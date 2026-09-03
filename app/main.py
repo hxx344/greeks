@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from .bybit import BybitError
 from .config import get_settings
 from .engine import TradingEngine
 from .models import CloseRequest, OpenRequest
@@ -84,6 +85,10 @@ async def open_trade(request: OpenRequest):
         return {"results": [item.model_dump(mode="json") for item in results], "executions": [item.model_dump(mode="json") for item in engine.last_executions], "live": settings.can_trade_live and request.confirm_live}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except BybitError as exc:
+        raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Open request failed: {exc}") from exc
 
 
 @app.post("/api/trading/close")
@@ -93,6 +98,10 @@ async def close_trade(request: CloseRequest):
         return {"results": [item.model_dump(mode="json") for item in results], "executions": [item.model_dump(mode="json") for item in executions], "live": settings.can_trade_live and request.confirm_live}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except BybitError as exc:
+        raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Close request failed: {exc}") from exc
 
 
 @app.get("/api/trading/executions")

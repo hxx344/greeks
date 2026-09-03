@@ -6,7 +6,9 @@ const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'
 
 async function getJson(url, options) {
   const response = await fetch(url, options);
-  const data = await response.json();
+  const raw = await response.text();
+  let data;
+  try { data = raw ? JSON.parse(raw) : {}; } catch (_) { data = {detail: raw || `HTTP ${response.status}`}; }
   if (!response.ok) throw new Error(data.detail || 'Request failed');
   if (url.includes('/api/strategy/preview')) window.__latestPreview = data;
   if (url.includes('/api/trading/executions')) window.__latestExecutions = data.items || [];
