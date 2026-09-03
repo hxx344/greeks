@@ -35,7 +35,13 @@ class BybitClient:
             headers.update({"X-BAPI-API-KEY": self.api_key, "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": str(self.recv_window), "X-BAPI-SIGN": signature})
         async with httpx.AsyncClient(timeout=12) as client:
             base_url = self.private_base_url if private else self.public_base_url
-            response = await client.request(method, base_url + path, params=params if method == "GET" else None, json=body if method != "GET" else None, headers=headers)
+            # Send the exact bytes used for V5 signature generation. Passing
+            # ``json=body`` lets httpx serialize the object again, which can
+            # produce a different payload and causes Bybit Error sign.
+            request_kwargs = {"params": params if method == "GET" else None, "headers": headers}
+            if method != "GET":
+                request_kwargs["content"] = json.dumps(body, separators=(",", ":"))
+            response = await client.request(method, base_url + path, **request_kwargs)
         response.raise_for_status()
         data = response.json()
         if data.get("retCode", 0) != 0:
