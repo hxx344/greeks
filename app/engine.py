@@ -202,7 +202,7 @@ class TradingEngine:
                     order_id = response.get("orderId") if isinstance(response, dict) else f"dry-{int(datetime.now().timestamp())}"
                     results.append(OrderResult(symbol=leg.symbol, side=leg.side, qty=qty, status="submitted" if live else "simulated", order_id=order_id, order_link_id=order_link_id))
                     successful_legs.append(leg)
-            if live and any(item.status == "error" for item in results):
+            if live and any(item.status == "error" for item in results) and self.settings.allow_market_fallback:
                 # A request can time out after Bybit accepted it. Check positions
                 # before retrying so an uncertain leg is never duplicated.
                 failed_legs = [leg for leg, result in zip(preview.legs, results) if result.status == "error"]
@@ -239,9 +239,9 @@ class TradingEngine:
                 self.last_executions = await self.load_recent_executions([item.order_link_id for item in results if item.order_link_id])
                 self._attach_execution_details(results)
             if live and any(item.status == "error" for item in results):
-                self.log("ERROR", "One or more live market orders were rejected; no reverse orders were sent. Verify positions on Bybit.")
+                self.log("ERROR", "One or more live limit orders failed; market fallback is disabled. Verify positions and handle missing legs manually.")
             elif live:
-                self.log("INFO", "All four live legs were accepted through BBO limits or market fallback; final fills are asynchronous on Bybit.")
+                self.log("INFO", "All four live legs were accepted through BBO limit orders; final fills are asynchronous on Bybit.")
             else:
                 self.positions.extend([Position(symbol=leg.symbol, side=leg.side, size=qty, avg_price=leg.mark_price, mark_price=leg.mark_price, unrealised_pnl=0, source="demo") for leg in successful_legs])
             if live and successful_legs:

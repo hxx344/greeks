@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     state_file: str = "data/engine_state.json"
     bbo_poll_seconds: float = Field(default=1.0, ge=0.2, le=10)
     bbo_order_timeout_seconds: int = Field(default=600, ge=60, le=1800)
+    allow_market_fallback: bool = False
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     @property
