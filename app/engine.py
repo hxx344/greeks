@@ -264,16 +264,24 @@ class TradingEngine:
             raise ValueError("RFQ requires explicit confirmation")
         if not self.settings.bybit_api_key or not self.settings.bybit_api_secret:
             raise ValueError("Bybit API credentials are not configured")
-        if not request.counterparties:
-            raise ValueError("Select at least one RFQ counterparty")
+        counterparties = list(request.counterparties)
+        if not counterparties:
+            rfq_config = await self.client.rfq_config()
+            available = rfq_config.get("counterparties") or []
+            counterparties = [item.get("deskCode") if isinstance(item, dict) else str(item) for item in available]
+            counterparties = [item for item in counterparties if item]
+            max_lp = int(rfq_config.get("maxLP") or len(counterparties) or 0)
+            counterparties = counterparties[:max_lp] if max_lp else counterparties
+        if not counterparties:
+            raise ValueError("Bybit returned no available RFQ counterparties")
         preview = await self.make_preview(request.quantity or self.settings.leg_qty)
         if preview.source != "bybit":
             raise ValueError("RFQ requires a fresh Bybit market snapshot")
         qty = request.quantity or self.settings.leg_qty
         legs = [{"category": "option", "symbol": leg.symbol, "side": leg.side, "qty": str(qty)} for leg in preview.legs]
         rfq_link_id = f"ic-rfq-{uuid4().hex[:16]}"
-        result = await self.client.create_rfq(request.counterparties, legs, rfq_link_id)
-        self.rfq_state = {"rfq_id": result.get("rfqId", ""), "rfq_link_id": result.get("rfqLinkId", rfq_link_id), "status": result.get("status", "Active"), "expires_at": result.get("expiresAt"), "counterparties": request.counterparties, "legs": legs, "quotes": [], "updated_at": datetime.now(timezone.utc).isoformat()}
+        result = await self.client.create_rfq(counterparties, legs, rfq_link_id)
+        self.rfq_state = {"rfq_id": result.get("rfqId", ""), "rfq_link_id": result.get("rfqLinkId", rfq_link_id), "status": result.get("status", "Active"), "expires_at": result.get("expiresAt"), "counterparties": counterparties, "legs": legs, "quotes": [], "updated_at": datetime.now(timezone.utc).isoformat()}
         self._save_state()
         self.log("INFO", f"RFQ created: {self.rfq_state['rfq_id']}")
         return self.rfq_state
