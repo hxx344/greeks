@@ -317,9 +317,10 @@ class TradingEngine:
         if request.rfq_id != self.rfq_state.get("rfq_id"):
             raise ValueError("RFQ is not the active inquiry")
         result = await self.client.cancel_rfq(request.rfq_id)
-        self.rfq_state.update({"status": "Canceled", "updated_at": datetime.now(timezone.utc).isoformat()})
+        canceled_id = request.rfq_id
+        self.rfq_state = {"status": "Canceled", "canceled_rfq_id": canceled_id, "quotes": [], "updated_at": datetime.now(timezone.utc).isoformat()}
         self._save_state()
-        self.log("INFO", f"RFQ canceled: {request.rfq_id}")
+        self.log("INFO", f"RFQ canceled: {canceled_id}")
         return {**self.rfq_state, "cancellation": result}
 
     def _attach_execution_details(self, results: list[OrderResult]) -> None:
