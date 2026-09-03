@@ -95,14 +95,15 @@ function renderExecutions(items) {
     let label = '其他成交';
     if (parts[0] === 'ic' && parts[1] === 'close' && parts[2]) { key = parts.slice(0, 3).join('-'); label = '平仓组合'; }
     else if (parts[0] === 'ic' && parts[1]) { key = parts.slice(0, 2).join('-'); label = '开仓组合'; }
-    if (!groups.has(key)) groups.set(key, {label, items: [], fee: 0, currency: item.fee_currency || ''});
+    if (!groups.has(key)) groups.set(key, {label, items: [], fee: 0, cashflow: 0, currency: item.fee_currency || ''});
     const group = groups.get(key);
     group.items.push(item);
     group.fee += Number(item.exec_fee || 0);
+    group.cashflow += (item.side === 'Sell' ? 1 : -1) * Number(item.exec_price || 0) * Number(item.exec_qty || 0);
     if (!group.currency) group.currency = item.fee_currency || '';
   }
   target.className = 'executions';
-  target.innerHTML = [...groups.values()].map((group) => `<div class="execution-group"><div class="execution-group-head"><strong>${group.label} · ${group.items.length} 腿</strong><span>组合手续费 -${group.fee.toFixed(6)} ${esc(group.currency)}</span></div>${group.items.map((item) => `<div class="execution-row"><strong>${esc(item.symbol)}</strong><span>${esc(item.side)} ${Number(item.exec_qty).toFixed(4)} · ${money(item.exec_price)}</span><span class="exec-fee">-${Number(item.exec_fee).toFixed(6)} ${esc(item.fee_currency)}</span></div>`).join('')}</div>`).join('');
+  target.innerHTML = [...groups.values()].map((group) => { const net = group.cashflow - group.fee; const legCount = new Set(group.items.map((item) => item.symbol)).size; const resultLabel = group.label === '平仓组合' ? '组合平仓收益' : '组合成交净额'; return `<div class="execution-group"><div class="execution-group-head"><strong>${group.label} · ${legCount} 腿</strong><span>${resultLabel} ${net >= 0 ? '+' : ''}${net.toFixed(6)} ${esc(group.currency)} · 手续费 -${group.fee.toFixed(6)} ${esc(group.currency)}</span></div>${group.items.map((item) => `<div class="execution-row"><strong>${esc(item.symbol)}</strong><span>${esc(item.side)} ${Number(item.exec_qty).toFixed(4)} · ${money(item.exec_price)}</span><span class="exec-fee">-${Number(item.exec_fee).toFixed(6)} ${esc(item.fee_currency)}</span></div>`).join('')}</div>`; }).join('');
 }
 async function load() {
   try {

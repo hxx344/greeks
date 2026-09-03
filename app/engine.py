@@ -313,7 +313,8 @@ class TradingEngine:
                 current = [position.model_copy(update={"size": min(position.size, self.active_strategy_sizes.get(f"{position.symbol}|{position.side}", 0.0))}) for position in current if self.active_strategy_sizes.get(f"{position.symbol}|{position.side}", 0.0) > 0]
             if not current:
                 raise ValueError("No open Iron Condor legs found to close")
-            links = [f"ic-close-{uuid4().hex[:12]}-{index}" for index, _ in enumerate(current)]
+            close_group_id = uuid4().hex[:12]
+            links = [f"ic-close-{close_group_id}-{index}" for index, _ in enumerate(current)]
             if live:
                 close_legs = [type("CloseLeg", (), {"symbol": position.symbol, "side": "Sell" if position.side == "Buy" else "Buy"})() for position in current]
                 responses = await asyncio.gather(*[self.follow_bbo_order(close_legs[index], position.size, links[index], reduce_only=True) for index, position in enumerate(current)], return_exceptions=True)
