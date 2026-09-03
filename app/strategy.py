@@ -37,7 +37,9 @@ def build_iron_condor(options: list[OptionInstrument], now: datetime, target_dte
         StrategyLeg(symbol=long_put.symbol, side="Buy", option_type="Put", strike=long_put.strike, delta=long_put.delta, qty=qty, mark_price=long_put.mark_price, target_delta=0.20),
     ]
     credit = (short_call.mark_price + short_put.mark_price - long_call.mark_price - long_put.mark_price) * qty
-    width = max(short_call.strike - long_put.strike, long_call.strike - short_call.strike)
+    call_width = long_call.strike - short_call.strike
+    put_width = short_put.strike - long_put.strike
+    width = max(call_width, put_width)
     max_loss = max(0.0, width * qty * contract_multiplier - credit)
     index_price = index_price or max(item.strike for item in chain)
     # Passive BBO estimate: buys at Bid1 and sells at Ask1.

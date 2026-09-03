@@ -49,6 +49,17 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(preview.legs), 4)
         self.assertEqual({leg.side for leg in preview.legs}, {"Buy", "Sell"})
 
+    def test_strategy_max_loss_uses_each_wing_width(self):
+        now = datetime.now(timezone.utc)
+        preview = build_iron_condor(demo_chain(now), now, target_dte=2, qty=0.01)
+        short_call = next(leg for leg in preview.legs if leg.option_type == "Call" and leg.side == "Sell")
+        long_call = next(leg for leg in preview.legs if leg.option_type == "Call" and leg.side == "Buy")
+        short_put = next(leg for leg in preview.legs if leg.option_type == "Put" and leg.side == "Sell")
+        long_put = next(leg for leg in preview.legs if leg.option_type == "Put" and leg.side == "Buy")
+        width = max(long_call.strike - short_call.strike, short_put.strike - long_put.strike)
+        expected = round(max(0.0, width * 0.01 - preview.net_credit_usd), 2)
+        self.assertEqual(preview.max_loss_usd, expected)
+
     def test_market_fallback_is_disabled_by_default(self):
         settings = Settings(_env_file=None)
         self.assertFalse(settings.allow_market_fallback)
