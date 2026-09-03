@@ -260,8 +260,6 @@ class TradingEngine:
             return results
 
     async def create_rfq(self, request: RfqCreateRequest) -> dict:
-        if not request.confirm_live:
-            raise ValueError("RFQ requires explicit confirmation")
         if not self.settings.bybit_api_key or not self.settings.bybit_api_secret:
             raise ValueError("Bybit API credentials are not configured")
         counterparties = list(request.counterparties)
