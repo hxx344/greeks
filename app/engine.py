@@ -314,8 +314,6 @@ class TradingEngine:
         return {**self.rfq_state, "execution": result}
 
     async def cancel_rfq(self, request: RfqCancelRequest) -> dict:
-        if not request.confirm_live:
-            raise ValueError("RFQ cancellation requires explicit confirmation")
         if request.rfq_id != self.rfq_state.get("rfq_id"):
             raise ValueError("RFQ is not the active inquiry")
         result = await self.client.cancel_rfq(request.rfq_id)
