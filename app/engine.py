@@ -125,6 +125,7 @@ class TradingEngine:
         if instrument is None:
             raise ValueError(f"Instrument disappeared from fresh market data: {leg.symbol}")
         response = None
+        last_order_price: float | None = None
         remaining = qty
         deadline = asyncio.get_running_loop().time() + self.settings.bbo_order_timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
@@ -145,8 +146,10 @@ class TradingEngine:
                 return {"orderId": response.get("orderId") if isinstance(response, dict) else "", "orderLinkId": order_link_id, "status": "filled"}
             if response is None:
                 response = await self.client.place_limit_order(leg.symbol, leg.side, remaining, price, order_link_id, reduce_only)
-            else:
+                last_order_price = price
+            elif last_order_price is None or abs(price - last_order_price) >= tick / 2:
                 await self.client.amend_order(leg.symbol, order_link_id, price)
+                last_order_price = price
             await asyncio.sleep(self.settings.bbo_poll_seconds)
         if response and remaining > 1e-12:
             try:
