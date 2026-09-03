@@ -25,7 +25,9 @@ class BybitClient:
         body = body or {}
         timestamp = str(int(time.time() * 1000))
         headers = {"Content-Type": "application/json"}
-        query = urlencode(sorted(params.items()))
+        # httpx preserves mapping insertion order when encoding query params;
+        # sign the same order that is sent on the wire.
+        query = urlencode(params.items())
         if private:
             if not self.api_key or not self.api_secret:
                 raise BybitError("Bybit API credentials are not configured")
