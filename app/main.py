@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,6 +10,10 @@ from fastapi.staticfiles import StaticFiles
 from .config import get_settings
 from .engine import TradingEngine
 from .models import CloseRequest, OpenRequest
+
+# The dashboard polls several endpoints frequently; HTTP 200 access lines are
+# noise in production logs. Application warnings and errors remain visible.
+logging.getLogger("uvicorn.access").disabled = True
 
 settings = get_settings()
 engine = TradingEngine(settings)
