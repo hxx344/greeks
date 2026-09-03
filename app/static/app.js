@@ -84,7 +84,26 @@ function renderPayoff(preview) {
 function renderLegs(legs) { $('legs').innerHTML = (legs || []).map((leg) => `<div class="leg"><span class="leg-mark ${leg.side.toLowerCase()}">${leg.side === 'Sell' ? 'S' : 'B'} ${leg.option_type[0]}</span><div><div class="leg-title">${leg.side === 'Sell' ? '卖出' : '买入'} ${leg.option_type} · Δ ${Number(leg.delta).toFixed(3)}</div><div class="leg-symbol">${esc(leg.symbol)}</div></div><div class="leg-price"><strong>${money(leg.mark_price)}</strong><small>目标 ${Number(leg.target_delta).toFixed(2)}</small><small>预估费 ${money(leg.estimated_fee_usd)} / 封顶 ${money(leg.fee_cap_usd)}</small></div></div>`).join(''); }
 function renderPositions(items) { $('positions').className = items.length ? 'positions' : 'positions empty'; $('positions').innerHTML = items.length ? items.map((p) => `<div class="position-row"><strong>${esc(p.symbol)}</strong><span>${esc(p.side)} · ${p.size}</span><span class="${p.unrealised_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}">${money(p.unrealised_pnl)}</span></div>`).join('') : '暂无持仓'; }
 function renderLogs(items) { $('logs').innerHTML = (items || []).slice(0, 20).map((log) => `<div class="log-line"><span class="log-time">${utcTime(log.timestamp)}</span><span class="log-level ${log.level}">${log.level}</span><span>${esc(log.message)}</span></div>`).join(''); }
-function renderExecutions(items) { const target = $('executions'); if (!items || !items.length) { target.className = 'executions empty'; target.textContent = '暂无成交记录'; return; } target.className = 'executions'; target.innerHTML = items.slice(0, 12).map((item) => `<div class="execution-row"><strong>${esc(item.symbol)}</strong><span>${esc(item.side)} ${Number(item.exec_qty).toFixed(4)} · ${money(item.exec_price)}</span><span class="exec-fee">-${Number(item.exec_fee).toFixed(6)} ${esc(item.fee_currency)}</span></div>`).join(''); }
+function renderExecutions(items) {
+  const target = $('executions');
+  if (!items || !items.length) { target.className = 'executions empty'; target.textContent = '暂无成交记录'; return; }
+  const groups = new Map();
+  for (const item of items) {
+    const link = String(item.order_link_id || '');
+    const parts = link.split('-');
+    let key = link;
+    let label = '其他成交';
+    if (parts[0] === 'ic' && parts[1] === 'close' && parts[2]) { key = parts.slice(0, 3).join('-'); label = '平仓组合'; }
+    else if (parts[0] === 'ic' && parts[1]) { key = parts.slice(0, 2).join('-'); label = '开仓组合'; }
+    if (!groups.has(key)) groups.set(key, {label, items: [], fee: 0, currency: item.fee_currency || ''});
+    const group = groups.get(key);
+    group.items.push(item);
+    group.fee += Number(item.exec_fee || 0);
+    if (!group.currency) group.currency = item.fee_currency || '';
+  }
+  target.className = 'executions';
+  target.innerHTML = [...groups.values()].map((group) => `<div class="execution-group"><div class="execution-group-head"><strong>${group.label} · ${group.items.length} 腿</strong><span>组合手续费 -${group.fee.toFixed(6)} ${esc(group.currency)}</span></div>${group.items.map((item) => `<div class="execution-row"><strong>${esc(item.symbol)}</strong><span>${esc(item.side)} ${Number(item.exec_qty).toFixed(4)} · ${money(item.exec_price)}</span><span class="exec-fee">-${Number(item.exec_fee).toFixed(6)} ${esc(item.fee_currency)}</span></div>`).join('')}</div>`).join('');
+}
 async function load() {
   try {
     const requestedQty = Number($('quantity')?.value || 1);
