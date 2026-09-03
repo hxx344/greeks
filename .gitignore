@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.py[cod]
+data/engine_state.json
+*.egg-info/
+.venv/
