@@ -277,7 +277,8 @@ class TradingEngine:
             raise ValueError("RFQ requires a fresh Bybit market snapshot")
         qty = request.quantity or self.settings.leg_qty
         legs = [{"category": "option", "symbol": leg.symbol, "side": leg.side, "qty": str(qty)} for leg in preview.legs]
-        rfq_link_id = f"ic-rfq-{uuid4().hex[:16]}"
+        # Bybit RFQ link IDs allow letters and numbers only.
+        rfq_link_id = f"icrfq{uuid4().hex[:16]}"
         result = await self.client.create_rfq(counterparties, legs, rfq_link_id)
         self.rfq_state = {"rfq_id": result.get("rfqId", ""), "rfq_link_id": result.get("rfqLinkId", rfq_link_id), "status": result.get("status", "Active"), "expires_at": result.get("expiresAt"), "counterparties": counterparties, "legs": legs, "quotes": [], "updated_at": datetime.now(timezone.utc).isoformat()}
         self._save_state()
