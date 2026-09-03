@@ -300,6 +300,8 @@ class TradingEngine:
     async def execute_rfq(self, request: RfqExecuteRequest) -> dict:
         if not request.confirm_live:
             raise ValueError("RFQ execution requires explicit confirmation")
+        if request.quote_side != "Sell":
+            raise ValueError("This Iron Condor workflow only accepts the Sell quote direction")
         if request.rfq_id != self.rfq_state.get("rfq_id"):
             raise ValueError("RFQ is not the active inquiry")
         quote = next((item for item in self.rfq_state.get("quotes", []) if item.get("quoteId") == request.quote_id), None)
