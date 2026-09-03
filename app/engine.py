@@ -263,8 +263,21 @@ class TradingEngine:
         if not self.settings.bybit_api_key or not self.settings.bybit_api_secret:
             raise ValueError("Bybit API credentials are not configured")
         counterparties = list(request.counterparties)
-        if not counterparties:
+        rfq_config = {}
+        try:
             rfq_config = await self.client.rfq_config()
+        except Exception as exc:
+            if not counterparties:
+                raise
+            self.log("WARNING", f"Could not load RFQ config; using specified counterparties: {exc}")
+        strategy_type = "custom"
+        for item in rfq_config.get("strategyTypes") or []:
+            name = str(item.get("strategyName", "") if isinstance(item, dict) else item)
+            normalized = name.replace(" ", "").replace("_", "").lower()
+            if "ironcondor" in normalized:
+                strategy_type = name
+                break
+        if not counterparties:
             available = rfq_config.get("counterparties") or []
             counterparties = [item.get("deskCode") if isinstance(item, dict) else str(item) for item in available]
             counterparties = [item for item in counterparties if item]
@@ -279,8 +292,8 @@ class TradingEngine:
         legs = [{"category": "option", "symbol": leg.symbol, "side": leg.side, "qty": str(qty)} for leg in preview.legs]
         # Bybit RFQ link IDs allow letters and numbers only.
         rfq_link_id = f"icrfq{uuid4().hex[:16]}"
-        result = await self.client.create_rfq(counterparties, legs, rfq_link_id)
-        self.rfq_state = {"rfq_id": result.get("rfqId", ""), "rfq_link_id": result.get("rfqLinkId", rfq_link_id), "status": result.get("status", "Active"), "expires_at": result.get("expiresAt"), "counterparties": counterparties, "legs": legs, "quotes": [], "updated_at": datetime.now(timezone.utc).isoformat()}
+        result = await self.client.create_rfq(counterparties, legs, rfq_link_id, strategy_type)
+        self.rfq_state = {"rfq_id": result.get("rfqId", ""), "rfq_link_id": result.get("rfqLinkId", rfq_link_id), "strategy_type": strategy_type, "status": result.get("status", "Active"), "expires_at": result.get("expiresAt"), "counterparties": counterparties, "legs": legs, "quotes": [], "updated_at": datetime.now(timezone.utc).isoformat()}
         self._save_state()
         self.log("INFO", f"RFQ created: {self.rfq_state['rfq_id']}")
         return self.rfq_state
