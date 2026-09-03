@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from .bybit import BybitError
 from .config import get_settings
 from .engine import TradingEngine
-from .models import CloseRequest, OpenRequest
+from .models import CloseRequest, OpenRequest, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest
 
 # The dashboard polls several endpoints frequently; HTTP 200 access lines are
 # noise in production logs. Application warnings and errors remain visible.
@@ -102,6 +102,52 @@ async def close_trade(request: CloseRequest):
         raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Close request failed: {exc}") from exc
+
+
+@app.get("/api/rfq/config")
+async def rfq_config():
+    try:
+        return await engine.client.rfq_config()
+    except BybitError as exc:
+        raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
+
+
+@app.get("/api/rfq/status")
+async def rfq_status(refresh: bool = Query(default=True)):
+    try:
+        return await engine.refresh_rfq() if refresh else engine.rfq_state
+    except BybitError as exc:
+        raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
+
+
+@app.post("/api/rfq/create")
+async def rfq_create(request: RfqCreateRequest):
+    try:
+        return await engine.create_rfq(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except BybitError as exc:
+        raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
+
+
+@app.post("/api/rfq/execute")
+async def rfq_execute(request: RfqExecuteRequest):
+    try:
+        return await engine.execute_rfq(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except BybitError as exc:
+        raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
+
+
+@app.post("/api/rfq/cancel")
+async def rfq_cancel(request: RfqCancelRequest):
+    try:
+        return await engine.cancel_rfq(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except BybitError as exc:
+        raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
 
 
 @app.get("/api/trading/executions")

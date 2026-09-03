@@ -69,6 +69,24 @@ class CloseRequest(BaseModel):
     confirm_live: bool = False
 
 
+class RfqCreateRequest(BaseModel):
+    confirm_live: bool = False
+    counterparties: list[str] = Field(default_factory=list)
+    quantity: float | None = Field(default=None, gt=0)
+
+
+class RfqExecuteRequest(BaseModel):
+    confirm_live: bool = False
+    rfq_id: str
+    quote_id: str
+    quote_side: Literal["Buy", "Sell"]
+
+
+class RfqCancelRequest(BaseModel):
+    confirm_live: bool = False
+    rfq_id: str
+
+
 class OrderResult(BaseModel):
     symbol: str
     side: str

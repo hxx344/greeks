@@ -92,3 +92,29 @@ class BybitClient:
 
     async def place_market_order(self, symbol: str, side: str, qty: float, order_link_id: str, reduce_only: bool = False) -> dict[str, Any]:
         return await self._request("POST", "/v5/order/create", body={"category": "option", "symbol": symbol, "side": side, "orderType": "Market", "qty": str(qty), "timeInForce": "IOC", "orderLinkId": order_link_id, "reduceOnly": reduce_only}, private=True)
+
+    async def rfq_config(self) -> dict[str, Any]:
+        return await self._request("GET", "/v5/rfq/config", private=True)
+
+    async def create_rfq(self, counterparties: list[str], legs: list[dict[str, Any]], rfq_link_id: str, strategy_type: str = "custom") -> dict[str, Any]:
+        return await self._request("POST", "/v5/rfq/create-rfq", body={"counterparties": counterparties, "rfqLinkId": rfq_link_id, "strategyType": strategy_type, "list": legs}, private=True)
+
+    async def rfq_realtime(self, rfq_id: str | None = None) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"traderType": "request"}
+        if rfq_id:
+            params["rfqId"] = rfq_id
+        result = await self._request("GET", "/v5/rfq/rfq-realtime", params, private=True)
+        return result.get("list", [])
+
+    async def quote_realtime(self, rfq_id: str | None = None) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"traderType": "request"}
+        if rfq_id:
+            params["rfqId"] = rfq_id
+        result = await self._request("GET", "/v5/rfq/quote-realtime", params, private=True)
+        return result.get("list", [])
+
+    async def execute_quote(self, rfq_id: str, quote_id: str, quote_side: str) -> dict[str, Any]:
+        return await self._request("POST", "/v5/rfq/execute-quote", body={"rfqId": rfq_id, "quoteId": quote_id, "quoteSide": quote_side}, private=True)
+
+    async def cancel_rfq(self, rfq_id: str) -> dict[str, Any]:
+        return await self._request("POST", "/v5/rfq/cancel-rfq", body={"rfqId": rfq_id}, private=True)

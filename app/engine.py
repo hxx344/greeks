@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from .bybit import BybitClient, BybitError
 from .config import Settings
-from .models import AccountHealth, CloseRequest, ExecutionRecord, LogEntry, OpenRequest, OrderResult, Position, StrategyPreview
+from .models import AccountHealth, CloseRequest, ExecutionRecord, LogEntry, OpenRequest, OrderResult, Position, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest, StrategyPreview
 from .strategy import build_iron_condor
 
 
@@ -26,6 +26,7 @@ class TradingEngine:
         self.last_open_week: str | None = None
         self.active_strategy_symbols: set[str] = set()
         self.active_strategy_sizes: dict[str, float] = {}
+        self.rfq_state: dict = {}
         self._load_state()
         self.account_health = AccountHealth(available=False, message="Live account credentials are not configured")
         self.last_executions: list[ExecutionRecord] = []
@@ -38,6 +39,7 @@ class TradingEngine:
             self.last_open_week = state.get("last_open_week")
             self.active_strategy_symbols = set(state.get("active_strategy_symbols", []))
             self.active_strategy_sizes = {key: float(value) for key, value in (state.get("active_strategy_sizes") or {}).items()}
+            self.rfq_state = state.get("rfq_state") or {}
         except (FileNotFoundError, OSError, ValueError):
             self.last_open_week = None
 
@@ -45,7 +47,7 @@ class TradingEngine:
         target = Path(self.settings.state_file)
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = target.with_suffix(target.suffix + ".tmp")
-        temp.write_text(json.dumps({"last_open_week": self.last_open_week, "active_strategy_symbols": sorted(self.active_strategy_symbols), "active_strategy_sizes": self.active_strategy_sizes}), encoding="utf-8")
+        temp.write_text(json.dumps({"last_open_week": self.last_open_week, "active_strategy_symbols": sorted(self.active_strategy_symbols), "active_strategy_sizes": self.active_strategy_sizes, "rfq_state": self.rfq_state}), encoding="utf-8")
         temp.replace(target)
 
     def is_open_window(self, now: datetime | None = None) -> bool:
@@ -256,6 +258,62 @@ class TradingEngine:
                 self._save_state()
             self.log("INFO", f"Iron Condor {'submitted to Bybit' if live else 'simulated'} with {len(results)} market legs")
             return results
+
+    async def create_rfq(self, request: RfqCreateRequest) -> dict:
+        if not request.confirm_live:
+            raise ValueError("RFQ requires explicit confirmation")
+        if not self.settings.bybit_api_key or not self.settings.bybit_api_secret:
+            raise ValueError("Bybit API credentials are not configured")
+        if not request.counterparties:
+            raise ValueError("Select at least one RFQ counterparty")
+        preview = await self.make_preview(request.quantity or self.settings.leg_qty)
+        if preview.source != "bybit":
+            raise ValueError("RFQ requires a fresh Bybit market snapshot")
+        qty = request.quantity or self.settings.leg_qty
+        legs = [{"category": "option", "symbol": leg.symbol, "side": leg.side, "qty": str(qty)} for leg in preview.legs]
+        rfq_link_id = f"ic-rfq-{uuid4().hex[:16]}"
+        result = await self.client.create_rfq(request.counterparties, legs, rfq_link_id)
+        self.rfq_state = {"rfq_id": result.get("rfqId", ""), "rfq_link_id": result.get("rfqLinkId", rfq_link_id), "status": result.get("status", "Active"), "expires_at": result.get("expiresAt"), "counterparties": request.counterparties, "legs": legs, "quotes": [], "updated_at": datetime.now(timezone.utc).isoformat()}
+        self._save_state()
+        self.log("INFO", f"RFQ created: {self.rfq_state['rfq_id']}")
+        return self.rfq_state
+
+    async def refresh_rfq(self) -> dict:
+        if not self.rfq_state.get("rfq_id"):
+            return self.rfq_state
+        rfq_id = self.rfq_state["rfq_id"]
+        rfqs, quotes = await asyncio.gather(self.client.rfq_realtime(rfq_id), self.client.quote_realtime(rfq_id))
+        if rfqs:
+            self.rfq_state.update({"status": rfqs[0].get("status", self.rfq_state.get("status")), "expires_at": rfqs[0].get("expiresAt", self.rfq_state.get("expires_at"))})
+        self.rfq_state["quotes"] = quotes
+        self.rfq_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_state()
+        return self.rfq_state
+
+    async def execute_rfq(self, request: RfqExecuteRequest) -> dict:
+        if not request.confirm_live:
+            raise ValueError("RFQ execution requires explicit confirmation")
+        if request.rfq_id != self.rfq_state.get("rfq_id"):
+            raise ValueError("RFQ is not the active inquiry")
+        quote = next((item for item in self.rfq_state.get("quotes", []) if item.get("quoteId") == request.quote_id), None)
+        if quote is None:
+            raise ValueError("Quote is not available or has expired")
+        result = await self.client.execute_quote(request.rfq_id, request.quote_id, request.quote_side)
+        self.rfq_state.update({"status": result.get("status", "PendingFill"), "selected_quote_id": request.quote_id, "selected_quote_side": request.quote_side, "updated_at": datetime.now(timezone.utc).isoformat()})
+        self._save_state()
+        self.log("INFO", f"RFQ quote execution submitted: {request.quote_id}")
+        return {**self.rfq_state, "execution": result}
+
+    async def cancel_rfq(self, request: RfqCancelRequest) -> dict:
+        if not request.confirm_live:
+            raise ValueError("RFQ cancellation requires explicit confirmation")
+        if request.rfq_id != self.rfq_state.get("rfq_id"):
+            raise ValueError("RFQ is not the active inquiry")
+        result = await self.client.cancel_rfq(request.rfq_id)
+        self.rfq_state.update({"status": "Canceled", "updated_at": datetime.now(timezone.utc).isoformat()})
+        self._save_state()
+        self.log("INFO", f"RFQ canceled: {request.rfq_id}")
+        return {**self.rfq_state, "cancellation": result}
 
     def _attach_execution_details(self, results: list[OrderResult]) -> None:
         by_link: dict[str, list[ExecutionRecord]] = {}
