@@ -25,9 +25,13 @@ async def lifespan(_: FastAPI):
     await engine.refresh_chain(force=True)
     market_task = asyncio.create_task(engine.market_loop())
     schedule_task = asyncio.create_task(engine.scheduler())
-    yield
-    market_task.cancel()
-    schedule_task.cancel()
+    try:
+        yield
+    finally:
+        market_task.cancel()
+        schedule_task.cancel()
+        await asyncio.gather(market_task, schedule_task, return_exceptions=True)
+        await engine.client.close()
 
 
 app = FastAPI(title="BTC Iron Condor", version="0.1.0", lifespan=lifespan)
@@ -55,7 +59,36 @@ async def health():
 
 @app.get("/api/config")
 async def config():
-    return {"environment": settings.environment, "live_enabled": settings.can_trade_live, "testnet": settings.bybit_testnet, "auto_open": settings.auto_open, "max_risk_usd": settings.max_risk_usd, "leg_qty": settings.leg_qty, "target_dte_days": settings.target_dte_days, "market_refresh_seconds": settings.market_refresh_seconds, "quote_stale_seconds": settings.quote_stale_seconds, "max_spread_bps": settings.max_spread_bps, "bbo_poll_seconds": settings.bbo_poll_seconds, "bbo_order_timeout_seconds": settings.bbo_order_timeout_seconds, "allow_market_fallback": settings.allow_market_fallback, "failed_leg_retry_delay_seconds": settings.failed_leg_retry_delay_seconds, "failed_leg_position_checks": settings.failed_leg_position_checks, "failed_leg_position_check_interval_seconds": settings.failed_leg_position_check_interval_seconds, "estimated_taker_fee_rate": settings.estimated_taker_fee_rate, "portfolio_margin_buffer_pct": settings.portfolio_margin_buffer_pct, "margin_mode": settings.margin_mode, "option_mm_factor": settings.option_mm_factor, "option_max_im_factor": settings.option_max_im_factor, "option_min_im_factor": settings.option_min_im_factor, "option_liquidation_fee_rate": settings.option_liquidation_fee_rate, "option_fee_cap_pct": settings.option_fee_cap_pct, "open_time": f"Friday {settings.open_hour_utc:02d}:{settings.open_minute_utc:02d} UTC"}
+    return config_payload()
+
+
+def config_payload():
+    return {"environment": settings.environment, "live_enabled": settings.can_trade_live, "testnet": settings.bybit_testnet, "auto_open": settings.auto_open, "max_risk_usd": settings.max_risk_usd, "leg_qty": settings.leg_qty, "target_dte_days": settings.target_dte_days, "market_refresh_seconds": settings.market_refresh_seconds, "instrument_refresh_seconds": settings.instrument_refresh_seconds, "quote_stale_seconds": settings.quote_stale_seconds, "max_spread_bps": settings.max_spread_bps, "bbo_poll_seconds": settings.bbo_poll_seconds, "bbo_order_timeout_seconds": settings.bbo_order_timeout_seconds, "allow_market_fallback": settings.allow_market_fallback, "failed_leg_retry_delay_seconds": settings.failed_leg_retry_delay_seconds, "failed_leg_position_checks": settings.failed_leg_position_checks, "failed_leg_position_check_interval_seconds": settings.failed_leg_position_check_interval_seconds, "estimated_taker_fee_rate": settings.estimated_taker_fee_rate, "portfolio_margin_buffer_pct": settings.portfolio_margin_buffer_pct, "margin_mode": settings.margin_mode, "option_mm_factor": settings.option_mm_factor, "option_max_im_factor": settings.option_max_im_factor, "option_min_im_factor": settings.option_min_im_factor, "option_liquidation_fee_rate": settings.option_liquidation_fee_rate, "option_fee_cap_pct": settings.option_fee_cap_pct, "open_time": f"Friday {settings.open_hour_utc:02d}:{settings.open_minute_utc:02d} UTC"}
+
+
+@app.get("/api/dashboard/market")
+async def dashboard_market(quantity: float | None = Query(default=None, gt=0)):
+    try:
+        strategy = await engine.make_preview(quantity)
+        expiry_items = [item for item in engine.chain if item.expiry == strategy.expiry]
+        return {"config": config_payload(), "preview": strategy.model_dump(mode="json"), "chain": {"source": engine.chain_source, "btc_price": engine.btc_price, "updated_at": engine.chain_updated_at, "items": [item.model_dump(mode="json") for item in expiry_items]}}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/dashboard/account")
+async def dashboard_account():
+    position_result, health_result, execution_result = await asyncio.gather(engine.load_positions(), engine.load_account_health(), engine.load_recent_executions(), return_exceptions=True)
+    if isinstance(position_result, Exception):
+        engine.log("WARNING", f"Could not refresh dashboard positions: {position_result}")
+        position_result = engine.positions
+    if isinstance(health_result, Exception):
+        engine.log("WARNING", f"Could not refresh dashboard account health: {health_result}")
+        health_result = engine.account_health
+    if isinstance(execution_result, Exception):
+        engine.log("WARNING", f"Could not refresh dashboard executions: {execution_result}")
+        execution_result = engine.last_executions
+    return {"positions": {"items": [item.model_dump(mode="json") for item in position_result]}, "health": health_result.model_dump(mode="json"), "executions": {"items": [item.model_dump(mode="json") for item in execution_result]}, "logs": {"items": [item.model_dump(mode="json") for item in engine.logs]}}
 
 
 @app.get("/api/chain")

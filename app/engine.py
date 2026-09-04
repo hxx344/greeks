@@ -18,6 +18,8 @@ class TradingEngine:
         self.chain = []
         self.chain_source = "demo"
         self.chain_updated_at: datetime | None = None
+        self.raw_instruments: list[dict] = []
+        self.instruments_updated_at: datetime | None = None
         self.btc_price: float | None = None
         self.refresh_lock = asyncio.Lock()
         self.preview: StrategyPreview | None = None
@@ -76,7 +78,14 @@ class TradingEngine:
             if not force and self.chain and self.chain_updated_at and (now - self.chain_updated_at).total_seconds() < max(1, self.settings.market_refresh_seconds - 1):
                 return self.chain
             try:
-                raw_instruments, raw_tickers, underlying = await asyncio.gather(self.client.instruments(), self.client.tickers(), self.client.underlying_ticker())
+                instruments_stale = not self.raw_instruments or not self.instruments_updated_at or (now - self.instruments_updated_at).total_seconds() >= self.settings.instrument_refresh_seconds
+                if instruments_stale:
+                    raw_instruments, raw_tickers, underlying = await asyncio.gather(self.client.instruments(), self.client.tickers(), self.client.underlying_ticker())
+                    self.raw_instruments = raw_instruments
+                    self.instruments_updated_at = now
+                else:
+                    raw_tickers, underlying = await asyncio.gather(self.client.tickers(), self.client.underlying_ticker())
+                    raw_instruments = self.raw_instruments
                 ticker_map = {item.get("symbol"): item for item in raw_tickers}
                 underlying_price = float(underlying.get("indexPrice") or underlying.get("markPrice") or underlying.get("lastPrice") or 0)
                 from .models import OptionInstrument

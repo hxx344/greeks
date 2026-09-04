@@ -19,6 +19,17 @@ class BybitClient:
         self.recv_window = recv_window
         self.public_base_url = "https://api.bybit.com"
         self.private_base_url = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
+        self._client: httpx.AsyncClient | None = None
+
+    def _http_client(self) -> httpx.AsyncClient:
+        if self._client is None or getattr(self._client, "is_closed", False):
+            limits = httpx.Limits(max_connections=30, max_keepalive_connections=15, keepalive_expiry=30)
+            self._client = httpx.AsyncClient(timeout=12, limits=limits)
+        return self._client
+
+    async def close(self) -> None:
+        if self._client is not None and not getattr(self._client, "is_closed", False):
+            await self._client.aclose()
 
     async def _request(self, method: str, path: str, params: dict[str, Any] | None = None, body: dict[str, Any] | None = None, private: bool = False) -> dict[str, Any]:
         params = params or {}
@@ -35,15 +46,15 @@ class BybitClient:
             sign_target = timestamp + self.api_key + str(self.recv_window) + payload
             signature = hmac.new(self.api_secret.encode(), sign_target.encode(), hashlib.sha256).hexdigest()
             headers.update({"X-BAPI-API-KEY": self.api_key, "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": str(self.recv_window), "X-BAPI-SIGN": signature})
-        async with httpx.AsyncClient(timeout=12) as client:
-            base_url = self.private_base_url if private else self.public_base_url
-            # Send the exact bytes used for V5 signature generation. Passing
-            # ``json=body`` lets httpx serialize the object again, which can
-            # produce a different payload and causes Bybit Error sign.
-            request_kwargs = {"params": params if method == "GET" else None, "headers": headers}
-            if method != "GET":
-                request_kwargs["content"] = json.dumps(body, separators=(",", ":"))
-            response = await client.request(method, base_url + path, **request_kwargs)
+        client = self._http_client()
+        base_url = self.private_base_url if private else self.public_base_url
+        # Send the exact bytes used for V5 signature generation. Passing
+        # ``json=body`` lets httpx serialize the object again, which can
+        # produce a different payload and causes Bybit Error sign.
+        request_kwargs = {"params": params if method == "GET" else None, "headers": headers}
+        if method != "GET":
+            request_kwargs["content"] = json.dumps(body, separators=(",", ":"))
+        response = await client.request(method, base_url + path, **request_kwargs)
         response.raise_for_status()
         data = response.json()
         if data.get("retCode", 0) != 0:

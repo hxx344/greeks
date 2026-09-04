@@ -5,7 +5,7 @@ import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -30,9 +30,12 @@ class FakeResponse:
 
 class FakeAsyncClient:
     last_request = None
+    created = 0
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self.is_closed = False
+        FakeAsyncClient.created += 1
 
     async def __aenter__(self):
         return self
@@ -43,6 +46,9 @@ class FakeAsyncClient:
     async def request(self, method, url, **kwargs):
         FakeAsyncClient.last_request = (method, url, kwargs)
         return FakeResponse({"retCode": 0, "result": {"ok": True}})
+
+    async def aclose(self):
+        self.is_closed = True
 
 
 class CoreTests(unittest.TestCase):
@@ -145,6 +151,36 @@ class CoreTests(unittest.TestCase):
         expected = hmac.new(b"secret", ("1700000000000key5000" + compact).encode(), hashlib.sha256).hexdigest()
         self.assertEqual(kwargs["content"], compact)
         self.assertEqual(kwargs["headers"]["X-BAPI-SIGN"], expected)
+
+    def test_bybit_client_reuses_http_connection_pool(self):
+        client = BybitClient()
+        FakeAsyncClient.created = 0
+
+        async def call_twice():
+            await client._request("GET", "/one")
+            await client._request("GET", "/two")
+            await client.close()
+
+        with patch("app.bybit.httpx.AsyncClient", FakeAsyncClient):
+            asyncio.run(call_twice())
+        self.assertEqual(FakeAsyncClient.created, 1)
+
+    def test_market_dashboard_returns_selected_expiry_only(self):
+        now = datetime.now(timezone.utc)
+        options = demo_chain(now)
+        preview = build_iron_condor(options, now, target_dte=2, qty=0.01)
+
+        async def call():
+            transport = httpx.ASGITransport(app=app)
+            with patch("app.main.engine.make_preview", new=AsyncMock(return_value=preview)), patch("app.main.engine.chain", options), patch("app.main.engine.chain_source", "bybit"), patch("app.main.engine.chain_updated_at", now), patch("app.main.engine.btc_price", 100000):
+                async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                    return await client.get("/api/dashboard/market?quantity=0.01")
+
+        response = asyncio.run(call())
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["chain"]["items"])
+        self.assertTrue(all(item["expiry"] == payload["preview"]["expiry"] for item in payload["chain"]["items"]))
 
     def test_health_endpoint_is_local_system_smoke_test(self):
         async def call():

@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     recv_window_ms: int = 5000
     auto_open: bool = False
     market_refresh_seconds: int = Field(default=10, ge=1)
+    instrument_refresh_seconds: int = Field(default=3600, ge=60)
     quote_stale_seconds: int = Field(default=30, ge=5)
     max_spread_bps: float = Field(default=0.0, ge=0)
     failed_leg_retry_delay_seconds: float = Field(default=0.8, ge=0, le=5)
