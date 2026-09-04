@@ -332,6 +332,8 @@ class TradingEngine:
         rfqs, quotes = await asyncio.gather(self.client.rfq_realtime(rfq_id), self.client.quote_realtime(rfq_id))
         if rfqs:
             self.rfq_state.update({"status": rfqs[0].get("status", self.rfq_state.get("status")), "expires_at": rfqs[0].get("expiresAt", self.rfq_state.get("expires_at"))})
+        if self.rfq_state.get("status") == "Filled":
+            self._track_filled_rfq()
         self.rfq_state["quotes"] = quotes
         self.rfq_state["updated_at"] = datetime.now(timezone.utc).isoformat()
         self._save_state()
@@ -352,6 +354,28 @@ class TradingEngine:
         self._save_state()
         self.log("INFO", f"RFQ quote execution submitted: {request.quote_id}")
         return {**self.rfq_state, "execution": result}
+
+    def _track_filled_rfq(self, positions: list[Position] | None = None) -> bool:
+        legs = self.rfq_state.get("legs") or []
+        execution_submitted = bool(self.rfq_state.get("selected_quote_id")) or self.rfq_state.get("status") == "Filled"
+        if not execution_submitted or len(legs) != 4 or len({leg.get("symbol") for leg in legs}) != 4:
+            return False
+        position_map = {(position.symbol, position.side): position for position in (positions or []) if position.size > 0}
+        if positions is not None and any((leg.get("symbol"), leg.get("side")) not in position_map for leg in legs):
+            return False
+        sizes: dict[str, float] = {}
+        for leg in legs:
+            symbol = str(leg.get("symbol", ""))
+            side = str(leg.get("side", ""))
+            requested_qty = float(leg.get("qty", 0) or 0)
+            if not symbol or side not in {"Buy", "Sell"} or requested_qty <= 0:
+                return False
+            tracked_qty = min(requested_qty, position_map[(symbol, side)].size) if positions is not None else requested_qty
+            sizes[f"{symbol}|{side}"] = tracked_qty
+        self.active_strategy_symbols = {str(leg["symbol"]) for leg in legs}
+        self.active_strategy_sizes = sizes
+        self._save_state()
+        return True
 
     async def cancel_rfq(self, request: RfqCancelRequest) -> dict:
         if request.rfq_id != self.rfq_state.get("rfq_id"):
@@ -414,12 +438,14 @@ class TradingEngine:
 
     async def close_position(self, request: CloseRequest) -> tuple[list[OrderResult], list[ExecutionRecord]]:
         async with self.lock:
-            preview = self.preview or await self.make_preview()
             live = bool(request.confirm_live and self.settings.can_trade_live)
             if live:
                 raw_positions = await self.client.positions()
                 current = [Position(symbol=item.get("symbol", ""), side=item.get("side", ""), size=float(item.get("size", 0) or 0), avg_price=float(item.get("avgPrice", 0) or 0), mark_price=float(item.get("markPrice", 0) or 0), unrealised_pnl=float(item.get("unrealisedPnl", 0) or 0), source="bybit") for item in raw_positions if float(item.get("size", 0) or 0) > 0]
+                if not self.active_strategy_symbols and self._track_filled_rfq(current):
+                    self.log("INFO", "Recovered tracked Iron Condor legs from the executed RFQ and current Bybit positions")
             else:
+                preview = self.preview or await self.make_preview()
                 current = list(self.positions)
             if live and not self.active_strategy_symbols:
                 raise ValueError("No tracked live Iron Condor legs found; refusing to close untracked positions")
@@ -495,6 +521,8 @@ class TradingEngine:
             try:
                 raw = await self.client.positions()
                 self.positions = [Position(symbol=item.get("symbol", ""), side=item.get("side", ""), size=float(item.get("size", 0)), avg_price=float(item.get("avgPrice", 0) or 0), mark_price=float(item.get("markPrice", 0) or 0), unrealised_pnl=float(item.get("unrealisedPnl", 0) or 0), source="bybit") for item in raw if float(item.get("size", 0) or 0) > 0]
+                if not self.active_strategy_symbols and self._track_filled_rfq(self.positions):
+                    self.log("INFO", "Recovered tracked Iron Condor legs from the executed RFQ and current Bybit positions")
             except BybitError as exc:
                 self.log("WARNING", f"Could not load private positions: {exc}")
         return self.positions

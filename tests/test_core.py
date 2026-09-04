@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -10,7 +11,9 @@ import httpx
 
 from app.bybit import BybitClient
 from app.config import Settings
+from app.engine import TradingEngine
 from app.main import app
+from app.models import Position
 from app.strategy import build_iron_condor, demo_chain
 
 
@@ -63,6 +66,37 @@ class CoreTests(unittest.TestCase):
     def test_market_fallback_is_disabled_by_default(self):
         settings = Settings(_env_file=None)
         self.assertFalse(settings.allow_market_fallback)
+
+    def test_executed_rfq_positions_restore_strategy_tracking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(_env_file=None, state_file=f"{directory}/state.json")
+            engine = TradingEngine(settings)
+            legs = [
+                {"symbol": "CALL-SHORT", "side": "Sell", "qty": "0.01"},
+                {"symbol": "PUT-SHORT", "side": "Sell", "qty": "0.01"},
+                {"symbol": "CALL-LONG", "side": "Buy", "qty": "0.01"},
+                {"symbol": "PUT-LONG", "side": "Buy", "qty": "0.01"},
+            ]
+            engine.rfq_state = {"status": "PendingFill", "selected_quote_id": "quote-1", "legs": legs}
+            positions = [Position(symbol=leg["symbol"], side=leg["side"], size=0.01, avg_price=1, mark_price=1, unrealised_pnl=0) for leg in legs]
+            self.assertTrue(engine._track_filled_rfq(positions))
+            self.assertEqual(engine.active_strategy_symbols, {leg["symbol"] for leg in legs})
+            self.assertEqual(engine.active_strategy_sizes["CALL-SHORT|Sell"], 0.01)
+
+    def test_rfq_tracking_rejects_incomplete_position_set(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(_env_file=None, state_file=f"{directory}/state.json")
+            engine = TradingEngine(settings)
+            legs = [
+                {"symbol": "CALL-SHORT", "side": "Sell", "qty": "0.01"},
+                {"symbol": "PUT-SHORT", "side": "Sell", "qty": "0.01"},
+                {"symbol": "CALL-LONG", "side": "Buy", "qty": "0.01"},
+                {"symbol": "PUT-LONG", "side": "Buy", "qty": "0.01"},
+            ]
+            engine.rfq_state = {"status": "PendingFill", "selected_quote_id": "quote-1", "legs": legs}
+            positions = [Position(symbol=leg["symbol"], side=leg["side"], size=0.01, avg_price=1, mark_price=1, unrealised_pnl=0) for leg in legs[:3]]
+            self.assertFalse(engine._track_filled_rfq(positions))
+            self.assertFalse(engine.active_strategy_symbols)
 
     def test_get_signature_matches_wire_query_order(self):
         client = BybitClient("key", "secret", testnet=False, recv_window=5000)
