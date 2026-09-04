@@ -157,15 +157,18 @@ setInterval(() => { if (window.__latestExecutions) renderExecutions(window.__lat
 window.__desiredQty = window.localStorage.getItem('ic-quantity') || '';
 const quantityField = $('quantity');
 const quantityPreset = $('quantityPreset');
+const syncQuantityPreset = () => { const value = String(quantityField.value); const option = [...quantityPreset.options].find((item) => item.value === value); quantityPreset.value = option ? value : 'custom'; };
 if (window.__desiredQty) quantityField.value = window.__desiredQty;
+syncQuantityPreset();
 quantityField.addEventListener('input', () => {
   window.__desiredQty = quantityField.value;
   window.localStorage.setItem('ic-quantity', quantityField.value);
+  syncQuantityPreset();
 });
-const refreshEstimate = () => { const value = Number(quantityField.value); if (value > 0) { window.__desiredQty = String(value); window.localStorage.setItem('ic-quantity', String(value)); load().finally(() => { quantityField.value = window.__desiredQty; }); } };
+const refreshEstimate = () => { const value = Number(quantityField.value); if (value > 0) { window.__desiredQty = String(value); window.localStorage.setItem('ic-quantity', String(value)); load().finally(() => { quantityField.value = window.__desiredQty; syncQuantityPreset(); }); } };
 quantityPreset.addEventListener('change', () => { if (quantityPreset.value !== 'custom') { quantityField.value = quantityPreset.value; refreshEstimate(); } });
 quantityField.addEventListener('change', refreshEstimate);
-setInterval(() => { if (window.__desiredQty && document.activeElement !== quantityField && quantityField.value !== window.__desiredQty) quantityField.value = window.__desiredQty; }, 25);
+setInterval(() => { if (window.__desiredQty && document.activeElement !== quantityField && quantityField.value !== window.__desiredQty) { quantityField.value = window.__desiredQty; syncQuantityPreset(); } }, 25);
 async function closeTrade() { const button = $('closeTrade'); button.disabled = true; button.textContent = '执行中…'; try { const result = await getJson('/api/trading/close', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked})}); window.alert(result.live ? '四腿平仓订单已提交' : '模拟平仓已记录'); await load(); } catch (error) { window.alert(error.message); } finally { button.disabled = false; button.textContent = $('confirm').checked ? '确认并平仓四腿' : '模拟平仓四腿'; } }
 $('closeTrade').addEventListener('click', closeTrade);
 function quoteNet(quote, side, state) { const requested = new Map((state.legs || []).map((leg) => [leg.symbol, leg.side])); return (quote[side === 'Buy' ? 'quoteBuyList' : 'quoteSellList'] || []).reduce((sum, item) => { const requestedSide = requested.get(item.symbol) || 'Buy'; const takerSide = side === 'Sell' ? requestedSide : (requestedSide === 'Buy' ? 'Sell' : 'Buy'); return sum + (takerSide === 'Sell' ? 1 : -1) * Number(item.price || 0) * Number(item.qty || 0); }, 0); }
