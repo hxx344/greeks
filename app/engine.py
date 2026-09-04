@@ -162,7 +162,18 @@ class TradingEngine:
                 await self.client.cancel_order(leg.symbol, order_link_id)
             except Exception as exc:
                 self.log("ERROR", f"Could not cancel timed-out BBO order {order_link_id}: {exc}")
-        return {"orderId": response.get("orderId") if isinstance(response, dict) else "", "orderLinkId": order_link_id, "status": "timeout_cancelled"}
+        # A fill can race with the cancel request. Reconcile one final time so
+        # a partial position is never discarded from strategy tracking.
+        try:
+            final_fills = await self.client.executions(order_link_id)
+            filled = sum(float(item.get("execQty", 0) or 0) for item in final_fills)
+            if filled >= qty - 1e-12:
+                return {"orderId": response.get("orderId") if isinstance(response, dict) else "", "orderLinkId": order_link_id, "status": "filled", "filledQty": qty}
+            if filled > 1e-12:
+                return {"orderId": response.get("orderId") if isinstance(response, dict) else "", "orderLinkId": order_link_id, "status": "partial", "filledQty": filled}
+        except Exception as exc:
+            self.log("WARNING", f"Could not reconcile timed-out order {order_link_id}: {exc}")
+        return {"orderId": response.get("orderId") if isinstance(response, dict) else "", "orderLinkId": order_link_id, "status": "timeout_cancelled", "filledQty": 0.0}
 
     async def open_position(self, request: OpenRequest, scheduled: bool = False) -> list[OrderResult]:
         async with self.lock:
@@ -205,7 +216,7 @@ class TradingEngine:
                 order_links = [None] * len(preview.legs)
                 responses = [None] * len(preview.legs)
             results = []
-            successful_legs = []
+            successful_legs: list[tuple[object, float]] = []
             for leg, response, order_link_id in zip(preview.legs, responses, order_links):
                 if isinstance(response, Exception) or (isinstance(response, dict) and response.get("status") == "timeout_cancelled"):
                     message = str(response) if isinstance(response, Exception) else "BBO order timed out and was cancelled"
@@ -213,8 +224,11 @@ class TradingEngine:
                     self.log("ERROR", f"Order failed for {leg.symbol}: {response}")
                 else:
                     order_id = response.get("orderId") if isinstance(response, dict) else f"dry-{int(datetime.now().timestamp())}"
-                    results.append(OrderResult(symbol=leg.symbol, side=leg.side, qty=qty, status="submitted" if live else "simulated", order_id=order_id, order_link_id=order_link_id))
-                    successful_legs.append(leg)
+                    filled_qty = float(response.get("filledQty", qty) if isinstance(response, dict) else qty)
+                    status = response.get("status") if isinstance(response, dict) else ("simulated" if not live else "submitted")
+                    results.append(OrderResult(symbol=leg.symbol, side=leg.side, qty=filled_qty, status=status, order_id=order_id, order_link_id=order_link_id))
+                    if filled_qty > 1e-12:
+                        successful_legs.append((leg, filled_qty))
             if live and any(item.status == "error" for item in results) and self.settings.allow_market_fallback:
                 # A request can time out after Bybit accepted it. Check positions
                 # before retrying so an uncertain leg is never duplicated.
@@ -247,22 +261,24 @@ class TradingEngine:
                         else:
                             result.status = "market_submitted"
                             result.order_id = response.get("orderId") if isinstance(response, dict) else result.order_id
-                            successful_legs.append(leg)
+                            successful_legs.append((leg, qty))
                     self.log("WARNING", f"Submitted market fallback for {len(retry_candidates)} missing leg(s) after BBO timeout")
                 else:
                     self.log("WARNING", "Failed leg(s) already existed in current positions; no duplicate retry sent")
             if live:
                 self.last_executions = await self.load_recent_executions([item.order_link_id for item in results if item.order_link_id])
                 self._attach_execution_details(results)
-            if live and any(item.status == "error" for item in results):
+            if live and any(item.status == "partial" for item in results):
+                self.log("ERROR", "One or more live limit orders partially filled before cancellation; verify the tracked quantities and complete the strategy manually.")
+            elif live and any(item.status == "error" for item in results):
                 self.log("ERROR", "One or more live limit orders failed; market fallback is disabled. Verify positions and handle missing legs manually.")
             elif live:
                 self.log("INFO", "All four live legs were accepted through BBO limit orders; final fills are asynchronous on Bybit.")
             else:
-                self.positions.extend([Position(symbol=leg.symbol, side=leg.side, size=qty, avg_price=leg.mark_price, mark_price=leg.mark_price, unrealised_pnl=0, source="demo") for leg in successful_legs])
+                self.positions.extend([Position(symbol=leg.symbol, side=leg.side, size=filled_qty, avg_price=leg.mark_price, mark_price=leg.mark_price, unrealised_pnl=0, source="demo") for leg, filled_qty in successful_legs])
             if live and successful_legs:
-                self.active_strategy_symbols = {leg.symbol for leg in successful_legs}
-                self.active_strategy_sizes = {f"{leg.symbol}|{leg.side}": qty for leg in successful_legs}
+                self.active_strategy_symbols = {leg.symbol for leg, _ in successful_legs}
+                self.active_strategy_sizes = {f"{leg.symbol}|{leg.side}": filled_qty for leg, filled_qty in successful_legs}
                 self._save_state()
             if scheduled:
                 self.last_open_week = datetime.now(timezone.utc).strftime("%G-W%V")
@@ -428,7 +444,8 @@ class TradingEngine:
                     message = str(response) if isinstance(response, Exception) else "BBO close order timed out and was cancelled"
                     results.append(OrderResult(symbol=position.symbol, side="Sell" if position.side == "Buy" else "Buy", qty=position.size, status="error", message=message, order_link_id=link))
                 else:
-                    results.append(OrderResult(symbol=position.symbol, side="Sell" if position.side == "Buy" else "Buy", qty=position.size, status="submitted" if live else "simulated", order_id=response.get("orderId") if isinstance(response, dict) else f"dry-close-{int(datetime.now().timestamp())}", order_link_id=link))
+                    filled_qty = float(response.get("filledQty", position.size) if isinstance(response, dict) else position.size)
+                    results.append(OrderResult(symbol=position.symbol, side="Sell" if position.side == "Buy" else "Buy", qty=filled_qty, status=response.get("status") if isinstance(response, dict) else ("submitted" if live else "simulated"), order_id=response.get("orderId") if isinstance(response, dict) else f"dry-close-{int(datetime.now().timestamp())}", order_link_id=link))
             if live:
                 await asyncio.sleep(self.settings.failed_leg_retry_delay_seconds)
                 self.last_executions = await self.load_recent_executions([item.order_link_id for item in results if item.order_link_id])
@@ -438,10 +455,16 @@ class TradingEngine:
             else:
                 self.positions = [position for position in self.positions if position not in current]
                 self.last_executions = []
-            if not any(item.status == "error" for item in results):
+            if not any(item.status in {"error", "partial"} for item in results):
                 self.active_strategy_symbols.difference_update(position.symbol for position in current)
                 for position in current:
                     self.active_strategy_sizes.pop(f"{position.symbol}|{position.side}", None)
+                self._save_state()
+            elif live:
+                for position, result in zip(current, results):
+                    if result.status == "partial":
+                        key = f"{position.symbol}|{position.side}"
+                        self.active_strategy_sizes[key] = max(0.0, self.active_strategy_sizes.get(key, position.size) - result.qty)
                 self._save_state()
             return results, self.last_executions
 
