@@ -27,6 +27,8 @@ class TradingEngine:
         self.active_strategy_symbols: set[str] = set()
         self.active_strategy_sizes: dict[str, float] = {}
         self.rfq_state: dict = {}
+        self.execution_groups: dict[str, dict] = {}
+        self.execution_group_links: dict[str, str] = {}
         self._load_state()
         self.account_health = AccountHealth(available=False, message="Live account credentials are not configured")
         self.last_executions: list[ExecutionRecord] = []
@@ -40,6 +42,8 @@ class TradingEngine:
             self.active_strategy_symbols = set(state.get("active_strategy_symbols", []))
             self.active_strategy_sizes = {key: float(value) for key, value in (state.get("active_strategy_sizes") or {}).items()}
             self.rfq_state = state.get("rfq_state") or {}
+            self.execution_groups = state.get("execution_groups") or {}
+            self.execution_group_links = state.get("execution_group_links") or {}
         except (FileNotFoundError, OSError, ValueError):
             self.last_open_week = None
 
@@ -47,7 +51,7 @@ class TradingEngine:
         target = Path(self.settings.state_file)
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = target.with_suffix(target.suffix + ".tmp")
-        temp.write_text(json.dumps({"last_open_week": self.last_open_week, "active_strategy_symbols": sorted(self.active_strategy_symbols), "active_strategy_sizes": self.active_strategy_sizes, "rfq_state": self.rfq_state}), encoding="utf-8")
+        temp.write_text(json.dumps({"last_open_week": self.last_open_week, "active_strategy_symbols": sorted(self.active_strategy_symbols), "active_strategy_sizes": self.active_strategy_sizes, "rfq_state": self.rfq_state, "execution_groups": self.execution_groups, "execution_group_links": self.execution_group_links}), encoding="utf-8")
         temp.replace(target)
 
     def is_open_window(self, now: datetime | None = None) -> bool:
@@ -192,6 +196,10 @@ class TradingEngine:
             if live:
                 request_id = uuid4().hex[:12]
                 order_links = [f"ic-{request_id}-{index}" for index, _ in enumerate(preview.legs)]
+                self.execution_groups[request_id] = {"type": "open", "created_at": datetime.now(timezone.utc).isoformat(), "legs": {leg.symbol: {"side": leg.side, "chain_price": (next(item for item in self.chain if item.symbol == leg.symbol).bid if leg.side == "Sell" else next(item for item in self.chain if item.symbol == leg.symbol).ask), "qty": qty} for leg in preview.legs}}
+                for link in order_links:
+                    self.execution_group_links[link] = request_id
+                self._save_state()
                 responses = await asyncio.gather(*[self.follow_bbo_order(leg, qty, order_links[index]) for index, leg in enumerate(preview.legs)], return_exceptions=True)
             else:
                 order_links = [None] * len(preview.legs)
@@ -227,6 +235,9 @@ class TradingEngine:
                 if retry_candidates:
                     market_id = uuid4().hex[:12]
                     retry_links = [f"ic-mkt-{market_id}-{index}" for index, _ in enumerate(retry_candidates)]
+                    for link in retry_links:
+                        self.execution_group_links[link] = request_id
+                    self._save_state()
                     retry_responses = await asyncio.gather(*[self.client.place_market_order(leg.symbol, leg.side, qty, retry_links[index]) for index, leg in enumerate(retry_candidates)], return_exceptions=True)
                     for leg, response, retry_link in zip(retry_candidates, retry_responses, retry_links):
                         result = next(item for item in results if item.symbol == leg.symbol)
@@ -367,7 +378,19 @@ class TradingEngine:
                 if not exec_id or exec_id in seen:
                     continue
                 seen.add(exec_id)
-                records.append(ExecutionRecord(symbol=item.get("symbol", ""), side=item.get("side", ""), order_id=item.get("orderId", ""), order_link_id=item.get("orderLinkId", ""), exec_id=exec_id, exec_fee=float(item.get("execFee", 0) or 0), fee_currency=item.get("feeCurrency", ""), exec_price=float(item.get("execPrice", 0) or 0), exec_qty=float(item.get("execQty", 0) or 0), fee_rate=float(item.get("feeRate", 0) or 0) if item.get("feeRate") not in (None, "") else None, exec_time=datetime.fromtimestamp(int(item.get("execTime", 0)) / 1000, tz=timezone.utc)))
+                order_link_id = item.get("orderLinkId", "")
+                group_id = self.execution_group_links.get(order_link_id)
+                if not group_id:
+                    parts = order_link_id.split("-")
+                    if len(parts) >= 3 and parts[0] == "ic" and parts[1] not in {"close", "mkt"}:
+                        group_id = parts[1]
+                baseline = (self.execution_groups.get(group_id or "") or {}).get("legs", {}).get(item.get("symbol", ""), {})
+                exec_price = float(item.get("execPrice", 0) or 0)
+                exec_qty = float(item.get("execQty", 0) or 0)
+                chain_price = float(baseline.get("chain_price", 0) or 0) if baseline else None
+                strategy_side = baseline.get("side")
+                chain_diff = ((1 if strategy_side == "Sell" else -1) * (exec_price - chain_price) * exec_qty) if chain_price is not None and strategy_side else None
+                records.append(ExecutionRecord(symbol=item.get("symbol", ""), side=item.get("side", ""), order_id=item.get("orderId", ""), order_link_id=order_link_id, exec_id=exec_id, exec_fee=float(item.get("execFee", 0) or 0), fee_currency=item.get("feeCurrency", ""), exec_price=exec_price, exec_qty=exec_qty, fee_rate=float(item.get("feeRate", 0) or 0) if item.get("feeRate") not in (None, "") else None, exec_time=datetime.fromtimestamp(int(item.get("execTime", 0)) / 1000, tz=timezone.utc), execution_group=group_id, chain_price_at_create=chain_price, chain_price_diff=chain_diff))
             self.last_executions = sorted(records, key=lambda item: item.exec_time, reverse=True)[:100]
         except Exception as exc:
             self.log("WARNING", f"Could not load execution fee records: {exc}")

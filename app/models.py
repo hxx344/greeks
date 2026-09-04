@@ -116,6 +116,9 @@ class ExecutionRecord(BaseModel):
     fee_rate: float | None = None
     exec_time: datetime
     reduce_only: bool = False
+    execution_group: str | None = None
+    chain_price_at_create: float | None = None
+    chain_price_diff: float | None = None
 
 
 class Position(BaseModel):
