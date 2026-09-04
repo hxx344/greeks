@@ -13,7 +13,7 @@ from app.bybit import BybitClient
 from app.config import Settings
 from app.engine import TradingEngine
 from app.main import app
-from app.models import Position
+from app.models import ExecutionRecord, Position
 from app.strategy import build_iron_condor, demo_chain
 
 
@@ -97,6 +97,33 @@ class CoreTests(unittest.TestCase):
             positions = [Position(symbol=leg["symbol"], side=leg["side"], size=0.01, avg_price=1, mark_price=1, unrealised_pnl=0) for leg in legs[:3]]
             self.assertFalse(engine._track_filled_rfq(positions))
             self.assertFalse(engine.active_strategy_symbols)
+
+    def test_manual_open_task_positions_restore_strategy_tracking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(_env_file=None, state_file=f"{directory}/state.json")
+            engine = TradingEngine(settings)
+            legs = {
+                "CALL-SHORT": {"side": "Sell", "qty": 0.01},
+                "PUT-SHORT": {"side": "Sell", "qty": 0.01},
+                "CALL-LONG": {"side": "Buy", "qty": 0.01},
+                "PUT-LONG": {"side": "Buy", "qty": 0.01},
+            }
+            engine.execution_groups = {"group1": {"type": "open", "created_at": "2026-01-01T00:00:00Z", "legs": legs}}
+            positions = [Position(symbol=symbol, side=leg["side"], size=0.01, avg_price=1, mark_price=1, unrealised_pnl=0) for symbol, leg in legs.items()]
+            self.assertTrue(engine._recover_tracked_open_positions(positions))
+            self.assertEqual(engine.active_strategy_group_id, "group1")
+            self.assertEqual(len(engine.active_strategy_symbols), 4)
+
+    def test_legacy_manual_executions_restore_strategy_tracking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(_env_file=None, state_file=f"{directory}/state.json")
+            engine = TradingEngine(settings)
+            legs = [("CALL-SHORT", "Sell"), ("PUT-SHORT", "Sell"), ("CALL-LONG", "Buy"), ("PUT-LONG", "Buy")]
+            now = datetime.now(timezone.utc)
+            engine.last_executions = [ExecutionRecord(symbol=symbol, side=side, order_id=str(index), order_link_id=f"ic-legacy-{index}", exec_id=str(index), exec_fee=0, fee_currency="USDT", exec_price=1, exec_qty=0.01, exec_time=now) for index, (symbol, side) in enumerate(legs)]
+            positions = [Position(symbol=symbol, side=side, size=0.01, avg_price=1, mark_price=1, unrealised_pnl=0) for symbol, side in legs]
+            self.assertTrue(engine._recover_tracked_open_positions(positions))
+            self.assertEqual(engine.active_strategy_group_id, "legacy")
 
     def test_get_signature_matches_wire_query_order(self):
         client = BybitClient("key", "secret", testnet=False, recv_window=5000)

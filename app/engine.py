@@ -26,6 +26,7 @@ class TradingEngine:
         self.last_open_week: str | None = None
         self.active_strategy_symbols: set[str] = set()
         self.active_strategy_sizes: dict[str, float] = {}
+        self.active_strategy_group_id: str | None = None
         self.rfq_state: dict = {}
         self.execution_groups: dict[str, dict] = {}
         self.execution_group_links: dict[str, str] = {}
@@ -41,6 +42,7 @@ class TradingEngine:
             self.last_open_week = state.get("last_open_week")
             self.active_strategy_symbols = set(state.get("active_strategy_symbols", []))
             self.active_strategy_sizes = {key: float(value) for key, value in (state.get("active_strategy_sizes") or {}).items()}
+            self.active_strategy_group_id = state.get("active_strategy_group_id")
             self.rfq_state = state.get("rfq_state") or {}
             self.execution_groups = state.get("execution_groups") or {}
             self.execution_group_links = state.get("execution_group_links") or {}
@@ -51,7 +53,7 @@ class TradingEngine:
         target = Path(self.settings.state_file)
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = target.with_suffix(target.suffix + ".tmp")
-        temp.write_text(json.dumps({"last_open_week": self.last_open_week, "active_strategy_symbols": sorted(self.active_strategy_symbols), "active_strategy_sizes": self.active_strategy_sizes, "rfq_state": self.rfq_state, "execution_groups": self.execution_groups, "execution_group_links": self.execution_group_links}), encoding="utf-8")
+        temp.write_text(json.dumps({"last_open_week": self.last_open_week, "active_strategy_symbols": sorted(self.active_strategy_symbols), "active_strategy_sizes": self.active_strategy_sizes, "active_strategy_group_id": self.active_strategy_group_id, "rfq_state": self.rfq_state, "execution_groups": self.execution_groups, "execution_group_links": self.execution_group_links}), encoding="utf-8")
         temp.replace(target)
 
     def is_open_window(self, now: datetime | None = None) -> bool:
@@ -279,6 +281,7 @@ class TradingEngine:
             if live and successful_legs:
                 self.active_strategy_symbols = {leg.symbol for leg, _ in successful_legs}
                 self.active_strategy_sizes = {f"{leg.symbol}|{leg.side}": filled_qty for leg, filled_qty in successful_legs}
+                self.active_strategy_group_id = request_id
                 self._save_state()
             if scheduled:
                 self.last_open_week = datetime.now(timezone.utc).strftime("%G-W%V")
@@ -374,8 +377,51 @@ class TradingEngine:
             sizes[f"{symbol}|{side}"] = tracked_qty
         self.active_strategy_symbols = {str(leg["symbol"]) for leg in legs}
         self.active_strategy_sizes = sizes
+        self.active_strategy_group_id = f"rfq:{self.rfq_state.get('rfq_id', '')}"
         self._save_state()
         return True
+
+    def _recover_tracked_open_positions(self, positions: list[Position]) -> bool:
+        position_map = {(position.symbol, position.side): position for position in positions if position.size > 0}
+        candidates: list[tuple[str, str, list[dict]]] = []
+        for group_id, group in self.execution_groups.items():
+            if group.get("type") != "open" or group.get("status") == "closed":
+                continue
+            legs = [{"symbol": symbol, **details} for symbol, details in (group.get("legs") or {}).items()]
+            candidates.append((str(group.get("created_at", "")), group_id, legs))
+        execution_groups: dict[str, dict[tuple[str, str], float]] = {}
+        execution_times: dict[str, str] = {}
+        for execution in self.last_executions:
+            parts = execution.order_link_id.split("-")
+            if execution.reduce_only or len(parts) < 3 or parts[0] != "ic" or parts[1] in {"close", "mkt"}:
+                continue
+            group_id = execution.execution_group or parts[1]
+            key = (execution.symbol, execution.side)
+            bucket = execution_groups.setdefault(group_id, {})
+            bucket[key] = bucket.get(key, 0.0) + execution.exec_qty
+            execution_times[group_id] = max(execution_times.get(group_id, ""), execution.exec_time.isoformat())
+        for group_id, legs in execution_groups.items():
+            candidates.append((execution_times.get(group_id, ""), group_id, [{"symbol": symbol, "side": side, "qty": qty} for (symbol, side), qty in legs.items()]))
+        for _, group_id, legs in sorted(candidates, reverse=True):
+            if len(legs) != 4 or len({leg.get("symbol") for leg in legs}) != 4:
+                continue
+            if any((leg.get("symbol"), leg.get("side")) not in position_map for leg in legs):
+                continue
+            sizes = {}
+            for leg in legs:
+                symbol, side = str(leg["symbol"]), str(leg["side"])
+                requested_qty = float(leg.get("qty", 0) or 0)
+                if requested_qty <= 0:
+                    break
+                sizes[f"{symbol}|{side}"] = min(requested_qty, position_map[(symbol, side)].size)
+            if len(sizes) != 4:
+                continue
+            self.active_strategy_symbols = {str(leg["symbol"]) for leg in legs}
+            self.active_strategy_sizes = sizes
+            self.active_strategy_group_id = group_id
+            self._save_state()
+            return True
+        return False
 
     async def cancel_rfq(self, request: RfqCancelRequest) -> dict:
         if request.rfq_id != self.rfq_state.get("rfq_id"):
@@ -442,8 +488,13 @@ class TradingEngine:
             if live:
                 raw_positions = await self.client.positions()
                 current = [Position(symbol=item.get("symbol", ""), side=item.get("side", ""), size=float(item.get("size", 0) or 0), avg_price=float(item.get("avgPrice", 0) or 0), mark_price=float(item.get("markPrice", 0) or 0), unrealised_pnl=float(item.get("unrealisedPnl", 0) or 0), source="bybit") for item in raw_positions if float(item.get("size", 0) or 0) > 0]
-                if not self.active_strategy_symbols and self._track_filled_rfq(current):
-                    self.log("INFO", "Recovered tracked Iron Condor legs from the executed RFQ and current Bybit positions")
+                if len(self.active_strategy_symbols) < 4:
+                    recovered = self._track_filled_rfq(current)
+                    if not recovered:
+                        await self.load_recent_executions()
+                        recovered = self._recover_tracked_open_positions(current)
+                    if recovered:
+                        self.log("INFO", "Recovered tracked Iron Condor legs from the opening task and current Bybit positions")
             else:
                 preview = self.preview or await self.make_preview()
                 current = list(self.positions)
@@ -482,9 +533,14 @@ class TradingEngine:
                 self.positions = [position for position in self.positions if position not in current]
                 self.last_executions = []
             if not any(item.status in {"error", "partial"} for item in results):
+                completed_group_id = self.active_strategy_group_id
                 self.active_strategy_symbols.difference_update(position.symbol for position in current)
                 for position in current:
                     self.active_strategy_sizes.pop(f"{position.symbol}|{position.side}", None)
+                if completed_group_id in self.execution_groups:
+                    self.execution_groups[completed_group_id]["status"] = "closed"
+                if not self.active_strategy_symbols:
+                    self.active_strategy_group_id = None
                 self._save_state()
             elif live:
                 for position, result in zip(current, results):
@@ -521,8 +577,8 @@ class TradingEngine:
             try:
                 raw = await self.client.positions()
                 self.positions = [Position(symbol=item.get("symbol", ""), side=item.get("side", ""), size=float(item.get("size", 0)), avg_price=float(item.get("avgPrice", 0) or 0), mark_price=float(item.get("markPrice", 0) or 0), unrealised_pnl=float(item.get("unrealisedPnl", 0) or 0), source="bybit") for item in raw if float(item.get("size", 0) or 0) > 0]
-                if not self.active_strategy_symbols and self._track_filled_rfq(self.positions):
-                    self.log("INFO", "Recovered tracked Iron Condor legs from the executed RFQ and current Bybit positions")
+                if len(self.active_strategy_symbols) < 4 and (self._track_filled_rfq(self.positions) or self._recover_tracked_open_positions(self.positions)):
+                    self.log("INFO", "Recovered tracked Iron Condor legs from the opening task and current Bybit positions")
             except BybitError as exc:
                 self.log("WARNING", f"Could not load private positions: {exc}")
         return self.positions
