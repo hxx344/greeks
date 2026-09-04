@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     auto_open: bool = False
     market_refresh_seconds: int = Field(default=10, ge=1)
     quote_stale_seconds: int = Field(default=30, ge=5)
-    max_spread_bps: float = Field(default=250.0, gt=0)
+    max_spread_bps: float = Field(default=0.0, ge=0)
     failed_leg_retry_delay_seconds: float = Field(default=0.8, ge=0, le=5)
     failed_leg_position_checks: int = Field(default=5, ge=1, le=10)
     failed_leg_position_check_interval_seconds: float = Field(default=1.0, ge=0.1, le=5)

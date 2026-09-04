@@ -198,7 +198,7 @@ class TradingEngine:
                 if live and (instrument.bid <= 0 or instrument.ask <= 0):
                     raise ValueError(f"No executable bid/ask for {leg.symbol}")
                 spread_bps = (instrument.ask - instrument.bid) / instrument.mark_price * 10000 if instrument.mark_price > 0 else float("inf")
-                if live and spread_bps > self.settings.max_spread_bps:
+                if live and self.settings.max_spread_bps > 0 and spread_bps > self.settings.max_spread_bps:
                     raise ValueError(f"Spread for {leg.symbol} is {spread_bps:.0f} bps, above limit {self.settings.max_spread_bps:.0f} bps")
             if preview.estimated_margin_usd > self.settings.max_risk_usd:
                 raise ValueError("Risk limit exceeded; reduce quantity or raise MAX_RISK_USD")
