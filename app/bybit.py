@@ -85,6 +85,9 @@ class BybitClient:
         result = await self._request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT,USDC"}, private=True)
         return (result.get("list") or [{}])[0]
 
+    async def portfolio_margin(self, base_coin: str = "BTC") -> dict[str, Any]:
+        return await self._request("GET", "/v5/asset/portfolio-margin", {"baseCoin": base_coin}, private=True)
+
     async def executions(self, order_link_id: str | None = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"category": "option", "baseCoin": "BTC", "limit": 50}
         if order_link_id:

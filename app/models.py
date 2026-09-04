@@ -150,3 +150,16 @@ class AccountHealth(BaseModel):
     updated_at: datetime | None = None
     available: bool = False
     message: str | None = None
+    portfolio_margin_available: bool = False
+    portfolio_margin_message: str | None = None
+    pm_account_initial_margin_usd: float | None = None
+    pm_account_maintenance_margin_usd: float | None = None
+    pm_asset_initial_margin_usd: float | None = None
+    pm_asset_maintenance_margin_usd: float | None = None
+    pm_incremental_initial_margin_usd: float | None = None
+    pm_incremental_maintenance_margin_usd: float | None = None
+    pm_contingency_usd: float | None = None
+    pm_max_loss_price_move: float | None = None
+    pm_max_loss_iv_shock: float | None = None
+    pm_baseline_at: datetime | None = None
+    pm_baseline_context: str | None = None

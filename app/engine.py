@@ -32,6 +32,7 @@ class TradingEngine:
         self.rfq_state: dict = {}
         self.execution_groups: dict[str, dict] = {}
         self.execution_group_links: dict[str, str] = {}
+        self.pm_baseline: dict = {}
         self._load_state()
         self.account_health = AccountHealth(available=False, message="Live account credentials are not configured")
         self.last_executions: list[ExecutionRecord] = []
@@ -48,6 +49,7 @@ class TradingEngine:
             self.rfq_state = state.get("rfq_state") or {}
             self.execution_groups = state.get("execution_groups") or {}
             self.execution_group_links = state.get("execution_group_links") or {}
+            self.pm_baseline = state.get("pm_baseline") or {}
         except (FileNotFoundError, OSError, ValueError):
             self.last_open_week = None
 
@@ -55,7 +57,7 @@ class TradingEngine:
         target = Path(self.settings.state_file)
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = target.with_suffix(target.suffix + ".tmp")
-        temp.write_text(json.dumps({"last_open_week": self.last_open_week, "active_strategy_symbols": sorted(self.active_strategy_symbols), "active_strategy_sizes": self.active_strategy_sizes, "active_strategy_group_id": self.active_strategy_group_id, "rfq_state": self.rfq_state, "execution_groups": self.execution_groups, "execution_group_links": self.execution_group_links}), encoding="utf-8")
+        temp.write_text(json.dumps({"last_open_week": self.last_open_week, "active_strategy_symbols": sorted(self.active_strategy_symbols), "active_strategy_sizes": self.active_strategy_sizes, "active_strategy_group_id": self.active_strategy_group_id, "rfq_state": self.rfq_state, "execution_groups": self.execution_groups, "execution_group_links": self.execution_group_links, "pm_baseline": self.pm_baseline}), encoding="utf-8")
         temp.replace(target)
 
     def is_open_window(self, now: datetime | None = None) -> bool:
@@ -68,6 +70,38 @@ class TradingEngine:
     def log(self, level: str, message: str) -> None:
         self.logs.insert(0, LogEntry(timestamp=datetime.now(timezone.utc), level=level, message=message))
         self.logs = self.logs[:80]
+
+    @staticmethod
+    def _portfolio_margin_metrics(payload: dict) -> dict[str, float | None]:
+        def number(value) -> float | None:
+            return float(value) if value not in (None, "") else None
+
+        wallet = payload.get("wallet") or {}
+        assets = payload.get("assetPnlRange") or []
+        btc = next((item for item in assets if item.get("baseCoin") == "BTC"), {})
+        asset = btc.get("asset") or {}
+        contingency = btc.get("contingency") or {}
+        return {
+            "account_im": number(wallet.get("accountIM")),
+            "account_mm": number(wallet.get("accountMM")),
+            "asset_im": number(asset.get("assetIM")),
+            "asset_mm": number(asset.get("assetMM")),
+            "contingency": number(contingency.get("contingencyComponents")),
+            "max_loss_price_move": number(btc.get("maxLossPriceMove")),
+            "max_loss_iv_shock": number(btc.get("maxLossIvShock")),
+        }
+
+    async def _capture_pm_baseline(self, context: str) -> None:
+        try:
+            account = await self.client.account_info()
+            if account.get("marginMode") != "PORTFOLIO_MARGIN":
+                self.pm_baseline = {}
+                return
+            metrics = self._portfolio_margin_metrics(await self.client.portfolio_margin("BTC"))
+            self.pm_baseline = {**metrics, "captured_at": datetime.now(timezone.utc).isoformat(), "context": context}
+            self._save_state()
+        except Exception as exc:
+            self.log("WARNING", f"Could not capture pre-trade portfolio margin baseline: {exc}")
 
     async def refresh_chain(self, force: bool = False) -> list:
         now = datetime.now(timezone.utc)
@@ -216,6 +250,7 @@ class TradingEngine:
             if live and preview.source != "bybit":
                 raise ValueError("Live orders require a fresh Bybit market snapshot")
             if live:
+                await self._capture_pm_baseline("scheduled_open" if scheduled else "manual_open")
                 request_id = uuid4().hex[:12]
                 order_links = [f"ic-{request_id}-{index}" for index, _ in enumerate(preview.legs)]
                 self.execution_groups[request_id] = {"type": "open", "created_at": datetime.now(timezone.utc).isoformat(), "legs": {leg.symbol: {"side": leg.side, "chain_price": (next(item for item in self.chain if item.symbol == leg.symbol).bid if leg.side == "Sell" else next(item for item in self.chain if item.symbol == leg.symbol).ask), "qty": qty} for leg in preview.legs}}
@@ -361,6 +396,7 @@ class TradingEngine:
         quote = next((item for item in self.rfq_state.get("quotes", []) if item.get("quoteId") == request.quote_id), None)
         if quote is None:
             raise ValueError("Quote is not available or has expired")
+        await self._capture_pm_baseline("rfq_open")
         result = await self.client.execute_quote(request.rfq_id, request.quote_id, request.quote_side)
         self.rfq_state.update({"status": result.get("status", "PendingFill"), "selected_quote_id": request.quote_id, "selected_quote_side": request.quote_side, "updated_at": datetime.now(timezone.utc).isoformat()})
         self._save_state()
@@ -550,6 +586,7 @@ class TradingEngine:
                     self.execution_groups[completed_group_id]["status"] = "closed"
                 if not self.active_strategy_symbols:
                     self.active_strategy_group_id = None
+                    self.pm_baseline = {}
                 self._save_state()
             elif live:
                 for position, result in zip(current, results):
@@ -604,7 +641,19 @@ class TradingEngine:
             def rate(name: str) -> float | None:
                 value = wallet.get(name, "")
                 return float(value) if value not in (None, "") else None
-            self.account_health = AccountHealth(available_balance_usd=number("totalAvailableBalance"), margin_balance_usd=number("totalMarginBalance"), total_equity_usd=number("totalEquity"), wallet_balance_usd=number("totalWalletBalance"), initial_margin_usd=number("totalInitialMargin"), maintenance_margin_usd=number("totalMaintenanceMargin"), initial_margin_rate=rate("accountIMRate"), maintenance_margin_rate=rate("accountMMRate"), margin_mode=account.get("marginMode"), updated_at=datetime.now(timezone.utc), available=True)
+            health_data = {"available_balance_usd": number("totalAvailableBalance"), "margin_balance_usd": number("totalMarginBalance"), "total_equity_usd": number("totalEquity"), "wallet_balance_usd": number("totalWalletBalance"), "initial_margin_usd": number("totalInitialMargin"), "maintenance_margin_usd": number("totalMaintenanceMargin"), "initial_margin_rate": rate("accountIMRate"), "maintenance_margin_rate": rate("accountMMRate"), "margin_mode": account.get("marginMode"), "updated_at": datetime.now(timezone.utc), "available": True}
+            if account.get("marginMode") == "PORTFOLIO_MARGIN":
+                try:
+                    metrics = self._portfolio_margin_metrics(await self.client.portfolio_margin("BTC"))
+                    baseline_account_im = self.pm_baseline.get("account_im")
+                    baseline_account_mm = self.pm_baseline.get("account_mm")
+                    account_im = metrics.get("account_im")
+                    account_mm = metrics.get("account_mm")
+                    health_data.update({"portfolio_margin_available": True, "pm_account_initial_margin_usd": account_im, "pm_account_maintenance_margin_usd": account_mm, "pm_asset_initial_margin_usd": metrics.get("asset_im"), "pm_asset_maintenance_margin_usd": metrics.get("asset_mm"), "pm_incremental_initial_margin_usd": account_im - baseline_account_im if account_im is not None and baseline_account_im is not None else None, "pm_incremental_maintenance_margin_usd": account_mm - baseline_account_mm if account_mm is not None and baseline_account_mm is not None else None, "pm_contingency_usd": metrics.get("contingency"), "pm_max_loss_price_move": metrics.get("max_loss_price_move"), "pm_max_loss_iv_shock": metrics.get("max_loss_iv_shock"), "pm_baseline_at": self.pm_baseline.get("captured_at"), "pm_baseline_context": self.pm_baseline.get("context")})
+                except Exception as exc:
+                    health_data.update({"portfolio_margin_message": str(exc)})
+                    self.log("WARNING", f"Could not load detailed portfolio margin: {exc}")
+            self.account_health = AccountHealth(**health_data)
         except Exception as exc:
             self.account_health = AccountHealth(available=False, message=str(exc))
             self.log("WARNING", f"Could not load account health: {exc}")

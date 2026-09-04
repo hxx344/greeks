@@ -74,6 +74,28 @@ class CoreTests(unittest.TestCase):
         settings = Settings(_env_file=None)
         self.assertFalse(settings.allow_market_fallback)
 
+    def test_portfolio_margin_metrics_are_parsed(self):
+        payload = {"wallet": {"accountIM": "120.5", "accountMM": "90.25"}, "assetPnlRange": [{"baseCoin": "BTC", "asset": {"assetIM": "110", "assetMM": "80"}, "contingency": {"contingencyComponents": "7.5"}, "maxLossPriceMove": "-0.1", "maxLossIvShock": "0.2"}]}
+        metrics = TradingEngine._portfolio_margin_metrics(payload)
+        self.assertEqual(metrics["account_im"], 120.5)
+        self.assertEqual(metrics["asset_mm"], 80.0)
+        self.assertEqual(metrics["contingency"], 7.5)
+        self.assertEqual(metrics["max_loss_price_move"], -0.1)
+
+    def test_account_health_reports_real_pm_increment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(_env_file=None, bybit_api_key="key", bybit_api_secret="secret", state_file=f"{directory}/state.json")
+            engine = TradingEngine(settings)
+            engine.pm_baseline = {"account_im": 100.0, "account_mm": 75.0, "captured_at": "2026-09-05T00:00:00+00:00", "context": "manual_open"}
+            engine.client.account_info = AsyncMock(return_value={"marginMode": "PORTFOLIO_MARGIN"})
+            engine.client.wallet_balance = AsyncMock(return_value={"totalAvailableBalance": "900", "totalMarginBalance": "1000", "totalEquity": "1100", "totalWalletBalance": "1000", "totalInitialMargin": "120", "totalMaintenanceMargin": "90", "accountIMRate": "0.12", "accountMMRate": "0.09"})
+            engine.client.portfolio_margin = AsyncMock(return_value={"wallet": {"accountIM": "125", "accountMM": "92"}, "assetPnlRange": [{"baseCoin": "BTC", "asset": {"assetIM": "115", "assetMM": "82"}, "contingency": {"contingencyComponents": "8"}, "maxLossPriceMove": "-0.1", "maxLossIvShock": "-0.2"}]})
+            health = asyncio.run(engine.load_account_health())
+            self.assertTrue(health.portfolio_margin_available)
+            self.assertEqual(health.pm_incremental_initial_margin_usd, 25.0)
+            self.assertEqual(health.pm_incremental_maintenance_margin_usd, 17.0)
+            self.assertEqual(health.pm_asset_initial_margin_usd, 115.0)
+
     def test_executed_rfq_positions_restore_strategy_tracking(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = Settings(_env_file=None, state_file=f"{directory}/state.json")
