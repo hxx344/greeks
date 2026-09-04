@@ -28,13 +28,13 @@ def build_iron_condor(options: list[OptionInstrument], now: datetime, target_dte
     long_puts = [item for item in puts if item.strike < short_put.strike]
     if not long_calls or not long_puts:
         raise ValueError("Unable to find protective wings beyond short strikes")
-    long_call = _nearest(long_calls, 0.20)
-    long_put = _nearest(long_puts, 0.20)
+    long_call = _nearest(long_calls, 0.10)
+    long_put = _nearest(long_puts, 0.10)
     legs = [
         StrategyLeg(symbol=short_call.symbol, side="Sell", option_type="Call", strike=short_call.strike, delta=short_call.delta, qty=qty, mark_price=short_call.mark_price, target_delta=0.45),
         StrategyLeg(symbol=short_put.symbol, side="Sell", option_type="Put", strike=short_put.strike, delta=short_put.delta, qty=qty, mark_price=short_put.mark_price, target_delta=0.45),
-        StrategyLeg(symbol=long_call.symbol, side="Buy", option_type="Call", strike=long_call.strike, delta=long_call.delta, qty=qty, mark_price=long_call.mark_price, target_delta=0.20),
-        StrategyLeg(symbol=long_put.symbol, side="Buy", option_type="Put", strike=long_put.strike, delta=long_put.delta, qty=qty, mark_price=long_put.mark_price, target_delta=0.20),
+        StrategyLeg(symbol=long_call.symbol, side="Buy", option_type="Call", strike=long_call.strike, delta=long_call.delta, qty=qty, mark_price=long_call.mark_price, target_delta=0.10),
+        StrategyLeg(symbol=long_put.symbol, side="Buy", option_type="Put", strike=long_put.strike, delta=long_put.delta, qty=qty, mark_price=long_put.mark_price, target_delta=0.10),
     ]
     credit = (short_call.mark_price + short_put.mark_price - long_call.mark_price - long_put.mark_price) * qty
     call_width = long_call.strike - short_call.strike

@@ -57,6 +57,7 @@ class CoreTests(unittest.TestCase):
         preview = build_iron_condor(demo_chain(now), now, target_dte=2, qty=0.01)
         self.assertEqual(len(preview.legs), 4)
         self.assertEqual({leg.side for leg in preview.legs}, {"Buy", "Sell"})
+        self.assertEqual({leg.target_delta for leg in preview.legs if leg.side == "Buy"}, {0.10})
 
     def test_strategy_max_loss_uses_each_wing_width(self):
         now = datetime.now(timezone.utc)
