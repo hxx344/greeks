@@ -87,13 +87,17 @@ function renderLogs(items) { $('logs').innerHTML = (items || []).slice(0, 20).ma
 function renderExecutions(items) {
   const target = $('executions');
   if (!items || !items.length) { target.className = 'executions empty'; target.textContent = '暂无成交记录'; return; }
+  const isClose = (item) => item.reduce_only === true || String(item.order_link_id || '').split('-')[1] === 'close';
+  const timeBucket = (item) => { const time = new Date(item.exec_time || 0).getTime(); return Number.isFinite(time) ? Math.floor(time / 15000) : 0; };
   const groups = new Map();
   for (const item of items) {
     const link = String(item.order_link_id || '');
     const parts = link.split('-');
     let key = link;
     let label = '其他成交';
+    const close = isClose(item);
     if (parts[0] === 'ic' && parts[1] === 'close' && parts[2]) { key = parts.slice(0, 3).join('-'); label = '平仓组合'; }
+    else if (close) { key = `legacy-close-${timeBucket(item)}`; label = '平仓组合'; }
     else if (parts[0] === 'ic' && parts[1]) { key = parts.slice(0, 2).join('-'); label = '开仓组合'; }
     if (!groups.has(key)) groups.set(key, {label, items: [], fee: 0, cashflow: 0, currency: item.fee_currency || ''});
     const group = groups.get(key);
@@ -102,8 +106,32 @@ function renderExecutions(items) {
     group.cashflow += (item.side === 'Sell' ? 1 : -1) * Number(item.exec_price || 0) * Number(item.exec_qty || 0);
     if (!group.currency) group.currency = item.fee_currency || '';
   }
+  const openings = new Map();
+  for (const item of items.filter((entry) => !isClose(entry))) {
+    const list = openings.get(item.symbol) || [];
+    list.push(item);
+    openings.set(item.symbol, list);
+  }
   target.className = 'executions';
-  target.innerHTML = [...groups.values()].map((group) => { const net = group.cashflow - group.fee; const legCount = new Set(group.items.map((item) => item.symbol)).size; const resultLabel = group.label === '平仓组合' ? '组合平仓收益' : '组合成交净额'; return `<div class="execution-group"><div class="execution-group-head"><strong>${group.label} · ${legCount} 腿</strong><span>${resultLabel} ${net >= 0 ? '+' : ''}${net.toFixed(6)} ${esc(group.currency)} · 手续费 -${group.fee.toFixed(6)} ${esc(group.currency)}</span></div>${group.items.map((item) => `<div class="execution-row"><strong>${esc(item.symbol)}</strong><span>${esc(item.side)} ${Number(item.exec_qty).toFixed(4)} · ${money(item.exec_price)}</span><span class="exec-fee">-${Number(item.exec_fee).toFixed(6)} ${esc(item.fee_currency)}</span></div>`).join('')}</div>`; }).join('');
+  target.innerHTML = [...groups.values()].map((group) => {
+    const legCount = new Set(group.items.map((item) => item.symbol)).size;
+    let realized = 0;
+    let matched = true;
+    if (group.label === '平仓组合') {
+      for (const close of group.items) {
+        const candidates = openings.get(close.symbol) || [];
+        const open = candidates.find((entry) => entry.side !== close.side);
+        if (!open) { matched = false; continue; }
+        const qty = Math.min(Number(close.exec_qty || 0), Number(open.exec_qty || 0));
+        const direction = close.side === 'Sell' ? 1 : -1;
+        realized += direction * (Number(close.exec_price || 0) - Number(open.exec_price || 0)) * qty - Number(close.exec_fee || 0) - Number(open.exec_fee || 0) * (qty / Math.max(Number(open.exec_qty || 1), 1e-12));
+      }
+    }
+    const resultLabel = group.label === '平仓组合' ? '组合平仓收益' : '组合成交净额';
+    const resultValue = group.label === '平仓组合' ? (matched ? realized : null) : group.cashflow - group.fee;
+    const resultText = resultValue === null ? `${resultLabel} 待匹配开仓成交` : `${resultLabel} ${resultValue >= 0 ? '+' : ''}${resultValue.toFixed(6)} ${esc(group.currency)}`;
+    return `<div class="execution-group"><div class="execution-group-head"><strong>${group.label} · ${legCount} 腿</strong><span>${resultText} · 手续费 -${group.fee.toFixed(6)} ${esc(group.currency)}</span></div>${group.items.map((item) => `<div class="execution-row"><strong>${esc(item.symbol)}</strong><span>${esc(item.side)} ${Number(item.exec_qty).toFixed(4)} · ${money(item.exec_price)}</span><span class="exec-fee">-${Number(item.exec_fee).toFixed(6)} ${esc(item.fee_currency)}</span></div>`).join('')}</div>`;
+  }).join('');
 }
 async function load() {
   try {
