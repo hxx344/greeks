@@ -23,8 +23,8 @@ uvicorn app.main:app --reload
 * 请求体中的 `confirm_live=true`
 * `BYBIT_TESTNET=false`（建议先使用测试网）
 
-默认风险上限为 `MAX_RISK_USD=2500`。四腿会并发提交市价单；若某腿请求失败，系统会等待并最多查询 Bybit 当前仓位 5 次（默认间隔 1 秒），仅对确认不存在的失败腿重试一次，不发送成交后的反向订单，也不会无限重试。可通过 `FAILED_LEG_POSITION_CHECKS` 和 `FAILED_LEG_POSITION_CHECK_INTERVAL_SECONDS` 调整。
-实盘执行使用 Limit + BBO 跟随：Buy 挂 Bid1（买一），Sell 挂 Ask1（卖一），默认每 1 秒读取最新报价并改单，30 秒未完成则撤单。Limit BBO 是程序侧跟单，不是交易所原子组合订单，四腿可能不同步成交。
+默认风险上限为 `MAX_RISK_USD=2500`。策略采用固定周历：仅允许 UTC 周五实盘开仓，四条腿必须属于同一个 UTC 周日到期日；`TARGET_DTE_DAYS` 仅为旧配置兼容项，不再用于滚动选择“开仓后两天”的合约。
+实盘执行使用 Limit + BBO 跟随：Buy 挂 Bid1（买一），Sell 挂 Ask1（卖一），默认每 1 秒读取最新报价并在 BBO 变化时改单，600 秒未完成则撤单。默认不使用市价兜底。Limit BBO 是程序侧跟单，不是交易所原子组合订单，四腿可能不同步成交。
 
 前端数量选择会实时请求 `/api/strategy/preview?quantity=...` 重算净权利金、Bybit 官方 Regular/Cross 期权 Order IM、短期权 Maintenance MM 和交易成本。手续费使用 Bybit 公式 `min(fee_rate × index_price, 7% × option_price) × qty`。若设置 `MARGIN_MODE=PORTFOLIO_MARGIN`，页面显示的是基于四腿压力损失的下界估算；Portfolio Margin 的精确账户级结果仍由 Bybit 风险引擎根据全账户仓位和动态压力参数决定。
 

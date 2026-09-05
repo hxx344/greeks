@@ -13,8 +13,8 @@ from app.bybit import BybitClient
 from app.config import Settings
 from app.engine import TradingEngine
 from app.main import app
-from app.models import ExecutionRecord, Position
-from app.strategy import build_iron_condor, demo_chain
+from app.models import ExecutionRecord, OptionInstrument, Position
+from app.strategy import build_iron_condor, choose_expiry, demo_chain
 
 
 class FakeResponse:
@@ -58,6 +58,25 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(preview.legs), 4)
         self.assertEqual({leg.side for leg in preview.legs}, {"Buy", "Sell"})
         self.assertEqual({leg.target_delta for leg in preview.legs if leg.side == "Buy"}, {0.10})
+        self.assertEqual(preview.expiry.weekday(), 6)
+
+    def test_expiry_selection_uses_next_sunday_not_rolling_dte(self):
+        now = datetime(2026, 9, 2, 21, tzinfo=timezone.utc)
+        saturday = datetime(2026, 9, 5, 8, tzinfo=timezone.utc)
+        sunday = datetime(2026, 9, 6, 8, tzinfo=timezone.utc)
+        options = [OptionInstrument(symbol="SAT", expiry=saturday, strike=100, option_type="Call", delta=0.1), OptionInstrument(symbol="SUN", expiry=sunday, strike=100, option_type="Call", delta=0.1)]
+        self.assertEqual(choose_expiry(options, now, 2), sunday)
+
+    def test_live_entry_calendar_requires_friday_and_sunday(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = TradingEngine(Settings(_env_file=None, state_file=f"{directory}/state.json"))
+            friday = datetime(2026, 9, 4, 21, tzinfo=timezone.utc)
+            sunday = datetime(2026, 9, 6, 8, tzinfo=timezone.utc)
+            engine._validate_open_calendar(sunday, friday)
+            with self.assertRaisesRegex(ValueError, "Sunday"):
+                engine._validate_open_calendar(datetime(2026, 9, 5, 8, tzinfo=timezone.utc), friday)
+            with self.assertRaisesRegex(ValueError, "Friday"):
+                engine._validate_open_calendar(sunday, datetime(2026, 9, 5, 1, tzinfo=timezone.utc))
 
     def test_strategy_max_loss_uses_each_wing_width(self):
         now = datetime.now(timezone.utc)

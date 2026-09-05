@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from math import isclose
 from pathlib import Path
 from uuid import uuid4
@@ -66,6 +66,16 @@ class TradingEngine:
             return False
         scheduled = now.replace(hour=self.settings.open_hour_utc, minute=self.settings.open_minute_utc, second=0, microsecond=0)
         return 0 <= (now - scheduled).total_seconds() < self.settings.open_window_seconds
+
+    def _validate_open_calendar(self, expiry: datetime, now: datetime | None = None) -> None:
+        now = now or datetime.now(timezone.utc)
+        if now.weekday() != self.settings.open_day:
+            raise ValueError("Live Iron Condor entry is only allowed on the configured Friday open day")
+        if expiry.weekday() != 6:
+            raise ValueError("Live Iron Condor legs must expire on Sunday UTC")
+        expected_sunday = (now + timedelta(days=(6 - now.weekday()) % 7)).date()
+        if expiry.date() != expected_sunday:
+            raise ValueError(f"Live Iron Condor expiry must be Sunday {expected_sunday.isoformat()} UTC")
 
     def log(self, level: str, message: str) -> None:
         self.logs.insert(0, LogEntry(timestamp=datetime.now(timezone.utc), level=level, message=message))
@@ -225,6 +235,8 @@ class TradingEngine:
             qty = request.quantity or self.settings.leg_qty
             preview = await self.make_preview(qty)
             live = bool(request.confirm_live and self.settings.can_trade_live)
+            if live:
+                self._validate_open_calendar(preview.expiry)
             if live and scheduled and not self.is_open_window():
                 raise ValueError(f"Live orders are only allowed during Friday {self.settings.open_hour_utc:02d}:{self.settings.open_minute_utc:02d} UTC window")
             if request.confirm_live and not self.settings.can_trade_live:
@@ -396,6 +408,10 @@ class TradingEngine:
         quote = next((item for item in self.rfq_state.get("quotes", []) if item.get("quoteId") == request.quote_id), None)
         if quote is None:
             raise ValueError("Quote is not available or has expired")
+        expiries = {item.expiry for leg in self.rfq_state.get("legs", []) for item in self.chain if item.symbol == leg.get("symbol")}
+        if len(expiries) != 1:
+            raise ValueError("RFQ legs must resolve to one common expiry")
+        self._validate_open_calendar(expiries.pop())
         await self._capture_pm_baseline("rfq_open")
         result = await self.client.execute_quote(request.rfq_id, request.quote_id, request.quote_side)
         self.rfq_state.update({"status": result.get("status", "PendingFill"), "selected_quote_id": request.quote_id, "selected_quote_side": request.quote_side, "updated_at": datetime.now(timezone.utc).isoformat()})

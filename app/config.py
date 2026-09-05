@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     live_confirmation: str = ""
     max_risk_usd: float = Field(default=2500.0, gt=0)
     leg_qty: float = Field(default=1.0, gt=0)
-    open_day: int = 4
+    open_day: int = Field(default=4, ge=4, le=4)
     open_hour_utc: int = 21
     open_minute_utc: int = Field(default=0, ge=0, le=59)
     open_window_seconds: int = Field(default=60, ge=1, le=300)

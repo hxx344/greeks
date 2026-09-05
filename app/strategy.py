@@ -8,11 +8,11 @@ def _nearest(options: list[OptionInstrument], target: float) -> OptionInstrument
 
 
 def choose_expiry(options: list[OptionInstrument], now: datetime, target_dte: int) -> datetime:
-    target = now + timedelta(days=target_dte)
-    expiries = sorted({item.expiry for item in options if item.expiry > now})
+    del target_dte  # Kept for API compatibility; this strategy is calendar-based.
+    expiries = sorted({item.expiry for item in options if item.expiry > now and item.expiry.weekday() == 6})
     if not expiries:
-        raise ValueError("No future BTC option expiry available")
-    return min(expiries, key=lambda expiry: abs((expiry - target).total_seconds()))
+        raise ValueError("No future Sunday BTC option expiry available")
+    return expiries[0]
 
 
 def build_iron_condor(options: list[OptionInstrument], now: datetime, target_dte: int = 2, qty: float = 1, contract_multiplier: float = 1.0, fee_rate: float = 0.0003, margin_buffer_pct: float = 0.0, index_price: float = 0.0, margin_mode: str = "REGULAR_MARGIN", mm_factor: float = 0.03, max_im_factor: float = 0.10, min_im_factor: float = 0.05, liquidation_fee_rate: float = 0.002, fee_cap_pct: float = 0.07) -> StrategyPreview:
@@ -73,7 +73,10 @@ def build_iron_condor(options: list[OptionInstrument], now: datetime, target_dte
 
 
 def demo_chain(now: datetime) -> list[OptionInstrument]:
-    expiry = (now + timedelta(days=2)).replace(hour=8, minute=0, second=0, microsecond=0)
+    days_until_sunday = (6 - now.weekday()) % 7
+    expiry = (now + timedelta(days=days_until_sunday)).replace(hour=8, minute=0, second=0, microsecond=0)
+    if expiry <= now:
+        expiry += timedelta(days=7)
     spot = 100000.0
     result: list[OptionInstrument] = []
     for offset in range(-18000, 20001, 5000):
