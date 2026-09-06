@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from math import isfinite
 
 from .models import OptionInstrument, StrategyLeg, StrategyPreview
 
@@ -16,14 +17,21 @@ def choose_expiry(options: list[OptionInstrument], now: datetime, target_dte: in
 
 
 def build_iron_condor(options: list[OptionInstrument], now: datetime, target_dte: int = 2, qty: float = 1, contract_multiplier: float = 1.0, fee_rate: float = 0.0003, margin_buffer_pct: float = 0.0, index_price: float = 0.0, margin_mode: str = "REGULAR_MARGIN", mm_factor: float = 0.03, max_im_factor: float = 0.10, min_im_factor: float = 0.05, liquidation_fee_rate: float = 0.002, fee_cap_pct: float = 0.07) -> StrategyPreview:
+    if not isfinite(qty) or qty <= 0:
+        raise ValueError("Quantity must be finite and greater than zero")
+    options = [item for item in options if isfinite(item.delta) and 0 < abs(item.delta) <= 1 and isfinite(item.mark_price) and item.mark_price > 0 and isfinite(item.strike) and item.strike > 0]
     if not options:
-        raise ValueError("Option chain is empty")
+        raise ValueError("Option chain has no usable prices and deltas")
     expiry = choose_expiry(options, now, target_dte)
     chain = [item for item in options if item.expiry == expiry]
     calls = sorted((item for item in chain if item.option_type == "Call"), key=lambda item: item.strike)
     puts = sorted((item for item in chain if item.option_type == "Put"), key=lambda item: item.strike)
+    if not calls or not puts:
+        raise ValueError("Selected expiry requires both calls and puts with usable prices and deltas")
     short_call = _nearest(calls, 0.45)
     short_put = _nearest(puts, 0.45)
+    if short_put.strike >= short_call.strike:
+        raise ValueError("Iron Condor short put strike must be below short call strike")
     long_calls = [item for item in calls if item.strike > short_call.strike]
     long_puts = [item for item in puts if item.strike < short_put.strike]
     if not long_calls or not long_puts:

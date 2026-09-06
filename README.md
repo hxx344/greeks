@@ -24,7 +24,14 @@ uvicorn app.main:app --reload
 * `BYBIT_TESTNET=false`（建议先使用测试网）
 
 默认风险上限为 `MAX_RISK_USD=2500`。策略采用固定周历：仅允许 UTC 周五实盘开仓，四条腿必须属于同一个 UTC 周日到期日；`TARGET_DTE_DAYS` 仅为旧配置兼容项，不再用于滚动选择“开仓后两天”的合约。
+开仓同时检查预估最大亏损与保证金，两者均不得超过风险上限。实盘开仓与 RFQ 执行要求行情不超过 `QUOTE_STALE_SECONDS`；启用实盘后，未明确确认的开平仓请求会被拒绝。
 实盘执行使用 Limit + BBO 跟随：Buy 挂 Bid1（买一），Sell 挂 Ask1（卖一），默认每 1 秒读取最新报价并在 BBO 变化时改单，600 秒未完成则撤单。默认不使用市价兜底。Limit BBO 是程序侧跟单，不是交易所原子组合订单，四腿可能不同步成交。
+
+下单响应丢失、行情/改单请求失败或执行任务取消时，系统按 `orderLinkId` 尝试撤单，并查询订单状态与累计成交量。撤单应答不代表撤单已经完成；查询不到终态时标记为 `unknown`，保留订单日志并阻止新的实盘开平仓，后续刷新持仓或重试交易入口会继续对账。已有策略须先平仓，才能开下一组策略。新订单日志与已确认成交数量保存在 `STATE_FILE`，重启后继续使用。
+
+即使设置 `ALLOW_MARKET_FALLBACK=true`，也只对确认终结且未完全成交的原订单补单。补单前重新检查原订单终态，只发送剩余数量，并校验最小数量和步长；无法确认状态或剩余数量不合法时不补单。补单本身也需确认成交，不会把“请求已接受”当作“已成交”。`FAILED_LEG_POSITION_CHECKS` 和 `FAILED_LEG_POSITION_CHECK_INTERVAL_SECONDS` 为兼容保留名称，现在控制订单状态对账次数与间隔。
+
+RFQ 询价需要 API 凭据；执行报价还必须满足上述实盘开关和明确确认，并检查四腿的合约、数量、价格、到期时间与报价对应的最大亏损。活动询价不能被新询价覆盖，同一询价不能重复执行。执行意图会在请求发送前保存；若请求结果不明，需先核对交易所状态，系统不会自动重试该报价。
 
 前端数量选择会实时请求 `/api/strategy/preview?quantity=...` 重算净权利金、Bybit 官方 Regular/Cross 期权 Order IM、短期权 Maintenance MM 和交易成本。手续费使用 Bybit 公式 `min(fee_rate × index_price, 7% × option_price) × qty`。若设置 `MARGIN_MODE=PORTFOLIO_MARGIN`，页面显示的是基于四腿压力损失的下界估算；Portfolio Margin 的精确账户级结果仍由 Bybit 风险引擎根据全账户仓位和动态压力参数决定。
 
@@ -33,3 +40,17 @@ uvicorn app.main:app --reload
 Bybit 官方 V5 提供的是单腿期权下单接口 `/v5/order/create`，以及支持现货/永续/期货组合的 Spread Trading 接口 `/v5/spread/order/create`。当前 Spread Instruments 不包含期权铁鹰组合，因此本系统会对四条期权腿分别下单，并使用唯一 `orderLinkId`、数量/价差/风险校验；不发送成交后的反向回滚，部分成交时提示人工核对 Bybit 仓位。不能把截图中的网页策略组合直接映射成一个官方铁鹰 `spread symbol`。
 
 Bybit 非 VIP 期权基础费率：Taker 0.03%、Maker 0.02%；单笔交易手续费不超过期权成交价的 7%。BTC/ETH 到期交割费为 0.015%，强平费为 0.2%。最终成交以 `/v5/execution/list` 返回的 `execFee`、`feeRate` 和 `feeCurrency` 为准。平仓仅允许关闭本系统记录的最多四个策略 symbol，并按本次策略记录的数量限制平仓；未记录的实盘仓位会被拒绝处理。
+
+成交记录按成交 ID 去重并合并缓存。前端按时间先后逐笔匹配反向成交，消耗已匹配数量并按数量分摊开仓手续费；已知开仓组合和手续费币种不同的记录不会混配。历史记录不足时显示“待匹配开仓成交”，不会把不完整结果当作完整收益；页面仅保留最近 100 条成交，因此不是完整账户账本。
+
+## 本地验证
+
+安装项目依赖后运行：
+
+```bash
+python -m unittest discover -s tests -v
+node tests/test_dashboard.cjs
+node --check app/static/app.js
+```
+
+测试使用模拟行情、模拟交易所响应和临时状态文件，不会发出真实订单。前端测试使用 Node.js 内置测试框架验证订单结果提示、执行中按钮状态和数量变更后的请求合并，不需要安装 npm 依赖。

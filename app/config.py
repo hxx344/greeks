@@ -13,11 +13,11 @@ class Settings(BaseSettings):
     max_risk_usd: float = Field(default=2500.0, gt=0)
     leg_qty: float = Field(default=1.0, gt=0)
     open_day: int = Field(default=4, ge=4, le=4)
-    open_hour_utc: int = 21
+    open_hour_utc: int = Field(default=21, ge=0, le=23)
     open_minute_utc: int = Field(default=0, ge=0, le=59)
     open_window_seconds: int = Field(default=60, ge=1, le=300)
     target_dte_days: int = 2
-    recv_window_ms: int = 5000
+    recv_window_ms: int = Field(default=5000, gt=0)
     auto_open: bool = False
     market_refresh_seconds: int = Field(default=10, ge=1)
     instrument_refresh_seconds: int = Field(default=3600, ge=60)
@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     bbo_poll_seconds: float = Field(default=1.0, ge=0.2, le=10)
     bbo_order_timeout_seconds: int = Field(default=600, ge=60, le=1800)
     allow_market_fallback: bool = False
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore", allow_inf_nan=False)
 
     @property
     def environment(self) -> str:

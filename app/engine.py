@@ -1,7 +1,7 @@
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
-from math import isclose
+from math import isclose, isfinite
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,6 +9,7 @@ from .bybit import BybitClient, BybitError
 from .config import Settings
 from .models import AccountHealth, CloseRequest, ExecutionRecord, LogEntry, OpenRequest, OrderResult, Position, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest, StrategyPreview
 from .strategy import build_iron_condor
+from .orders import OrderExecutor
 
 
 class TradingEngine:
@@ -33,6 +34,7 @@ class TradingEngine:
         self.execution_groups: dict[str, dict] = {}
         self.execution_group_links: dict[str, str] = {}
         self.pm_baseline: dict = {}
+        self.order_journal: dict[str, dict] = {}
         self._load_state()
         self.account_health = AccountHealth(available=False, message="Live account credentials are not configured")
         self.last_executions: list[ExecutionRecord] = []
@@ -50,6 +52,7 @@ class TradingEngine:
             self.execution_groups = state.get("execution_groups") or {}
             self.execution_group_links = state.get("execution_group_links") or {}
             self.pm_baseline = state.get("pm_baseline") or {}
+            self.order_journal = state.get("order_journal") or {}
         except (FileNotFoundError, OSError, ValueError):
             self.last_open_week = None
 
@@ -57,7 +60,7 @@ class TradingEngine:
         target = Path(self.settings.state_file)
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = target.with_suffix(target.suffix + ".tmp")
-        temp.write_text(json.dumps({"last_open_week": self.last_open_week, "active_strategy_symbols": sorted(self.active_strategy_symbols), "active_strategy_sizes": self.active_strategy_sizes, "active_strategy_group_id": self.active_strategy_group_id, "rfq_state": self.rfq_state, "execution_groups": self.execution_groups, "execution_group_links": self.execution_group_links, "pm_baseline": self.pm_baseline}), encoding="utf-8")
+        temp.write_text(json.dumps({"last_open_week": self.last_open_week, "active_strategy_symbols": sorted(self.active_strategy_symbols), "active_strategy_sizes": self.active_strategy_sizes, "active_strategy_group_id": self.active_strategy_group_id, "rfq_state": self.rfq_state, "execution_groups": self.execution_groups, "execution_group_links": self.execution_group_links, "pm_baseline": self.pm_baseline, "order_journal": self.order_journal}), encoding="utf-8")
         temp.replace(target)
 
     def is_open_window(self, now: datetime | None = None) -> bool:
@@ -169,7 +172,7 @@ class TradingEngine:
         await self.refresh_chain()
         multiplier = 1.0 if self.chain_source == "bybit" else 0.01
         now = datetime.now(timezone.utc)
-        qty = quantity or self.settings.leg_qty
+        qty = self.settings.leg_qty if quantity is None else quantity
         self.preview = build_iron_condor(self.chain, now, self.settings.target_dte_days, qty, multiplier, self.settings.estimated_taker_fee_rate, self.settings.portfolio_margin_buffer_pct, self.btc_price or 0.0, self.settings.margin_mode, self.settings.option_mm_factor, self.settings.option_max_im_factor, self.settings.option_min_im_factor, self.settings.option_liquidation_fee_rate, self.settings.option_fee_cap_pct)
         self.preview.source = self.chain_source
         self.preview.market_timestamp = self.chain_updated_at
@@ -180,62 +183,78 @@ class TradingEngine:
             self.log("INFO", f"Preview ready: credit ${self.preview.net_credit_usd:.2f}, max loss ${self.preview.max_loss_usd:.2f}")
         return self.preview
 
-    async def follow_bbo_order(self, leg, qty: float, order_link_id: str, reduce_only: bool = False) -> dict:
-        """Keep a limit order at the current BBO until filled or timeout."""
+    def _validate_market_snapshot(self) -> None:
+        if self.chain_source != "bybit" or self.chain_updated_at is None:
+            raise ValueError("Live orders require a fresh Bybit market snapshot")
+        age = (datetime.now(timezone.utc) - self.chain_updated_at).total_seconds()
+        if age < 0 or age > self.settings.quote_stale_seconds:
+            raise ValueError("Bybit market snapshot is stale; refresh market data before trading")
+
+    def _validate_risk(self, preview: StrategyPreview) -> None:
+        metrics = (preview.max_loss_usd, preview.estimated_margin_usd)
+        if any(not isfinite(value) or value > self.settings.max_risk_usd for value in metrics):
+            raise ValueError("Risk limit exceeded; reduce quantity or raise MAX_RISK_USD")
+
+    def _record_order(self, link: str, outcome: dict) -> None:
+        entry = self.order_journal[link]
+        previous_filled = float(entry.get("filledQty", 0))
+        if float(outcome.get("filledQty", 0)) < previous_filled:
+            outcome = {**outcome, "filledQty": previous_filled}
+        if all(entry.get(key) == value for key, value in outcome.items()):
+            return
+        entry.update(outcome)
+        delta = max(0.0, float(entry.get("filledQty", 0)) - previous_filled)
+        group_id = self.execution_group_links.get(link)
+        group = self.execution_groups.get(group_id, {})
+        if delta > 0 and group:
+            position_side = ("Sell" if entry["side"] == "Buy" else "Buy") if entry["reduce_only"] else entry["side"]
+            key = f"{entry['symbol']}|{position_side}"
+            if entry["reduce_only"]:
+                self.active_strategy_sizes[key] = max(0.0, self.active_strategy_sizes.get(key, 0) - delta)
+                if self.active_strategy_sizes[key] <= 1e-9:
+                    self.active_strategy_sizes.pop(key, None)
+                    self.active_strategy_symbols.discard(entry["symbol"])
+            else:
+                self.active_strategy_sizes[key] = self.active_strategy_sizes.get(key, 0) + delta
+                self.active_strategy_symbols.add(entry["symbol"])
+                self.active_strategy_group_id = group_id
+        self._save_state()
+
+    async def _execute_order(self, leg, qty: float, link: str, reduce_only: bool = False, market: bool = False) -> dict:
         instrument = next((item for item in self.chain if item.symbol == leg.symbol), None)
         if instrument is None:
             raise ValueError(f"Instrument disappeared from fresh market data: {leg.symbol}")
-        response = None
-        last_order_price: float | None = None
-        remaining = qty
-        deadline = asyncio.get_running_loop().time() + self.settings.bbo_order_timeout_seconds
-        while asyncio.get_running_loop().time() < deadline:
-            latest = (await self.client.tickers(symbol=leg.symbol) or [{}])[0]
-            bid = float(latest.get("bid1Price", 0) or 0)
-            ask = float(latest.get("ask1Price", 0) or 0)
-            price = bid if leg.side == "Buy" else ask
-            if price <= 0:
-                await asyncio.sleep(self.settings.bbo_poll_seconds)
-                continue
-            tick = instrument.price_tick or 0.01
-            price = round(round(price / tick) * tick, 10)
-            instrument.bid, instrument.ask, instrument.mark_price = bid, ask, float(latest.get("markPrice", instrument.mark_price) or instrument.mark_price)
-            fills = await self.client.executions(order_link_id)
-            filled = sum(float(item.get("execQty", 0) or 0) for item in fills)
-            remaining = max(0.0, qty - filled)
-            if remaining <= 1e-12:
-                return {"orderId": response.get("orderId") if isinstance(response, dict) else "", "orderLinkId": order_link_id, "status": "filled"}
-            if response is None:
-                response = await self.client.place_limit_order(leg.symbol, leg.side, remaining, price, order_link_id, reduce_only)
-                last_order_price = price
-            elif last_order_price is None or abs(price - last_order_price) >= tick / 2:
-                await self.client.amend_order(leg.symbol, order_link_id, price)
-                last_order_price = price
-            await asyncio.sleep(self.settings.bbo_poll_seconds)
-        if response and remaining > 1e-12:
-            try:
-                await self.client.cancel_order(leg.symbol, order_link_id)
-            except Exception as exc:
-                self.log("ERROR", f"Could not cancel timed-out BBO order {order_link_id}: {exc}")
-        # A fill can race with the cancel request. Reconcile one final time so
-        # a partial position is never discarded from strategy tracking.
-        try:
-            final_fills = await self.client.executions(order_link_id)
-            filled = sum(float(item.get("execQty", 0) or 0) for item in final_fills)
-            if filled >= qty - 1e-12:
-                return {"orderId": response.get("orderId") if isinstance(response, dict) else "", "orderLinkId": order_link_id, "status": "filled", "filledQty": qty}
-            if filled > 1e-12:
-                return {"orderId": response.get("orderId") if isinstance(response, dict) else "", "orderLinkId": order_link_id, "status": "partial", "filledQty": filled}
-        except Exception as exc:
-            self.log("WARNING", f"Could not reconcile timed-out order {order_link_id}: {exc}")
-        return {"orderId": response.get("orderId") if isinstance(response, dict) else "", "orderLinkId": order_link_id, "status": "timeout_cancelled", "filledQty": 0.0}
+        if link in self.order_journal:
+            raise ValueError("Order link has already been used; reconcile it instead of resubmitting")
+        self.order_journal[link] = {"symbol": leg.symbol, "side": leg.side, "qty": qty,
+                                    "reduce_only": reduce_only, "status": "unknown", "terminal": False, "filledQty": 0.0}
+        self._save_state()
+        executor = OrderExecutor(self.client, self.settings, self.log)
+        return await executor.execute(instrument, leg.side, qty, link, lambda outcome: self._record_order(link, outcome), reduce_only, market)
+
+    async def follow_bbo_order(self, leg, qty: float, order_link_id: str, reduce_only: bool = False) -> dict:
+        return await self._execute_order(leg, qty, order_link_id, reduce_only)
+
+    async def _reconcile_pending_orders(self) -> None:
+        executor = OrderExecutor(self.client, self.settings, self.log)
+        async def reconcile(link, entry):
+            outcome = await executor.reconcile(entry["symbol"], entry["side"], entry["qty"], link, entry)
+            self._record_order(link, outcome)
+        await asyncio.gather(*(reconcile(link, dict(entry)) for link, entry in list(self.order_journal.items()) if not entry.get("terminal")))
+        if any(not entry.get("terminal") for entry in self.order_journal.values()):
+            raise ValueError("Unresolved orders remain; verify exchange orders before trading again")
 
     async def open_position(self, request: OpenRequest, scheduled: bool = False) -> list[OrderResult]:
         async with self.lock:
+            if self.settings.can_trade_live and not request.confirm_live:
+                raise ValueError("Live opening requires explicit confirmation")
             qty = request.quantity or self.settings.leg_qty
             preview = await self.make_preview(qty)
             live = bool(request.confirm_live and self.settings.can_trade_live)
             if live:
+                await self._reconcile_pending_orders()
+                if self.active_strategy_symbols:
+                    raise ValueError("Close the tracked strategy before opening another")
                 self._validate_open_calendar(preview.expiry)
             if live and scheduled and not self.is_open_window():
                 raise ValueError(f"Live orders are only allowed during Friday {self.settings.open_hour_utc:02d}:{self.settings.open_minute_utc:02d} UTC window")
@@ -257,15 +276,14 @@ class TradingEngine:
                 spread_bps = (instrument.ask - instrument.bid) / instrument.mark_price * 10000 if instrument.mark_price > 0 else float("inf")
                 if live and self.settings.max_spread_bps > 0 and spread_bps > self.settings.max_spread_bps:
                     raise ValueError(f"Spread for {leg.symbol} is {spread_bps:.0f} bps, above limit {self.settings.max_spread_bps:.0f} bps")
-            if preview.estimated_margin_usd > self.settings.max_risk_usd:
-                raise ValueError("Risk limit exceeded; reduce quantity or raise MAX_RISK_USD")
-            if live and preview.source != "bybit":
-                raise ValueError("Live orders require a fresh Bybit market snapshot")
+            self._validate_risk(preview)
             if live:
+                self._validate_market_snapshot()
                 await self._capture_pm_baseline("scheduled_open" if scheduled else "manual_open")
+                self._validate_market_snapshot()
                 request_id = uuid4().hex[:12]
                 order_links = [f"ic-{request_id}-{index}" for index, _ in enumerate(preview.legs)]
-                self.execution_groups[request_id] = {"type": "open", "created_at": datetime.now(timezone.utc).isoformat(), "legs": {leg.symbol: {"side": leg.side, "chain_price": (next(item for item in self.chain if item.symbol == leg.symbol).bid if leg.side == "Sell" else next(item for item in self.chain if item.symbol == leg.symbol).ask), "qty": qty} for leg in preview.legs}}
+                self.execution_groups[request_id] = {"type": "open", "order_tracking": True, "created_at": datetime.now(timezone.utc).isoformat(), "legs": {leg.symbol: {"side": leg.side, "chain_price": (next(item for item in self.chain if item.symbol == leg.symbol).bid if leg.side == "Sell" else next(item for item in self.chain if item.symbol == leg.symbol).ask), "qty": qty} for leg in preview.legs}}
                 for link in order_links:
                     self.execution_group_links[link] = request_id
                 self._save_state()
@@ -274,78 +292,78 @@ class TradingEngine:
                 order_links = [None] * len(preview.legs)
                 responses = [None] * len(preview.legs)
             results = []
-            successful_legs: list[tuple[object, float]] = []
-            for leg, response, order_link_id in zip(preview.legs, responses, order_links):
-                if isinstance(response, Exception) or (isinstance(response, dict) and response.get("status") == "timeout_cancelled"):
-                    message = str(response) if isinstance(response, Exception) else "BBO order timed out and was cancelled"
-                    results.append(OrderResult(symbol=leg.symbol, side=leg.side, qty=qty, status="error", message=message, order_link_id=order_link_id))
-                    self.log("ERROR", f"Order failed for {leg.symbol}: {response}")
-                else:
-                    order_id = response.get("orderId") if isinstance(response, dict) else f"dry-{int(datetime.now().timestamp())}"
-                    filled_qty = float(response.get("filledQty", qty) if isinstance(response, dict) else qty)
-                    status = response.get("status") if isinstance(response, dict) else ("simulated" if not live else "submitted")
-                    results.append(OrderResult(symbol=leg.symbol, side=leg.side, qty=filled_qty, status=status, order_id=order_id, order_link_id=order_link_id))
-                    if filled_qty > 1e-12:
-                        successful_legs.append((leg, filled_qty))
-            if live and any(item.status == "error" for item in results) and self.settings.allow_market_fallback:
-                # A request can time out after Bybit accepted it. Check positions
-                # before retrying so an uncertain leg is never duplicated.
-                failed_legs = [leg for leg, result in zip(preview.legs, results) if result.status == "error"]
-                await asyncio.sleep(self.settings.failed_leg_retry_delay_seconds)
-                retry_candidates = failed_legs
-                for check_index in range(self.settings.failed_leg_position_checks):
-                    try:
-                        raw_positions = await self.client.positions()
-                        position_sizes = {(item.get("symbol"), item.get("side")): abs(float(item.get("size", 0) or 0)) for item in raw_positions}
-                        retry_candidates = [leg for leg in failed_legs if position_sizes.get((leg.symbol, leg.side), 0) < qty]
-                        if not retry_candidates:
-                            break
-                    except Exception as exc:
-                        self.log("WARNING", f"Position check {check_index + 1}/{self.settings.failed_leg_position_checks} failed: {exc}")
-                    if check_index + 1 < self.settings.failed_leg_position_checks:
-                        await asyncio.sleep(self.settings.failed_leg_position_check_interval_seconds)
-                if retry_candidates:
-                    market_id = uuid4().hex[:12]
-                    retry_links = [f"ic-mkt-{market_id}-{index}" for index, _ in enumerate(retry_candidates)]
-                    for link in retry_links:
-                        self.execution_group_links[link] = request_id
-                    self._save_state()
-                    retry_responses = await asyncio.gather(*[self.client.place_market_order(leg.symbol, leg.side, qty, retry_links[index]) for index, leg in enumerate(retry_candidates)], return_exceptions=True)
-                    for leg, response, retry_link in zip(retry_candidates, retry_responses, retry_links):
-                        result = next(item for item in results if item.symbol == leg.symbol)
-                        result.order_link_id = retry_link
-                        if isinstance(response, Exception):
-                            result.message = f"BBO timeout and market fallback failed: {response}"
-                        else:
-                            result.status = "market_submitted"
-                            result.order_id = response.get("orderId") if isinstance(response, dict) else result.order_id
-                            successful_legs.append((leg, qty))
-                    self.log("WARNING", f"Submitted market fallback for {len(retry_candidates)} missing leg(s) after BBO timeout")
-                else:
-                    self.log("WARNING", "Failed leg(s) already existed in current positions; no duplicate retry sent")
+            all_links = [link for link in order_links if link]
+            for leg, response, link in zip(preview.legs, responses, order_links):
+                if not live:
+                    results.append(OrderResult(symbol=leg.symbol, side=leg.side, qty=qty, status="simulated"))
+                    self.positions.append(Position(symbol=leg.symbol, side=leg.side, size=qty, avg_price=leg.mark_price,
+                                                   mark_price=leg.mark_price, unrealised_pnl=0, source="demo"))
+                    continue
+                if isinstance(response, BaseException):
+                    response = {"status": "unknown", "filledQty": 0.0, "terminal": False, "message": str(response)}
+                result = OrderResult(symbol=leg.symbol, side=leg.side, qty=float(response.get("filledQty", 0)),
+                                     status=response["status"], order_id=response.get("orderId"), order_link_id=link,
+                                     message=response.get("message"))
+                results.append(result)
+            if live and self.settings.allow_market_fallback:
+                await self._market_fallback(preview.legs, qty, order_links, results, request_id, all_links)
             if live:
-                self.last_executions = await self.load_recent_executions([item.order_link_id for item in results if item.order_link_id])
+                await self.load_recent_executions(all_links)
                 self._attach_execution_details(results)
-            if live and any(item.status == "partial" for item in results):
-                self.log("ERROR", "One or more live limit orders partially filled before cancellation; verify the tracked quantities and complete the strategy manually.")
-            elif live and any(item.status == "error" for item in results):
-                self.log("ERROR", "One or more live limit orders failed; market fallback is disabled. Verify positions and handle missing legs manually.")
-            elif live:
-                self.log("INFO", "All four live legs were accepted through BBO limit orders; final fills are asynchronous on Bybit.")
+                if any(item.status != "filled" for item in results):
+                    self.log("ERROR", "Some legs are incomplete or unresolved; inspect the reported quantities and exchange orders")
+                else:
+                    self.log("INFO", "All four live legs are confirmed filled")
             else:
-                self.positions.extend([Position(symbol=leg.symbol, side=leg.side, size=filled_qty, avg_price=leg.mark_price, mark_price=leg.mark_price, unrealised_pnl=0, source="demo") for leg, filled_qty in successful_legs])
-            if live and successful_legs:
-                self.active_strategy_symbols = {leg.symbol for leg, _ in successful_legs}
-                self.active_strategy_sizes = {f"{leg.symbol}|{leg.side}": filled_qty for leg, filled_qty in successful_legs}
-                self.active_strategy_group_id = request_id
-                self._save_state()
+                self.log("INFO", "All four legs were simulated")
             if scheduled:
                 self.last_open_week = datetime.now(timezone.utc).strftime("%G-W%V")
                 self._save_state()
-            self.log("INFO", f"Iron Condor {'submitted to Bybit' if live else 'simulated'} with {len(results)} market legs")
+            self.log("INFO", f"Iron Condor {'processed on Bybit' if live else 'simulated'} with {len(results)} legs")
             return results
 
+    async def _market_fallback(self, legs, qty, links, results, group_id, all_links) -> None:
+        executor = OrderExecutor(self.client, self.settings, self.log)
+        await asyncio.sleep(self.settings.failed_leg_retry_delay_seconds)
+        for leg, link, result in zip(legs, links, results):
+            original = self.order_journal.get(link)
+            if not original or not original.get("terminal") or original.get("status") not in {"partial", "timeout_cancelled"}:
+                continue
+            # Re-read the original order, even if cancellation was previously
+            # confirmed. Neither account holdings nor a missing order proves it safe.
+            confirmed = await executor.reconcile(leg.symbol, leg.side, qty, link, original, cancel=False)
+            self._record_order(link, confirmed)
+            result.qty = confirmed["filledQty"]
+            result.status = confirmed["status"]
+            if not confirmed["terminal"]:
+                result.message = confirmed.get("message")
+                continue
+            remaining = round(max(0.0, qty - confirmed["filledQty"]), 10)
+            if remaining <= 1e-9:
+                continue
+            instrument = next(item for item in self.chain if item.symbol == leg.symbol)
+            if (remaining < instrument.min_qty or remaining > instrument.max_qty
+                    or not isclose(remaining / instrument.qty_step, round(remaining / instrument.qty_step), rel_tol=0, abs_tol=1e-9)):
+                result.message = "Remaining quantity does not meet exchange lot limits; no fallback sent"
+                continue
+            retry_link = f"ic-mkt-{uuid4().hex[:12]}"
+            self.execution_group_links[retry_link] = group_id
+            all_links.append(retry_link)
+            self._save_state()
+            replacement = await self._execute_order(leg, remaining, retry_link, market=True)
+            result.related_order_link_ids = [link, retry_link]
+            result.qty = round(confirmed["filledQty"] + replacement["filledQty"], 10)
+            result.status = ("filled" if isclose(result.qty, qty, rel_tol=0, abs_tol=1e-9) else "partial" if result.qty else "error") if replacement["terminal"] else "unknown"
+            result.message = replacement.get("message")
+            self.log("WARNING", f"Market fallback for {leg.symbol}: requested only remaining quantity {remaining}")
+
     async def create_rfq(self, request: RfqCreateRequest) -> dict:
+        async with self.lock:
+            return await self._create_rfq(request)
+
+    async def _create_rfq(self, request: RfqCreateRequest) -> dict:
+        if self.rfq_state.get("rfq_id") and self.rfq_state.get("status") not in {"Canceled", "Expired", "Filled", "Failed"}:
+            raise ValueError("An RFQ is already active; resolve it before creating another")
         if not self.settings.bybit_api_key or not self.settings.bybit_api_secret:
             raise ValueError("Bybit API credentials are not configured")
         counterparties = list(request.counterparties)
@@ -372,8 +390,8 @@ class TradingEngine:
         if not counterparties:
             raise ValueError("Bybit returned no available RFQ counterparties")
         preview = await self.make_preview(request.quantity or self.settings.leg_qty)
-        if preview.source != "bybit":
-            raise ValueError("RFQ requires a fresh Bybit market snapshot")
+        self._validate_market_snapshot()
+        self._validate_risk(preview)
         qty = request.quantity or self.settings.leg_qty
         legs = [{"category": "option", "symbol": leg.symbol, "side": leg.side, "qty": str(qty)} for leg in preview.legs]
         # Bybit RFQ link IDs allow letters and numbers only.
@@ -385,6 +403,10 @@ class TradingEngine:
         return self.rfq_state
 
     async def refresh_rfq(self) -> dict:
+        async with self.lock:
+            return await self._refresh_rfq()
+
+    async def _refresh_rfq(self) -> dict:
         if not self.rfq_state.get("rfq_id"):
             return self.rfq_state
         rfq_id = self.rfq_state["rfq_id"]
@@ -399,27 +421,89 @@ class TradingEngine:
         return self.rfq_state
 
     async def execute_rfq(self, request: RfqExecuteRequest) -> dict:
+        async with self.lock:
+            return await self._execute_rfq(request)
+
+    async def _execute_rfq(self, request: RfqExecuteRequest) -> dict:
+        if not self.settings.can_trade_live:
+            raise ValueError("Live trading is disabled")
         if not request.confirm_live:
             raise ValueError("RFQ execution requires explicit confirmation")
         if request.quote_side != "Sell":
             raise ValueError("This Iron Condor workflow only accepts the Sell quote direction")
         if request.rfq_id != self.rfq_state.get("rfq_id"):
             raise ValueError("RFQ is not the active inquiry")
-        quote = next((item for item in self.rfq_state.get("quotes", []) if item.get("quoteId") == request.quote_id), None)
-        if quote is None:
-            raise ValueError("Quote is not available or has expired")
-        expiries = {item.expiry for leg in self.rfq_state.get("legs", []) for item in self.chain if item.symbol == leg.get("symbol")}
-        if len(expiries) != 1:
-            raise ValueError("RFQ legs must resolve to one common expiry")
-        self._validate_open_calendar(expiries.pop())
+        if self.rfq_state.get("selected_quote_id") or self.rfq_state.get("status") in {"Filled", "PendingFill", "Canceled", "Expired", "Failed", "ExecutionUnknown"}:
+            raise ValueError("RFQ is no longer available for execution")
+        await self._reconcile_pending_orders()
+        if self.active_strategy_symbols:
+            raise ValueError("Close the tracked strategy before opening another")
+        await self.refresh_chain()
+        self._validate_market_snapshot()
+        self._validate_rfq_quote(request)
         await self._capture_pm_baseline("rfq_open")
+        self._validate_market_snapshot()
+        self._validate_rfq_quote(request)
+        # Persist the intent before submitting: an ambiguous network failure
+        # must not permit a second execution of the same inquiry.
+        self.rfq_state.update({"status": "ExecutionUnknown", "selected_quote_id": request.quote_id, "selected_quote_side": request.quote_side})
+        self._save_state()
         result = await self.client.execute_quote(request.rfq_id, request.quote_id, request.quote_side)
         self.rfq_state.update({"status": result.get("status", "PendingFill"), "selected_quote_id": request.quote_id, "selected_quote_side": request.quote_side, "updated_at": datetime.now(timezone.utc).isoformat()})
         self._save_state()
         self.log("INFO", f"RFQ quote execution submitted: {request.quote_id}")
         return {**self.rfq_state, "execution": result}
 
+    def _validate_rfq_quote(self, request: RfqExecuteRequest) -> None:
+        quote = next((item for item in self.rfq_state.get("quotes", []) if item.get("quoteId") == request.quote_id), None)
+        if quote is None:
+            raise ValueError("Quote is not available or has expired")
+        now_ms = datetime.now(timezone.utc).timestamp() * 1000
+        for deadline in (quote.get("expiresAt"), self.rfq_state.get("expires_at")):
+            if deadline not in (None, ""):
+                expiry_ms = float(deadline)
+                if not isfinite(expiry_ms) or expiry_ms <= now_ms:
+                    raise ValueError("Quote is not available or has expired")
+        legs = self.rfq_state.get("legs") or []
+        quoted_legs = quote.get("quoteSellList") or []
+        requested = {leg.get("symbol"): leg for leg in legs}
+        quoted = {leg.get("symbol"): leg for leg in quoted_legs}
+        if len(legs) != 4 or len(requested) != 4 or len(quoted_legs) != 4 or set(requested) != set(quoted):
+            raise ValueError("Quote must cover exactly the four requested legs")
+        for symbol, leg in requested.items():
+            quantity = float(quoted[symbol].get("qty", 0) or 0)
+            price = float(quoted[symbol].get("price", 0) or 0)
+            if not isfinite(quantity) or quantity <= 0 or not isclose(quantity, float(leg["qty"]), rel_tol=0, abs_tol=1e-9) or not isfinite(price) or price <= 0:
+                raise ValueError("Quote has an invalid price or mismatched quantity")
+        instruments = {item.symbol: item for item in self.chain if item.symbol in requested}
+        if set(instruments) != set(requested):
+            raise ValueError("RFQ instruments are missing from market data")
+        roles = {(instruments[symbol].option_type, leg.get("side")): instruments[symbol].strike for symbol, leg in requested.items()}
+        if set(roles) != {("Call", "Buy"), ("Call", "Sell"), ("Put", "Buy"), ("Put", "Sell")} or len({float(leg["qty"]) for leg in legs}) != 1:
+            raise ValueError("RFQ must contain four balanced Iron Condor legs")
+        if not roles[("Put", "Buy")] < roles[("Put", "Sell")] < roles[("Call", "Sell")] < roles[("Call", "Buy")]:
+            raise ValueError("RFQ Iron Condor strikes are not ordered correctly")
+        expiries = {item.expiry for item in instruments.values()}
+        if len(expiries) != 1:
+            raise ValueError("RFQ legs must resolve to one common expiry")
+        self._validate_open_calendar(expiries.pop())
+        # A piecewise-linear expiry payoff reaches its minimum at a strike
+        # or an outer boundary. Evaluate the actual quoted legs and prices.
+        credit = sum((1 if leg["side"] == "Sell" else -1) * float(quoted[symbol]["price"]) * float(leg["qty"]) for symbol, leg in requested.items())
+        payoffs = []
+        for spot in [0.0, *(item.strike for item in instruments.values())]:
+            payoff = credit
+            for symbol, leg in requested.items():
+                item = instruments[symbol]
+                intrinsic = max(spot - item.strike, 0) if item.option_type == "Call" else max(item.strike - spot, 0)
+                payoff += (1 if leg["side"] == "Buy" else -1) * intrinsic * float(leg["qty"])
+            payoffs.append(payoff)
+        if max(0.0, -min(payoffs)) > self.settings.max_risk_usd:
+            raise ValueError("RFQ quote exceeds the maximum loss limit")
+
     def _track_filled_rfq(self, positions: list[Position] | None = None) -> bool:
+        if self.execution_groups.get(self.active_strategy_group_id, {}).get("order_tracking"):
+            return False
         legs = self.rfq_state.get("legs") or []
         execution_submitted = bool(self.rfq_state.get("selected_quote_id")) or self.rfq_state.get("status") == "Filled"
         if not execution_submitted or len(legs) != 4 or len({leg.get("symbol") for leg in legs}) != 4:
@@ -443,10 +527,12 @@ class TradingEngine:
         return True
 
     def _recover_tracked_open_positions(self, positions: list[Position]) -> bool:
+        if self.execution_groups.get(self.active_strategy_group_id, {}).get("order_tracking"):
+            return False
         position_map = {(position.symbol, position.side): position for position in positions if position.size > 0}
         candidates: list[tuple[str, str, list[dict]]] = []
         for group_id, group in self.execution_groups.items():
-            if group.get("type") != "open" or group.get("status") == "closed":
+            if group.get("type") != "open" or group.get("status") == "closed" or group.get("order_tracking"):
                 continue
             legs = [{"symbol": symbol, **details} for symbol, details in (group.get("legs") or {}).items()]
             candidates.append((str(group.get("created_at", "")), group_id, legs))
@@ -457,6 +543,8 @@ class TradingEngine:
             if execution.reduce_only or len(parts) < 3 or parts[0] != "ic" or parts[1] in {"close", "mkt"}:
                 continue
             group_id = execution.execution_group or parts[1]
+            if self.execution_groups.get(group_id, {}).get("order_tracking"):
+                continue
             key = (execution.symbol, execution.side)
             bucket = execution_groups.setdefault(group_id, {})
             bucket[key] = bucket.get(key, 0.0) + execution.exec_qty
@@ -485,6 +573,10 @@ class TradingEngine:
         return False
 
     async def cancel_rfq(self, request: RfqCancelRequest) -> dict:
+        async with self.lock:
+            return await self._cancel_rfq(request)
+
+    async def _cancel_rfq(self, request: RfqCancelRequest) -> dict:
         if request.rfq_id != self.rfq_state.get("rfq_id"):
             raise ValueError("RFQ is not the active inquiry")
         result = await self.client.cancel_rfq(request.rfq_id)
@@ -499,15 +591,17 @@ class TradingEngine:
         for execution in self.last_executions:
             by_link.setdefault(execution.order_link_id, []).append(execution)
         for result in results:
-            executions = by_link.get(result.order_link_id or "", [])
+            links = result.related_order_link_ids or [result.order_link_id or ""]
+            executions = [item for link in set(links) for item in by_link.get(link, [])]
             if not executions:
                 continue
             result.exec_fee = round(sum(item.exec_fee for item in executions), 8)
             result.fee_currency = executions[0].fee_currency
             result.exec_qty = round(sum(item.exec_qty for item in executions), 8)
             result.exec_price = round(sum(item.exec_price * item.exec_qty for item in executions) / result.exec_qty, 8) if result.exec_qty else None
-            result.execution_id = executions[-1].exec_id
-            result.exec_time = executions[-1].exec_time
+            latest = max(executions, key=lambda item: item.exec_time)
+            result.execution_id = latest.exec_id
+            result.exec_time = latest.exec_time
 
     async def load_recent_executions(self, order_link_ids: list[str] | None = None) -> list[ExecutionRecord]:
         if not self.settings.bybit_api_key or not self.settings.bybit_api_secret:
@@ -515,6 +609,9 @@ class TradingEngine:
         try:
             if order_link_ids:
                 raw_groups = await asyncio.gather(*[self.client.executions(order_link_id) for order_link_id in set(order_link_ids)], return_exceptions=True)
+                for group in raw_groups:
+                    if isinstance(group, Exception):
+                        self.log("WARNING", f"Could not load some order executions; preserving cached records: {group}")
                 raw_items = [item for group in raw_groups if isinstance(group, list) for item in group]
             else:
                 raw_items = await self.client.executions()
@@ -531,22 +628,29 @@ class TradingEngine:
                     parts = order_link_id.split("-")
                     if len(parts) >= 3 and parts[0] == "ic" and parts[1] not in {"close", "mkt"}:
                         group_id = parts[1]
-                baseline = (self.execution_groups.get(group_id or "") or {}).get("legs", {}).get(item.get("symbol", ""), {})
+                group = self.execution_groups.get(group_id or "") or {}
+                reduce_only = group.get("type") == "close" or order_link_id.startswith("ic-close-")
+                baseline = {} if reduce_only else group.get("legs", {}).get(item.get("symbol", ""), {})
                 exec_price = float(item.get("execPrice", 0) or 0)
                 exec_qty = float(item.get("execQty", 0) or 0)
                 chain_price = float(baseline.get("chain_price", 0) or 0) if baseline else None
                 strategy_side = baseline.get("side")
                 chain_diff = ((1 if strategy_side == "Sell" else -1) * (exec_price - chain_price) * exec_qty) if chain_price is not None and strategy_side else None
-                records.append(ExecutionRecord(symbol=item.get("symbol", ""), side=item.get("side", ""), order_id=item.get("orderId", ""), order_link_id=order_link_id, exec_id=exec_id, exec_fee=float(item.get("execFee", 0) or 0), fee_currency=item.get("feeCurrency", ""), exec_price=exec_price, exec_qty=exec_qty, fee_rate=float(item.get("feeRate", 0) or 0) if item.get("feeRate") not in (None, "") else None, exec_time=datetime.fromtimestamp(int(item.get("execTime", 0)) / 1000, tz=timezone.utc), execution_group=group_id, chain_price_at_create=chain_price, chain_price_diff=chain_diff))
-            self.last_executions = sorted(records, key=lambda item: item.exec_time, reverse=True)[:100]
+                records.append(ExecutionRecord(symbol=item.get("symbol", ""), side=item.get("side", ""), order_id=item.get("orderId", ""), order_link_id=order_link_id, exec_id=exec_id, exec_fee=float(item.get("execFee", 0) or 0), fee_currency=item.get("feeCurrency", ""), exec_price=exec_price, exec_qty=exec_qty, fee_rate=float(item.get("feeRate", 0) or 0) if item.get("feeRate") not in (None, "") else None, exec_time=datetime.fromtimestamp(int(item.get("execTime", 0)) / 1000, tz=timezone.utc), reduce_only=reduce_only, opening_group=group.get("opening_group"), execution_group=group_id, chain_price_at_create=chain_price, chain_price_diff=chain_diff))
+            merged = {item.exec_id: item for item in self.last_executions}
+            merged.update({item.exec_id: item for item in records})
+            self.last_executions = sorted(merged.values(), key=lambda item: item.exec_time, reverse=True)[:100]
         except Exception as exc:
             self.log("WARNING", f"Could not load execution fee records: {exc}")
         return self.last_executions
 
     async def close_position(self, request: CloseRequest) -> tuple[list[OrderResult], list[ExecutionRecord]]:
         async with self.lock:
+            if self.settings.can_trade_live and not request.confirm_live:
+                raise ValueError("Live closing requires explicit confirmation")
             live = bool(request.confirm_live and self.settings.can_trade_live)
             if live:
+                await self._reconcile_pending_orders()
                 raw_positions = await self.client.positions()
                 current = [Position(symbol=item.get("symbol", ""), side=item.get("side", ""), size=float(item.get("size", 0) or 0), avg_price=float(item.get("avgPrice", 0) or 0), mark_price=float(item.get("markPrice", 0) or 0), unrealised_pnl=float(item.get("unrealisedPnl", 0) or 0), source="bybit") for item in raw_positions if float(item.get("size", 0) or 0) > 0]
                 if len(self.active_strategy_symbols) < 4:
@@ -558,10 +662,10 @@ class TradingEngine:
                         self.log("INFO", "Recovered tracked Iron Condor legs from the opening task and current Bybit positions")
             else:
                 preview = self.preview or await self.make_preview()
-                current = list(self.positions)
+                current = [position for position in self.positions if position.source == "demo"]
             if live and not self.active_strategy_symbols:
                 raise ValueError("No tracked live Iron Condor legs found; refusing to close untracked positions")
-            symbols = self.active_strategy_symbols if live else (self.active_strategy_symbols or {leg.symbol for leg in preview.legs})
+            symbols = self.active_strategy_symbols if live else {leg.symbol for leg in preview.legs}
             if len(symbols) > 4:
                 raise ValueError("Tracked strategy contains more than four symbols; refusing bulk close")
             current = [position for position in current if position.symbol in symbols and position.size > 0]
@@ -573,43 +677,36 @@ class TradingEngine:
             links = [f"ic-close-{close_group_id}-{index}" for index, _ in enumerate(current)]
             if live:
                 close_legs = [type("CloseLeg", (), {"symbol": position.symbol, "side": "Sell" if position.side == "Buy" else "Buy"})() for position in current]
+                self.execution_groups[close_group_id] = {"type": "close", "opening_group": self.active_strategy_group_id, "order_tracking": True}
+                for link in links:
+                    self.execution_group_links[link] = close_group_id
+                self._save_state()
                 responses = await asyncio.gather(*[self.follow_bbo_order(close_legs[index], position.size, links[index], reduce_only=True) for index, position in enumerate(current)], return_exceptions=True)
             else:
                 responses = [None] * len(current)
             results = []
             for position, response, link in zip(current, responses, links):
-                if isinstance(response, Exception) or (isinstance(response, dict) and response.get("status") == "timeout_cancelled"):
-                    message = str(response) if isinstance(response, Exception) else "BBO close order timed out and was cancelled"
-                    results.append(OrderResult(symbol=position.symbol, side="Sell" if position.side == "Buy" else "Buy", qty=position.size, status="error", message=message, order_link_id=link))
-                else:
-                    filled_qty = float(response.get("filledQty", position.size) if isinstance(response, dict) else position.size)
-                    results.append(OrderResult(symbol=position.symbol, side="Sell" if position.side == "Buy" else "Buy", qty=filled_qty, status=response.get("status") if isinstance(response, dict) else ("submitted" if live else "simulated"), order_id=response.get("orderId") if isinstance(response, dict) else f"dry-close-{int(datetime.now().timestamp())}", order_link_id=link))
+                if isinstance(response, BaseException):
+                    response = {"status": "unknown", "filledQty": 0.0, "message": str(response)}
+                results.append(OrderResult(symbol=position.symbol, side="Sell" if position.side == "Buy" else "Buy",
+                                           qty=float(response.get("filledQty", 0)) if live else position.size,
+                                           status=response["status"] if live else "simulated",
+                                           order_id=response.get("orderId") if live else None, order_link_id=link,
+                                           message=response.get("message") if live else None))
             if live:
-                await asyncio.sleep(self.settings.failed_leg_retry_delay_seconds)
-                self.last_executions = await self.load_recent_executions([item.order_link_id for item in results if item.order_link_id])
-                for item in self.last_executions:
-                    item.reduce_only = True
+                await self.load_recent_executions(links)
                 self._attach_execution_details(results)
-            else:
-                self.positions = [position for position in self.positions if position not in current]
-                self.last_executions = []
-            if not any(item.status in {"error", "partial"} for item in results):
-                completed_group_id = self.active_strategy_group_id
-                self.active_strategy_symbols.difference_update(position.symbol for position in current)
-                for position in current:
-                    self.active_strategy_sizes.pop(f"{position.symbol}|{position.side}", None)
-                if completed_group_id in self.execution_groups:
-                    self.execution_groups[completed_group_id]["status"] = "closed"
-                if not self.active_strategy_symbols:
+                # Quantities are deducted incrementally by _record_order,
+                # including successful legs when another close leg is unresolved.
+                if not self.active_strategy_symbols and all(item.status == "filled" for item in results):
+                    completed_group_id = self.active_strategy_group_id
+                    if completed_group_id in self.execution_groups:
+                        self.execution_groups[completed_group_id]["status"] = "closed"
                     self.active_strategy_group_id = None
                     self.pm_baseline = {}
                 self._save_state()
-            elif live:
-                for position, result in zip(current, results):
-                    if result.status == "partial":
-                        key = f"{position.symbol}|{position.side}"
-                        self.active_strategy_sizes[key] = max(0.0, self.active_strategy_sizes.get(key, position.size) - result.qty)
-                self._save_state()
+            else:
+                self.positions = [position for position in self.positions if position not in current]
             return results, self.last_executions
 
     async def scheduler(self) -> None:
@@ -636,6 +733,12 @@ class TradingEngine:
 
     async def load_positions(self) -> list[Position]:
         if self.settings.can_trade_live:
+            if not self.lock.locked() and any(not entry.get("terminal") for entry in self.order_journal.values()):
+                async with self.lock:
+                    try:
+                        await self._reconcile_pending_orders()
+                    except ValueError as exc:
+                        self.log("WARNING", str(exc))
             try:
                 raw = await self.client.positions()
                 self.positions = [Position(symbol=item.get("symbol", ""), side=item.get("side", ""), size=float(item.get("size", 0)), avg_price=float(item.get("avgPrice", 0) or 0), mark_price=float(item.get("markPrice", 0) or 0), unrealised_pnl=float(item.get("unrealisedPnl", 0) or 0), source="bybit") for item in raw if float(item.get("size", 0) or 0) > 0]

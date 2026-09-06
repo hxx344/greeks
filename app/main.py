@@ -67,7 +67,7 @@ def config_payload():
 
 
 @app.get("/api/dashboard/market")
-async def dashboard_market(quantity: float | None = Query(default=None, gt=0)):
+async def dashboard_market(quantity: float | None = Query(default=None, gt=0, allow_inf_nan=False)):
     try:
         strategy = await engine.make_preview(quantity)
         expiry_items = [item for item in engine.chain if item.expiry == strategy.expiry]
@@ -104,7 +104,7 @@ async def refresh_market():
 
 
 @app.get("/api/strategy/preview")
-async def preview(quantity: float | None = Query(default=None, gt=0)):
+async def preview(quantity: float | None = Query(default=None, gt=0, allow_inf_nan=False)):
     try:
         return (await engine.make_preview(quantity)).model_dump(mode="json")
     except ValueError as exc:

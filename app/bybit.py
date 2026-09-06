@@ -95,6 +95,17 @@ class BybitClient:
         result = await self._request("GET", "/v5/execution/list", params, private=True)
         return result.get("list", [])
 
+    async def order(self, symbol: str, order_link_id: str) -> dict[str, Any] | None:
+        params = {"category": "option", "symbol": symbol, "orderLinkId": order_link_id}
+        # Closed realtime records can disappear after an exchange restart.
+        # Absence from both endpoints is still unknown, never a cancellation.
+        for path in ("/v5/order/realtime", "/v5/order/history"):
+            result = await self._request("GET", path, params, private=True)
+            match = next((item for item in result.get("list", []) if item.get("orderLinkId") == order_link_id and item.get("symbol") == symbol), None)
+            if match is not None:
+                return match
+        return None
+
     async def place_limit_order(self, symbol: str, side: str, qty: float, price: float, order_link_id: str, reduce_only: bool = False) -> dict[str, Any]:
         return await self._request("POST", "/v5/order/create", body={"category": "option", "symbol": symbol, "side": side, "orderType": "Limit", "qty": str(qty), "price": str(price), "timeInForce": "GTC", "orderLinkId": order_link_id, "reduceOnly": reduce_only}, private=True)
 

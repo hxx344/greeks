@@ -62,7 +62,7 @@ class StrategyPreview(BaseModel):
 
 class OpenRequest(BaseModel):
     confirm_live: bool = False
-    quantity: float | None = Field(default=None, gt=0)
+    quantity: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
 class CloseRequest(BaseModel):
@@ -72,7 +72,7 @@ class CloseRequest(BaseModel):
 class RfqCreateRequest(BaseModel):
     confirm_live: bool = False
     counterparties: list[str] = Field(default_factory=list)
-    quantity: float | None = Field(default=None, gt=0)
+    quantity: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
 class RfqExecuteRequest(BaseModel):
@@ -95,6 +95,7 @@ class OrderResult(BaseModel):
     order_id: str | None = None
     message: str | None = None
     order_link_id: str | None = None
+    related_order_link_ids: list[str] = Field(default_factory=list)
     exec_fee: float | None = None
     fee_currency: str | None = None
     exec_price: float | None = None
@@ -117,6 +118,7 @@ class ExecutionRecord(BaseModel):
     exec_time: datetime
     reduce_only: bool = False
     execution_group: str | None = None
+    opening_group: str | None = None
     chain_price_at_create: float | None = None
     chain_price_diff: float | None = None
 

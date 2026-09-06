@@ -95,10 +95,58 @@ function renderPortfolioMargin(health) {
   const increment = (value) => value === null || value === undefined ? '--' : `${value >= 0 ? '+' : ''}${money(value)}`;
   target.innerHTML = `<div><span>真实账户 IM</span><strong>${optionalMoney(health.pm_account_initial_margin_usd)}</strong></div><div><span>真实账户 MM</span><strong>${optionalMoney(health.pm_account_maintenance_margin_usd)}</strong></div><div><span>BTC 风险单元 IM</span><strong>${optionalMoney(health.pm_asset_initial_margin_usd)}</strong></div><div><span>BTC 风险单元 MM</span><strong>${optionalMoney(health.pm_asset_maintenance_margin_usd)}</strong></div><div><span>本次开仓 IM 增量</span><strong class="${Number(incrementIm) > 0 ? 'loss' : 'profit'}">${increment(incrementIm)}</strong></div><div><span>本次开仓 MM 增量</span><strong class="${Number(incrementMm) > 0 ? 'loss' : 'profit'}">${increment(incrementMm)}</strong></div><div><span>Contingency</span><strong>${optionalMoney(health.pm_contingency_usd)}</strong></div><div><span>最大压力场景</span><strong>${health.pm_max_loss_price_move === null || health.pm_max_loss_price_move === undefined ? '--' : `${(Number(health.pm_max_loss_price_move) * 100).toFixed(1)}%`} / IV ${health.pm_max_loss_iv_shock === null || health.pm_max_loss_iv_shock === undefined ? '--' : `${(Number(health.pm_max_loss_iv_shock) * 100).toFixed(1)}%`}</strong></div>`;
 }
+const isClosingExecution = (item) => item.reduce_only === true || String(item.order_link_id || '').startsWith('ic-close-');
+function uniqueExecutions(items) {
+  const seen = new Set();
+  return (items || []).filter((item) => {
+    if (!item.exec_id) return true;
+    if (seen.has(item.exec_id)) return false;
+    seen.add(item.exec_id);
+    return true;
+  });
+}
+function matchClosingExecutions(items) {
+  const lots = new Map();
+  const results = new Map();
+  const time = (item) => new Date(item.exec_time).getTime();
+  const openingGroup = (item) => item.execution_group || (String(item.order_link_id || '').startsWith('ic-') ? item.order_link_id.split('-')[1] : null);
+  const ordered = uniqueExecutions(items).slice().sort((a, b) => time(a) - time(b) || Number(isClosingExecution(b)) - Number(isClosingExecution(a)) || String(a.exec_id || '').localeCompare(String(b.exec_id || '')));
+  for (const item of ordered) {
+    const closing = isClosingExecution(item);
+    const qty = Number(item.exec_qty); const price = Number(item.exec_price); const fee = Number(item.exec_fee);
+    if (![qty, price, fee, time(item)].every(Number.isFinite) || qty <= 0 || price < 0 || !['Buy', 'Sell'].includes(item.side)) {
+      if (closing) results.set(item, null);
+      continue;
+    }
+    const side = closing ? (item.side === 'Buy' ? 'Sell' : 'Buy') : item.side;
+    const key = JSON.stringify([item.symbol, side, item.fee_currency || '']);
+    const candidates = lots.get(key) || [];
+    if (!closing) {
+      candidates.push({item, remaining: qty});
+      lots.set(key, candidates);
+      continue;
+    }
+    let remaining = qty;
+    let pnl = -fee;
+    for (const lot of candidates) {
+      if (remaining <= 1e-9) break;
+      if (lot.remaining <= 1e-9 || (item.opening_group && openingGroup(lot.item) !== item.opening_group)) continue;
+      const matchedQty = Math.min(remaining, lot.remaining);
+      pnl += (item.side === 'Sell' ? 1 : -1) * (price - Number(lot.item.exec_price)) * matchedQty;
+      pnl -= Number(lot.item.exec_fee) * matchedQty / Number(lot.item.exec_qty);
+      lot.remaining -= matchedQty;
+      remaining -= matchedQty;
+    }
+    results.set(item, remaining <= 1e-9 ? pnl : null);
+  }
+  return results;
+}
 function renderExecutions(items) {
   const target = $('executions');
   if (!items || !items.length) { target.className = 'executions empty'; target.textContent = '暂无成交记录'; return; }
-  const isClose = (item) => item.reduce_only === true || String(item.order_link_id || '').split('-')[1] === 'close';
+  items = uniqueExecutions(items);
+  const isClose = isClosingExecution;
+  const realizedByExecution = matchClosingExecutions(items);
   const timeBucket = (item) => { const time = new Date(item.exec_time || 0).getTime(); return Number.isFinite(time) ? Math.floor(time / 15000) : 0; };
   const groups = new Map();
   for (const item of items) {
@@ -111,6 +159,7 @@ function renderExecutions(items) {
     else if (parts[0] === 'ic' && parts[1] === 'close' && parts[2]) { key = parts.slice(0, 3).join('-'); label = '平仓组合'; }
     else if (close) { key = `legacy-close-${timeBucket(item)}`; label = '平仓组合'; }
     else if (parts[0] === 'ic' && parts[1]) { key = parts.slice(0, 2).join('-'); label = '开仓组合'; }
+    key = JSON.stringify([key, item.fee_currency || '']);
     if (!groups.has(key)) groups.set(key, {label, items: [], fee: 0, cashflow: 0, chainDiff: 0, hasChainDiff: false, currency: item.fee_currency || ''});
     const group = groups.get(key);
     group.items.push(item);
@@ -119,12 +168,6 @@ function renderExecutions(items) {
     if (item.chain_price_diff !== null && item.chain_price_diff !== undefined) { group.chainDiff += Number(item.chain_price_diff || 0); group.hasChainDiff = true; }
     if (!group.currency) group.currency = item.fee_currency || '';
   }
-  const openings = new Map();
-  for (const item of items.filter((entry) => !isClose(entry))) {
-    const list = openings.get(item.symbol) || [];
-    list.push(item);
-    openings.set(item.symbol, list);
-  }
   target.className = 'executions';
   target.innerHTML = [...groups.values()].map((group) => {
     const legCount = new Set(group.items.map((item) => item.symbol)).size;
@@ -132,12 +175,9 @@ function renderExecutions(items) {
     let matched = true;
     if (group.label === '平仓组合') {
       for (const close of group.items) {
-        const candidates = openings.get(close.symbol) || [];
-        const open = candidates.find((entry) => entry.side !== close.side);
-        if (!open) { matched = false; continue; }
-        const qty = Math.min(Number(close.exec_qty || 0), Number(open.exec_qty || 0));
-        const direction = close.side === 'Sell' ? 1 : -1;
-        realized += direction * (Number(close.exec_price || 0) - Number(open.exec_price || 0)) * qty - Number(close.exec_fee || 0) - Number(open.exec_fee || 0) * (qty / Math.max(Number(open.exec_qty || 1), 1e-12));
+        const pnl = realizedByExecution.get(close);
+        if (pnl === null || pnl === undefined) matched = false;
+        else realized += pnl;
       }
     }
     const resultLabel = group.label === '平仓组合' ? '组合平仓收益' : '组合成交净额';
@@ -147,16 +187,25 @@ function renderExecutions(items) {
     return `<div class="execution-group"><div class="execution-group-head"><strong>${group.label} · ${legCount} 腿</strong><span>${resultText}${chainText} · 手续费 -${group.fee.toFixed(6)} ${esc(group.currency)}</span></div>${group.items.map((item) => `<div class="execution-row"><strong>${esc(item.symbol)}</strong><span>${esc(item.side)} ${Number(item.exec_qty).toFixed(4)} · ${money(item.exec_price)}${item.chain_price_at_create !== null && item.chain_price_at_create !== undefined ? ` · 链基准 ${Number(item.chain_price_at_create).toFixed(4)}` : ''}</span><span class="exec-fee">-${Number(item.exec_fee).toFixed(6)} ${esc(item.fee_currency)}</span></div>`).join('')}</div>`;
   }).join('');
 }
+function tradeResultMessage(payload, action) {
+  const results = payload.results || [];
+  if (!results.length) return `${action}未返回订单结果，请刷新持仓核对`;
+  const incomplete = results.filter((item) => !['filled', 'simulated'].includes(item.status));
+  if (incomplete.length) {
+    return `${action}尚未全部确认成交，请核对持仓：\n${incomplete.map((item) => `${item.symbol}：${item.status}${item.message ? `（${item.message}）` : ''}`).join('\n')}`;
+  }
+  return payload.live ? `${action}订单已全部成交` : `模拟${action}已记录`;
+}
 function updateTradeControls() {
   const live = Boolean(window.__liveEnabled);
   const confirmed = $('confirm').checked;
-  $('openTrade').textContent = live ? '确认并开仓四腿' : '模拟开仓四腿';
-  $('closeTrade').textContent = live ? '确认并平仓四腿' : '模拟平仓四腿';
+  if (!$('openTrade').dataset.busy) $('openTrade').textContent = live ? '确认并开仓四腿' : '模拟开仓四腿';
+  if (!$('closeTrade').dataset.busy) $('closeTrade').textContent = live ? '确认并平仓四腿' : '模拟平仓四腿';
   if (!$('openTrade').dataset.busy) $('openTrade').disabled = live && !confirmed;
   if (!$('closeTrade').dataset.busy) $('closeTrade').disabled = live && !confirmed;
 }
 async function loadMarket() {
-  if (window.__marketLoading) return;
+  if (window.__marketLoading) { window.__marketReloadPending = true; return; }
   window.__marketLoading = true;
   try {
     const requestedQty = Number($('quantity')?.value || 1);
@@ -170,7 +219,10 @@ async function loadMarket() {
     const quoteTime = preview.market_timestamp ? new Date(preview.market_timestamp) : new Date(); const age = Math.max(0, Math.round((Date.now() - quoteTime.getTime()) / 1000));
     $('statusValue').textContent = age > config.quote_stale_seconds ? '行情过期' : '策略就绪'; $('statusSub').textContent = `${chain.source === 'bybit' ? 'Bybit 主网行情' : '行情不可用'} · ${age}s 前`; $('expiry').textContent = `到期 ${new Date(preview.expiry).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit',timeZone:'UTC'})}`; $('chainSource').textContent = chain.source.toUpperCase();  $('refreshRate').textContent = config.market_refresh_seconds; $('nextOpen').textContent = config.open_time; $('modeTitle').textContent = config.live_enabled ? '实盘模式已启用' : '模拟模式'; $('modeText').textContent = config.live_enabled ? '确认后将向 Bybit 发送 BBO 限价订单。' : '不会向交易所发送订单。'; window.__liveEnabled = config.live_enabled; updateTradeControls(); renderChain(chain.items, preview); renderLegs(preview.legs); renderPayoff(preview); $('updateText').textContent = `行情 ${age}s · 每 ${config.market_refresh_seconds}s 更新`; $('updateDot').style.background = age > config.quote_stale_seconds ? '#ef8989' : '#d7f36b';
   } catch (error) { $('statusValue').textContent = '行情异常'; $('statusSub').textContent = error.message; $('updateText').textContent = '等待重试'; $('updateDot').style.background = '#ef8989'; }
-  finally { window.__marketLoading = false; }
+  finally {
+    window.__marketLoading = false;
+    if (window.__marketReloadPending) { window.__marketReloadPending = false; void loadMarket(); }
+  }
 }
 async function loadAccount() {
   if (window.__accountLoading) return;
@@ -185,7 +237,7 @@ async function loadAccount() {
   finally { window.__accountLoading = false; }
 }
 async function load() { await Promise.allSettled([loadMarket(), loadAccount()]); }
-async function openTrade() { const button = $('openTrade'); button.dataset.busy = '1'; button.disabled = true; button.textContent = '执行中…'; try { const result = await getJson('/api/trading/open', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, quantity:Number($('quantity').value)})}); window.alert(result.live ? '四腿实盘订单已提交' : '模拟订单已记录'); await load(); } catch (error) { window.alert(error.message); } finally { delete button.dataset.busy; updateTradeControls(); } }
+async function openTrade() { const button = $('openTrade'); button.dataset.busy = '1'; button.disabled = true; button.textContent = '执行中…'; try { const result = await getJson('/api/trading/open', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, quantity:Number($('quantity').value)})}); window.alert(tradeResultMessage(result, '开仓')); await load(); } catch (error) { window.alert(error.message); } finally { delete button.dataset.busy; updateTradeControls(); } }
 function tick() { $('clock').textContent = `${new Date().toLocaleTimeString('en-GB',{hour12:false,timeZone:'UTC'})} UTC`; }
 $('refresh').addEventListener('click', async () => { try { await getJson('/api/market/refresh',{method:'POST'}); await loadMarket(); } catch (error) { $('statusSub').textContent = error.message; } }); $('reloadPositions').addEventListener('click', loadAccount); $('openTrade').addEventListener('click', openTrade); $('confirm').addEventListener('change', updateTradeControls); tick(); setInterval(tick,1000);
 let payoffResizeFrame; window.addEventListener('resize', () => { cancelAnimationFrame(payoffResizeFrame); payoffResizeFrame = requestAnimationFrame(() => { if (window.__latestPreview) renderPayoff(window.__latestPreview); }); });
@@ -204,7 +256,7 @@ const refreshEstimate = () => { const value = Number(quantityField.value); if (v
 quantityPreset.addEventListener('change', () => { if (quantityPreset.value !== 'custom') { quantityField.value = quantityPreset.value; refreshEstimate(); } });
 quantityField.addEventListener('change', refreshEstimate);
 loadMarket().finally(loadAccount); setInterval(loadMarket, 10000); setInterval(loadAccount, 15000);
-async function closeTrade() { const button = $('closeTrade'); button.dataset.busy = '1'; button.disabled = true; button.textContent = '执行中…'; try { const result = await getJson('/api/trading/close', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked})}); window.alert(result.live ? '四腿平仓订单已提交' : '模拟平仓已记录'); await load(); } catch (error) { window.alert(error.message); } finally { delete button.dataset.busy; updateTradeControls(); } }
+async function closeTrade() { const button = $('closeTrade'); button.dataset.busy = '1'; button.disabled = true; button.textContent = '执行中…'; try { const result = await getJson('/api/trading/close', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked})}); window.alert(tradeResultMessage(result, '平仓')); await load(); } catch (error) { window.alert(error.message); } finally { delete button.dataset.busy; updateTradeControls(); } }
 $('closeTrade').addEventListener('click', closeTrade);
 function quoteNet(quote, side, state) { const requested = new Map((state.legs || []).map((leg) => [leg.symbol, leg.side])); return (quote[side === 'Buy' ? 'quoteBuyList' : 'quoteSellList'] || []).reduce((sum, item) => { const requestedSide = requested.get(item.symbol) || 'Buy'; const takerSide = side === 'Sell' ? requestedSide : (requestedSide === 'Buy' ? 'Sell' : 'Buy'); return sum + (takerSide === 'Sell' ? 1 : -1) * Number(item.price || 0) * Number(item.qty || 0); }, 0); }
 function quoteLegCount(quote) { return new Set((quote.quoteSellList || []).map((item) => item.symbol)).size; }
