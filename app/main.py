@@ -3,13 +3,18 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 
 from .bybit import BybitError
 from .config import get_settings
 from .engine import TradingEngine
+from .cache import SnapshotCache
+from .lease import StateLease
+from .security import authorize_dashboard
 from .models import CloseRequest, OpenRequest, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest
 
 # The dashboard polls several endpoints frequently; HTTP 200 access lines are
@@ -18,20 +23,24 @@ logging.getLogger("uvicorn.access").disabled = True
 
 settings = get_settings()
 engine = TradingEngine(settings)
+account_cache = SnapshotCache(settings.account_cache_seconds)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    await engine.refresh_chain(force=True)
-    market_task = asyncio.create_task(engine.market_loop())
-    schedule_task = asyncio.create_task(engine.scheduler())
-    try:
-        yield
-    finally:
-        market_task.cancel()
-        schedule_task.cancel()
-        await asyncio.gather(market_task, schedule_task, return_exceptions=True)
-        await engine.client.close()
+    with StateLease(settings.state_file):
+        engine._load_state()
+        account_cache.invalidate()
+        tasks = []
+        try:
+            await engine.refresh_chain(force=True)
+            tasks = [asyncio.create_task(engine.market_loop()), asyncio.create_task(engine.scheduler())]
+            yield
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await engine.client.close()
 
 
 app = FastAPI(title="BTC Iron Condor", version="0.1.0", lifespan=lifespan)
@@ -39,12 +48,37 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), na
 
 
 @app.middleware("http")
-async def no_cache_static(request: Request, call_next):
-    response = await call_next(request)
+async def protect_dashboard(request: Request, call_next):
+    denied = authorize_dashboard(request, settings)
+    if denied is not None:
+        return denied
+    try:
+        response = await call_next(request)
+    finally:
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            account_cache.invalidate()
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
     if request.url.path == "/" or request.url.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
     return response
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(_: Request, exc: RequestValidationError):
+    # Do not echo request inputs (possibly secrets or NaN/Infinity) into JSON.
+    errors = [{"loc": item["loc"], "msg": item["msg"], "type": item["type"]} for item in exc.errors()]
+    return JSONResponse({"detail": errors}, status_code=422)
+
+
+@app.exception_handler(httpx.HTTPError)
+async def upstream_error(_: Request, exc: httpx.HTTPError):
+    engine.log("WARNING", f"Exchange communication failed: {type(exc).__name__}")
+    return JSONResponse({"detail": "Exchange communication failed; retry after checking connectivity"}, status_code=502)
 
 
 @app.get("/", include_in_schema=False)
@@ -79,6 +113,10 @@ async def dashboard_market(quantity: float | None = Query(default=None, gt=0, al
 
 @app.get("/api/dashboard/account")
 async def dashboard_account():
+    return await account_cache.get(_build_account_dashboard)
+
+
+async def _build_account_dashboard():
     position_result, health_result, execution_result = await asyncio.gather(engine.load_positions(), engine.load_account_health(), engine.load_recent_executions(), return_exceptions=True)
     if isinstance(position_result, Exception):
         engine.log("WARNING", f"Could not refresh dashboard positions: {position_result}")
@@ -121,8 +159,11 @@ async def open_trade(request: OpenRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except BybitError as exc:
         raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
+    except httpx.HTTPError as exc:
+        return await upstream_error(None, exc)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Open request failed: {exc}") from exc
+        logging.getLogger(__name__).exception("Open request failed")
+        raise HTTPException(status_code=500, detail="Open request failed; check server logs and order state") from exc
 
 
 @app.post("/api/trading/close")
@@ -134,8 +175,11 @@ async def close_trade(request: CloseRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except BybitError as exc:
         raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
+    except httpx.HTTPError as exc:
+        return await upstream_error(None, exc)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Close request failed: {exc}") from exc
+        logging.getLogger(__name__).exception("Close request failed")
+        raise HTTPException(status_code=500, detail="Close request failed; check server logs and order state") from exc
 
 
 @app.get("/api/rfq/config")
@@ -150,6 +194,8 @@ async def rfq_config():
 async def rfq_status(refresh: bool = Query(default=True)):
     try:
         return await engine.refresh_rfq() if refresh else engine.rfq_state
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except BybitError as exc:
         raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
 

@@ -3,7 +3,6 @@ import hmac
 import json
 import time
 from typing import Any
-from urllib.parse import urlencode
 
 import httpx
 
@@ -38,11 +37,12 @@ class BybitClient:
         headers = {"Content-Type": "application/json"}
         # httpx preserves mapping insertion order when encoding query params;
         # sign the same order that is sent on the wire.
-        query = urlencode(params)
+        query = str(httpx.QueryParams(params))
+        encoded_body = json.dumps(body, separators=(",", ":"), allow_nan=False) if method != "GET" else None
         if private:
             if not self.api_key or not self.api_secret:
                 raise BybitError("Bybit API credentials are not configured")
-            payload = query if method == "GET" else json.dumps(body, separators=(",", ":"))
+            payload = query if method == "GET" else encoded_body
             sign_target = timestamp + self.api_key + str(self.recv_window) + payload
             signature = hmac.new(self.api_secret.encode(), sign_target.encode(), hashlib.sha256).hexdigest()
             headers.update({"X-BAPI-API-KEY": self.api_key, "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": str(self.recv_window), "X-BAPI-SIGN": signature})
@@ -53,17 +53,54 @@ class BybitClient:
         # produce a different payload and causes Bybit Error sign.
         request_kwargs = {"params": params if method == "GET" else None, "headers": headers}
         if method != "GET":
-            request_kwargs["content"] = json.dumps(body, separators=(",", ":"))
+            request_kwargs["content"] = encoded_body
         response = await client.request(method, base_url + path, **request_kwargs)
         response.raise_for_status()
-        data = response.json()
-        if data.get("retCode", 0) != 0:
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise BybitError("Invalid Bybit JSON response") from exc
+        if not isinstance(data, dict) or type(data.get("retCode")) is not int:
+            raise BybitError("Invalid Bybit response envelope")
+        if data["retCode"] != 0:
             raise BybitError(data.get("retMsg", "Bybit request failed"))
-        return data.get("result", {})
+        if not isinstance(data.get("result"), dict):
+            raise BybitError("Invalid Bybit response result")
+        return data["result"]
+
+    async def _pages(self, path: str, params: dict[str, Any], *, private: bool = False, max_items: int | None = None, identity: str | tuple[str, ...] = "symbol") -> list[dict[str, Any]]:
+        params = dict(params)
+        items = []
+        seen_items = set()
+        seen_cursors = set()
+        # A broken/repeating cursor must fail rather than return partial data.
+        for _ in range(100):
+            result = await self._request("GET", path, params, private=private)
+            rows = result.get("list")
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise BybitError("Invalid Bybit paginated response")
+            for row in rows:
+                fields = (identity,) if isinstance(identity, str) else identity
+                values = tuple(row.get(field) for field in fields)
+                if not all(isinstance(value, str) for value in values) or not values[0]:
+                    raise BybitError("Missing identity in Bybit paginated response")
+                key = values
+                if key not in seen_items:
+                    seen_items.add(key)
+                    items.append(row)
+            if max_items is not None and len(items) >= max_items:
+                return items[:max_items]
+            cursor = result.get("nextPageCursor")
+            if cursor in (None, ""):
+                return items
+            if not isinstance(cursor, str) or cursor in seen_cursors:
+                raise BybitError("Invalid or repeated Bybit pagination cursor")
+            seen_cursors.add(cursor)
+            params["cursor"] = cursor
+        raise BybitError("Bybit pagination exceeded the page limit")
 
     async def instruments(self) -> list[dict[str, Any]]:
-        result = await self._request("GET", "/v5/market/instruments-info", {"category": "option", "baseCoin": "BTC", "limit": 1000})
-        return result.get("list", [])
+        return await self._pages("/v5/market/instruments-info", {"category": "option", "baseCoin": "BTC", "limit": 1000})
 
     async def tickers(self, symbol: str | None = None) -> list[dict[str, Any]]:
         params = {"category": "option", "symbol": symbol} if symbol else {"category": "option", "baseCoin": "BTC"}
@@ -75,8 +112,7 @@ class BybitClient:
         return (result.get("list") or [{}])[0]
 
     async def positions(self) -> list[dict[str, Any]]:
-        result = await self._request("GET", "/v5/position/list", {"category": "option", "baseCoin": "BTC"}, private=True)
-        return result.get("list", [])
+        return await self._pages("/v5/position/list", {"category": "option", "baseCoin": "BTC", "limit": 200}, private=True, identity=("symbol", "side"))
 
     async def account_info(self) -> dict[str, Any]:
         return await self._request("GET", "/v5/account/info", private=True)
@@ -92,8 +128,7 @@ class BybitClient:
         params: dict[str, Any] = {"category": "option", "baseCoin": "BTC", "limit": 50}
         if order_link_id:
             params["orderLinkId"] = order_link_id
-        result = await self._request("GET", "/v5/execution/list", params, private=True)
-        return result.get("list", [])
+        return await self._pages("/v5/execution/list", params, private=True, identity="execId", max_items=None if order_link_id else 100)
 
     async def order(self, symbol: str, order_link_id: str) -> dict[str, Any] | None:
         params = {"category": "option", "symbol": symbol, "orderLinkId": order_link_id}

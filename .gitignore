@@ -2,5 +2,6 @@
 __pycache__/
 *.py[cod]
 data/engine_state.json
+data/engine_state.json.lock
 *.egg-info/
 .venv/

@@ -1,10 +1,13 @@
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    dashboard_username: str = Field(default="admin", min_length=1)
+    dashboard_password: SecretStr = SecretStr("")
+    account_cache_seconds: float = Field(default=2.0, ge=0, le=10)
     bybit_api_key: str = ""
     bybit_api_secret: str = ""
     bybit_testnet: bool = True
@@ -39,6 +42,13 @@ class Settings(BaseSettings):
     bbo_order_timeout_seconds: int = Field(default=600, ge=60, le=1800)
     allow_market_fallback: bool = False
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore", allow_inf_nan=False)
+
+    @field_validator("dashboard_password")
+    @classmethod
+    def validate_dashboard_password(cls, value: SecretStr) -> SecretStr:
+        if value.get_secret_value() and len(value.get_secret_value()) < 12:
+            raise ValueError("Dashboard password must contain at least 12 characters")
+        return value
 
     @property
     def environment(self) -> str:

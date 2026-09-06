@@ -215,7 +215,7 @@ class CoreTests(unittest.TestCase):
         async def call():
             transport = httpx.ASGITransport(app=app)
             with patch("app.main.engine.make_preview", new=AsyncMock(return_value=preview)), patch("app.main.engine.chain", options), patch("app.main.engine.chain_source", "bybit"), patch("app.main.engine.chain_updated_at", now), patch("app.main.engine.btc_price", 100000):
-                async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
                     return await client.get("/api/dashboard/market?quantity=0.01")
 
         response = asyncio.run(call())
@@ -227,7 +227,7 @@ class CoreTests(unittest.TestCase):
     def test_health_endpoint_is_local_system_smoke_test(self):
         async def call():
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
                 return await client.get("/api/health")
 
         response = asyncio.run(call())

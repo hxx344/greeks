@@ -146,7 +146,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_http_quantity_validation_rejects_nonfinite_input(self):
         async def run():
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost") as client:
                 for path in ("/api/strategy/preview", "/api/dashboard/market"):
                     for value in ("inf", "nan", "0", "-1"):
                         response = await client.get(path, params={"quantity": value})

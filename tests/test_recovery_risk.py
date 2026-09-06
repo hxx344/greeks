@@ -119,7 +119,7 @@ class RecoveryRiskTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_health_reports_state_failure(self):
         with patch("app.main.engine.state_error", "State file could not be loaded"):
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost") as client:
                 payload = (await client.get("/api/health")).json()
                 self.assertEqual(payload["status"], "degraded")
                 self.assertIn("State file", payload["trading_blocked_reason"])

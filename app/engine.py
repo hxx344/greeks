@@ -43,6 +43,7 @@ class TradingEngine:
         self._load_state()
         self.account_health = AccountHealth(available=False, message="Live account credentials are not configured")
         self.last_executions: list[ExecutionRecord] = []
+        self.execution_details: dict[str, list[ExecutionRecord]] = {}
         self.lock = asyncio.Lock()
         self.log("INFO", f"Engine started in {settings.environment} mode")
 
@@ -61,6 +62,7 @@ class TradingEngine:
             self.execution_group_links = state.get("execution_group_links") or {}
             self.pm_baseline = state.get("pm_baseline") or {}
             self.order_journal = state.get("order_journal") or {}
+            self.state_error = None
         except FileNotFoundError:
             return
         except (OSError, ValueError) as exc:
@@ -680,7 +682,7 @@ class TradingEngine:
             by_link.setdefault(execution.order_link_id, []).append(execution)
         for result in results:
             links = result.related_order_link_ids or [result.order_link_id or ""]
-            executions = [item for link in set(links) for item in by_link.get(link, [])]
+            executions = [item for link in set(links) for item in self.execution_details.get(link, by_link.get(link, []))]
             if not executions:
                 continue
             result.exec_fee = round(sum(item.exec_fee for item in executions), 8)
@@ -696,7 +698,8 @@ class TradingEngine:
             return self.last_executions
         try:
             if order_link_ids:
-                raw_groups = await asyncio.gather(*[self.client.executions(order_link_id) for order_link_id in set(order_link_ids)], return_exceptions=True)
+                requested_links = list(dict.fromkeys(order_link_ids))
+                raw_groups = await asyncio.gather(*[self.client.executions(order_link_id) for order_link_id in requested_links], return_exceptions=True)
                 for group in raw_groups:
                     if isinstance(group, Exception):
                         self.log("WARNING", f"Could not load some order executions; preserving cached records: {group}")
@@ -725,6 +728,13 @@ class TradingEngine:
                 strategy_side = baseline.get("side")
                 chain_diff = ((1 if strategy_side == "Sell" else -1) * (exec_price - chain_price) * exec_qty) if chain_price is not None and strategy_side else None
                 records.append(ExecutionRecord(symbol=item.get("symbol", ""), side=item.get("side", ""), order_id=item.get("orderId", ""), order_link_id=order_link_id, exec_id=exec_id, exec_fee=float(item.get("execFee", 0) or 0), fee_currency=item.get("feeCurrency", ""), exec_price=exec_price, exec_qty=exec_qty, fee_rate=float(item.get("feeRate", 0) or 0) if item.get("feeRate") not in (None, "") else None, exec_time=datetime.fromtimestamp(int(item.get("execTime", 0)) / 1000, tz=timezone.utc), reduce_only=reduce_only, opening_group=group.get("opening_group"), execution_group=group_id, chain_price_at_create=chain_price, chain_price_diff=chain_diff))
+            if order_link_ids:
+                for link, group in zip(requested_links, raw_groups):
+                    if isinstance(group, list):
+                        self.execution_details.pop(link, None)
+                        self.execution_details[link] = [item for item in records if item.order_link_id == link]
+                while len(self.execution_details) > 32:
+                    self.execution_details.pop(next(iter(self.execution_details)))
             merged = {item.exec_id: item for item in self.last_executions}
             merged.update({item.exec_id: item for item in records})
             self.last_executions = sorted(merged.values(), key=lambda item: item.exec_time, reverse=True)[:100]
