@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 from math import isclose, isfinite
 from pathlib import Path
@@ -10,6 +12,8 @@ from .config import Settings
 from .models import AccountHealth, CloseRequest, ExecutionRecord, LogEntry, OpenRequest, OrderResult, Position, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest, StrategyPreview
 from .strategy import build_iron_condor
 from .orders import OrderExecutor
+from .state import EngineState
+from .risk import maximum_loss
 
 
 class TradingEngine:
@@ -35,6 +39,7 @@ class TradingEngine:
         self.execution_group_links: dict[str, str] = {}
         self.pm_baseline: dict = {}
         self.order_journal: dict[str, dict] = {}
+        self.state_error: str | None = None
         self._load_state()
         self.account_health = AccountHealth(available=False, message="Live account credentials are not configured")
         self.last_executions: list[ExecutionRecord] = []
@@ -43,7 +48,10 @@ class TradingEngine:
 
     def _load_state(self) -> None:
         try:
-            state = json.loads(Path(self.settings.state_file).read_text(encoding="utf-8"))
+            def reject_constant(value):
+                raise ValueError(f"Invalid JSON number: {value}")
+            parsed = json.loads(Path(self.settings.state_file).read_text(encoding="utf-8"), parse_constant=reject_constant)
+            state = EngineState.model_validate(parsed).model_dump()
             self.last_open_week = state.get("last_open_week")
             self.active_strategy_symbols = set(state.get("active_strategy_symbols", []))
             self.active_strategy_sizes = {key: float(value) for key, value in (state.get("active_strategy_sizes") or {}).items()}
@@ -53,15 +61,40 @@ class TradingEngine:
             self.execution_group_links = state.get("execution_group_links") or {}
             self.pm_baseline = state.get("pm_baseline") or {}
             self.order_journal = state.get("order_journal") or {}
-        except (FileNotFoundError, OSError, ValueError):
-            self.last_open_week = None
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            self.state_error = f"State file could not be loaded ({type(exc).__name__}); restore a valid file and restart before trading"
+            self.log("ERROR", self.state_error)
+
+    def _require_trading_state(self) -> None:
+        if self.state_error:
+            raise ValueError(self.state_error)
 
     def _save_state(self) -> None:
+        self._require_trading_state()
         target = Path(self.settings.state_file)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temp = target.with_suffix(target.suffix + ".tmp")
-        temp.write_text(json.dumps({"last_open_week": self.last_open_week, "active_strategy_symbols": sorted(self.active_strategy_symbols), "active_strategy_sizes": self.active_strategy_sizes, "active_strategy_group_id": self.active_strategy_group_id, "rfq_state": self.rfq_state, "execution_groups": self.execution_groups, "execution_group_links": self.execution_group_links, "pm_baseline": self.pm_baseline, "order_journal": self.order_journal}), encoding="utf-8")
-        temp.replace(target)
+        temp = None
+        try:
+            state = EngineState(last_open_week=self.last_open_week, active_strategy_symbols=sorted(self.active_strategy_symbols),
+                                active_strategy_sizes=self.active_strategy_sizes, active_strategy_group_id=self.active_strategy_group_id,
+                                rfq_state=self.rfq_state, execution_groups=self.execution_groups, execution_group_links=self.execution_group_links,
+                                pm_baseline=self.pm_baseline, order_journal=self.order_journal)
+            payload = json.dumps(state.model_dump(), allow_nan=False)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, prefix=target.name + ".", suffix=".tmp", delete=False) as stream:
+                temp = Path(stream.name)
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temp.replace(target)
+        except (OSError, ValueError) as exc:
+            self.state_error = f"State file could not be saved ({type(exc).__name__}); verify storage and restart before trading"
+            self.log("ERROR", self.state_error)
+            raise ValueError(self.state_error) from exc
+        finally:
+            if temp is not None:
+                temp.unlink(missing_ok=True)
 
     def is_open_window(self, now: datetime | None = None) -> bool:
         now = now or datetime.now(timezone.utc)
@@ -230,7 +263,35 @@ class TradingEngine:
                                     "reduce_only": reduce_only, "status": "unknown", "terminal": False, "filledQty": 0.0}
         self._save_state()
         executor = OrderExecutor(self.client, self.settings, self.log)
-        return await executor.execute(instrument, leg.side, qty, link, lambda outcome: self._record_order(link, outcome), reduce_only, market)
+        guard = None if reduce_only else lambda price: self._reserve_execution_price(link, leg.symbol, price)
+        return await executor.execute(instrument, leg.side, qty, link, lambda outcome: self._record_order(link, outcome), reduce_only, market, guard)
+
+    def _reserve_execution_price(self, link: str, symbol: str, price: float | None) -> None:
+        self._require_trading_state()
+        group = self.execution_groups.get(self.execution_group_links.get(link), {})
+        if not group:
+            return  # Direct executor use has no strategy context.
+        if group.get("risk_blocked"):
+            raise ValueError("Combination risk was exceeded; remaining opening orders must stop")
+        if price is None:
+            return
+        if not isfinite(price) or price <= 0:
+            raise ValueError("Invalid execution price")
+        bounds = group.get("risk_legs")
+        if not bounds or symbol not in bounds:
+            raise ValueError("Opening strategy has no execution price risk bounds")
+        proposed = {key: dict(value) for key, value in bounds.items()}
+        leg = proposed[symbol]
+        leg["price_bound"] = max(price, leg["price_bound"]) if leg["side"] == "Buy" else min(price, leg["price_bound"])
+        loss = maximum_loss(proposed)
+        if loss > self.settings.max_risk_usd:
+            group["risk_blocked"] = True
+            self._save_state()
+            raise ValueError(f"Execution prices exceed combination maximum loss limit: {loss:.2f}")
+        if proposed != bounds:
+            # Keep the worst bound ever submitted; fills can race amendments.
+            group["risk_legs"] = proposed
+            self._save_state()
 
     async def follow_bbo_order(self, leg, qty: float, order_link_id: str, reduce_only: bool = False) -> dict:
         return await self._execute_order(leg, qty, order_link_id, reduce_only)
@@ -246,6 +307,7 @@ class TradingEngine:
 
     async def open_position(self, request: OpenRequest, scheduled: bool = False) -> list[OrderResult]:
         async with self.lock:
+            self._require_trading_state()
             if self.settings.can_trade_live and not request.confirm_live:
                 raise ValueError("Live opening requires explicit confirmation")
             qty = request.quantity or self.settings.leg_qty
@@ -284,6 +346,13 @@ class TradingEngine:
                 request_id = uuid4().hex[:12]
                 order_links = [f"ic-{request_id}-{index}" for index, _ in enumerate(preview.legs)]
                 self.execution_groups[request_id] = {"type": "open", "order_tracking": True, "created_at": datetime.now(timezone.utc).isoformat(), "legs": {leg.symbol: {"side": leg.side, "chain_price": (next(item for item in self.chain if item.symbol == leg.symbol).bid if leg.side == "Sell" else next(item for item in self.chain if item.symbol == leg.symbol).ask), "qty": qty} for leg in preview.legs}}
+                instruments = {item.symbol: item for item in self.chain}
+                risk_legs = {leg.symbol: {"side": leg.side, "option_type": leg.option_type, "strike": leg.strike, "qty": qty,
+                                         "price_bound": instruments[leg.symbol].bid if leg.side == "Buy" else instruments[leg.symbol].ask}
+                             for leg in preview.legs}
+                if maximum_loss(risk_legs) > self.settings.max_risk_usd:
+                    raise ValueError("Initial BBO prices exceed combination maximum loss limit")
+                self.execution_groups[request_id]["risk_legs"] = risk_legs
                 for link in order_links:
                     self.execution_group_links[link] = request_id
                 self._save_state()
@@ -362,6 +431,7 @@ class TradingEngine:
             return await self._create_rfq(request)
 
     async def _create_rfq(self, request: RfqCreateRequest) -> dict:
+        self._require_trading_state()
         if self.rfq_state.get("rfq_id") and self.rfq_state.get("status") not in {"Canceled", "Expired", "Filled", "Failed"}:
             raise ValueError("An RFQ is already active; resolve it before creating another")
         if not self.settings.bybit_api_key or not self.settings.bybit_api_secret:
@@ -407,6 +477,7 @@ class TradingEngine:
             return await self._refresh_rfq()
 
     async def _refresh_rfq(self) -> dict:
+        self._require_trading_state()
         if not self.rfq_state.get("rfq_id"):
             return self.rfq_state
         rfq_id = self.rfq_state["rfq_id"]
@@ -425,6 +496,7 @@ class TradingEngine:
             return await self._execute_rfq(request)
 
     async def _execute_rfq(self, request: RfqExecuteRequest) -> dict:
+        self._require_trading_state()
         if not self.settings.can_trade_live:
             raise ValueError("Live trading is disabled")
         if not request.confirm_live:
@@ -502,6 +574,20 @@ class TradingEngine:
             raise ValueError("RFQ quote exceeds the maximum loss limit")
 
     def _track_filled_rfq(self, positions: list[Position] | None = None) -> bool:
+        self._require_trading_state()
+        group_id = f"rfq:{self.rfq_state.get('rfq_id', '')}"
+        if self.rfq_state.get("tracking_applied"):
+            return False
+        # Migrate existing tracking without restoring the original quantity
+        # after a partial or complete close, including older state files.
+        already_tracked = self.active_strategy_group_id == group_id or any(
+            group.get("type") == "close" and group.get("opening_group") == group_id
+            for group in self.execution_groups.values()
+        )
+        if already_tracked:
+            self.rfq_state["tracking_applied"] = True
+            self._save_state()
+            return False
         if self.execution_groups.get(self.active_strategy_group_id, {}).get("order_tracking"):
             return False
         legs = self.rfq_state.get("legs") or []
@@ -523,6 +609,7 @@ class TradingEngine:
         self.active_strategy_symbols = {str(leg["symbol"]) for leg in legs}
         self.active_strategy_sizes = sizes
         self.active_strategy_group_id = f"rfq:{self.rfq_state.get('rfq_id', '')}"
+        self.rfq_state["tracking_applied"] = True
         self._save_state()
         return True
 
@@ -577,6 +664,7 @@ class TradingEngine:
             return await self._cancel_rfq(request)
 
     async def _cancel_rfq(self, request: RfqCancelRequest) -> dict:
+        self._require_trading_state()
         if request.rfq_id != self.rfq_state.get("rfq_id"):
             raise ValueError("RFQ is not the active inquiry")
         result = await self.client.cancel_rfq(request.rfq_id)
@@ -646,6 +734,7 @@ class TradingEngine:
 
     async def close_position(self, request: CloseRequest) -> tuple[list[OrderResult], list[ExecutionRecord]]:
         async with self.lock:
+            self._require_trading_state()
             if self.settings.can_trade_live and not request.confirm_live:
                 raise ValueError("Live closing requires explicit confirmation")
             live = bool(request.confirm_live and self.settings.can_trade_live)
@@ -733,7 +822,7 @@ class TradingEngine:
 
     async def load_positions(self) -> list[Position]:
         if self.settings.can_trade_live:
-            if not self.lock.locked() and any(not entry.get("terminal") for entry in self.order_journal.values()):
+            if not self.state_error and not self.lock.locked() and any(not entry.get("terminal") for entry in self.order_journal.values()):
                 async with self.lock:
                     try:
                         await self._reconcile_pending_orders()
@@ -742,7 +831,7 @@ class TradingEngine:
             try:
                 raw = await self.client.positions()
                 self.positions = [Position(symbol=item.get("symbol", ""), side=item.get("side", ""), size=float(item.get("size", 0)), avg_price=float(item.get("avgPrice", 0) or 0), mark_price=float(item.get("markPrice", 0) or 0), unrealised_pnl=float(item.get("unrealisedPnl", 0) or 0), source="bybit") for item in raw if float(item.get("size", 0) or 0) > 0]
-                if len(self.active_strategy_symbols) < 4 and (self._track_filled_rfq(self.positions) or self._recover_tracked_open_positions(self.positions)):
+                if not self.state_error and len(self.active_strategy_symbols) < 4 and (self._track_filled_rfq(self.positions) or self._recover_tracked_open_positions(self.positions)):
                     self.log("INFO", "Recovered tracked Iron Condor legs from the opening task and current Bybit positions")
             except BybitError as exc:
                 self.log("WARNING", f"Could not load private positions: {exc}")

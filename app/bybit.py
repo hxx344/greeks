@@ -115,8 +115,8 @@ class BybitClient:
     async def cancel_order(self, symbol: str, order_link_id: str) -> dict[str, Any]:
         return await self._request("POST", "/v5/order/cancel", body={"category": "option", "symbol": symbol, "orderLinkId": order_link_id}, private=True)
 
-    async def place_market_order(self, symbol: str, side: str, qty: float, order_link_id: str, reduce_only: bool = False) -> dict[str, Any]:
-        return await self._request("POST", "/v5/order/create", body={"category": "option", "symbol": symbol, "side": side, "orderType": "Market", "qty": str(qty), "timeInForce": "IOC", "orderLinkId": order_link_id, "reduceOnly": reduce_only}, private=True)
+    async def place_ioc_order(self, symbol: str, side: str, qty: float, price: float, order_link_id: str, reduce_only: bool = False) -> dict[str, Any]:
+        return await self._request("POST", "/v5/order/create", body={"category": "option", "symbol": symbol, "side": side, "orderType": "Limit", "price": str(price), "qty": str(qty), "timeInForce": "IOC", "orderLinkId": order_link_id, "reduceOnly": reduce_only}, private=True)
 
     async def rfq_config(self) -> dict[str, Any]:
         return await self._request("GET", "/v5/rfq/config", private=True)

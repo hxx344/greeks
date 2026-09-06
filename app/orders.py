@@ -1,5 +1,5 @@
 import asyncio
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
 from math import isclose, isfinite
 
 
@@ -51,21 +51,34 @@ class OrderExecutor:
         self.log("ERROR", f"Order {link} remains unresolved; automatic retry is blocked")
         return outcome
 
-    async def execute(self, instrument, side: str, qty: float, link: str, record, reduce_only: bool = False, market: bool = False) -> dict:
+    async def execute(self, instrument, side: str, qty: float, link: str, record, reduce_only: bool = False, market: bool = False, check_price=None) -> dict:
         outcome = {"orderId": "", "orderLinkId": link, "status": "unknown", "terminal": False, "filledQty": 0.0}
         attempted = False
         last_price = None
         deadline = asyncio.get_running_loop().time() + self.settings.bbo_order_timeout_seconds
         try:
             if market:
+                latest = (await self.client.tickers(symbol=instrument.symbol) or [{}])[0]
+                price = float(latest.get("ask1Price" if side == "Buy" else "bid1Price", 0) or 0)
+                tick = Decimal(str(instrument.price_tick))
+                if not isfinite(price) or price <= 0 or not tick.is_finite() or tick <= 0:
+                    raise ValueError("No usable price for bounded IOC fallback")
+                rounding = ROUND_FLOOR if side == "Buy" else ROUND_CEILING
+                price = float((Decimal(str(price)) / tick).quantize(Decimal("1"), rounding=rounding) * tick)
+                if price <= 0:
+                    raise ValueError("IOC price is below the minimum tick")
+                if check_price:
+                    check_price(price)
                 attempted = True
-                response = await self.client.place_market_order(instrument.symbol, side, qty, link, reduce_only)
+                response = await self.client.place_ioc_order(instrument.symbol, side, qty, price, link, reduce_only)
                 outcome["orderId"] = response.get("orderId", "")
                 outcome = await self.reconcile(instrument.symbol, side, qty, link, outcome, cancel=False)
                 if not outcome["terminal"]:
                     outcome = await self.reconcile(instrument.symbol, side, qty, link, outcome)
             else:
                 while asyncio.get_running_loop().time() < deadline:
+                    if check_price:
+                        check_price(None)
                     if attempted:
                         outcome = self.snapshot(await self.client.order(instrument.symbol, link), qty, side, outcome)
                         record(outcome)
@@ -80,6 +93,8 @@ class OrderExecutor:
                         price = float((Decimal(str(price)) / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick)
                         if price <= 0:
                             raise ValueError("BBO price is below the minimum tick")
+                        if check_price:
+                            check_price(price)
                         if not attempted:
                             # Set before awaiting: a lost response can hide an accepted order.
                             attempted = True

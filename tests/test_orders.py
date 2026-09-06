@@ -37,7 +37,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
             tickers=AsyncMock(return_value=[{"bid1Price": "10", "ask1Price": "12"}]),
             order=AsyncMock(return_value=None), cancel_order=AsyncMock(return_value={}),
             place_limit_order=AsyncMock(return_value={"orderId": "order-1"}),
-            place_market_order=AsyncMock(return_value={"orderId": "market-1"}),
+            place_ioc_order=AsyncMock(return_value={"orderId": "market-1"}),
             amend_order=AsyncMock(return_value={}), positions=AsyncMock(side_effect=AssertionError("Account positions must not determine fallback")),
         )
         self.client = self.engine.client
@@ -153,7 +153,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         self.client.place_limit_order.assert_awaited_once()
 
     async def test_later_reconciliation_restores_only_own_confirmed_quantity(self):
-        self.engine.execution_groups["opening"] = {"type": "open", "order_tracking": True}
+        self.engine.execution_groups["opening"] = {"type": "open", "order_tracking": True, "risk_legs": {leg.symbol: {"side": leg.side, "option_type": leg.option_type, "strike": leg.strike, "qty": leg.qty, "price_bound": leg.mark_price} for leg in self.preview.legs}}
         self.engine.execution_group_links["ic-order"] = "opening"
         self.client.place_limit_order.side_effect = httpx.ReadTimeout("response lost")
         await self.run_leg()
@@ -172,15 +172,15 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         async def limit(symbol, side, qty, price, link, reduce_only):
             orders[link] = self.order("Cancelled", "0.01", str(qty), side)
             return {"orderId": link}
-        async def market(symbol, side, qty, link, reduce_only):
+        async def market(symbol, side, qty, price, link, reduce_only):
             orders[link] = self.order("Filled", str(qty), str(qty), side)
             return {"orderId": link}
         self.client.place_limit_order.side_effect = limit
-        self.client.place_market_order.side_effect = market
+        self.client.place_ioc_order.side_effect = market
         self.client.order.side_effect = lambda symbol, link: orders.get(link)
         results = await self.engine.open_position(OpenRequest(confirm_live=True, quantity=0.03))
-        self.assertEqual(self.client.place_market_order.await_count, 4)
-        self.assertTrue(all(call.args[2] == 0.02 for call in self.client.place_market_order.await_args_list))
+        self.assertEqual(self.client.place_ioc_order.await_count, 4)
+        self.assertTrue(all(call.args[2] == 0.02 for call in self.client.place_ioc_order.await_args_list))
         self.assertTrue(all(result.status == "filled" and result.qty == 0.03 for result in results))
         self.assertTrue(all(abs(qty - 0.03) < 1e-9 for qty in self.engine.active_strategy_sizes.values()))
         self.assertEqual(len(self.engine.active_strategy_sizes), 4)
@@ -192,7 +192,7 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         self.client.place_limit_order.side_effect = httpx.ReadTimeout("response lost")
         results = await self.engine.open_position(OpenRequest(confirm_live=True, quantity=0.03))
         self.assertTrue(all(result.status == "unknown" for result in results))
-        self.client.place_market_order.assert_not_awaited()
+        self.client.place_ioc_order.assert_not_awaited()
 
     async def test_fallback_requires_fresh_original_order_confirmation(self):
         self.settings.allow_market_fallback = True
@@ -205,15 +205,15 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         await self.engine._market_fallback([self.leg], 0.03, ["ic-order"], [result], "group", [])
         self.assertEqual(result.status, "unknown")
         self.assertEqual(result.qty, 0.01)
-        self.client.place_market_order.assert_not_awaited()
+        self.client.place_ioc_order.assert_not_awaited()
 
     async def test_replacement_response_loss_never_causes_a_second_submission(self):
-        self.client.place_market_order.side_effect = httpx.ReadTimeout("market response lost")
+        self.client.place_ioc_order.side_effect = httpx.ReadTimeout("market response lost")
         result = await self.engine._execute_order(self.leg, 0.02, "ic-mkt-unknown", market=True)
         self.assertEqual(result["status"], "unknown")
         with self.assertRaisesRegex(ValueError, "already been used"):
             await self.engine._execute_order(self.leg, 0.02, "ic-mkt-unknown", market=True)
-        self.client.place_market_order.assert_awaited_once()
+        self.client.place_ioc_order.assert_awaited_once()
         self.client.cancel_order.assert_awaited_once()
 
     async def test_remainder_below_lot_minimum_is_not_rounded_up(self):
@@ -225,11 +225,11 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         await self.engine._market_fallback([self.leg], 0.03, ["ic-order"], [result], "group", [])
         self.assertEqual(result.qty, 0.025)
         self.assertIn("lot limits", result.message)
-        self.client.place_market_order.assert_not_awaited()
+        self.client.place_ioc_order.assert_not_awaited()
 
     async def test_partial_close_updates_all_confirmed_legs_without_double_deduction(self):
         self.engine.active_strategy_group_id = "opening"
-        self.engine.execution_groups["opening"] = {"type": "open", "order_tracking": True}
+        self.engine.execution_groups["opening"] = {"type": "open", "order_tracking": True, "risk_legs": {leg.symbol: {"side": leg.side, "option_type": leg.option_type, "strike": leg.strike, "qty": leg.qty, "price_bound": leg.mark_price} for leg in self.preview.legs}}
         self.engine.active_strategy_symbols = {leg.symbol for leg in self.preview.legs}
         self.engine.active_strategy_sizes = {f"{leg.symbol}|{leg.side}": 0.03 for leg in self.preview.legs}
         self.client.positions.side_effect = None

@@ -50,6 +50,16 @@ test('polling preserves busy trade button text', () => {
   assert.equal(button.disabled, true);
 });
 
+test('state failure disables both trading buttons even with confirmation', () => {
+  const {context, element} = dashboard();
+  context.window.__liveEnabled = true;
+  context.window.__tradingBlocked = true;
+  element('confirm').checked = true;
+  context.updateTradeControls();
+  assert.equal(element('openTrade').disabled, true);
+  assert.equal(element('closeTrade').disabled, true);
+});
+
 test('quantity changes during a request coalesce into a fresh request', async () => {
   const {context, element, pending} = dashboard();
   assert.equal(pending.length, 1);
