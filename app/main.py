@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -124,9 +124,17 @@ async def dashboard_market(quantity: float | None = Query(default=None, gt=0, al
             raise HTTPException(status_code=503, detail="行情暂不可用或已过期，无法确认周日到期合约是否上线") from exc
         if has_sunday or not engine.chain:
             raise HTTPException(status_code=422, detail="周日到期合约报价暂不足以构建策略") from exc
-        return {"status": "waiting_for_listing", "message": "周日到期合约尚未上线，系统将自动检查；上线后生成四腿策略。",
+        observation_date = (now + timedelta(days=2)).date()
+        observation_expiry = min((item.expiry for item in engine.chain if item.expiry > now and item.expiry.astimezone(timezone.utc).date() == observation_date), default=None)
+        observation_items = [item for item in engine.chain if item.expiry == observation_expiry] if observation_expiry else []
+        message = (f"周日到期合约尚未上线，暂展示 {observation_date:%Y-%m-%d}（UTC 后天）到期盘口，仅供查看，不能用于开仓或询价。"
+                   if observation_items else "周日及 UTC 后天到期合约尚未上线，系统将自动检查；周日合约上线后恢复策略。")
+        # Observation quotes never become an execution preview or change the
+        # engine's Sunday-only expiry selection used by opening and RFQ APIs.
+        return {"status": "waiting_for_listing", "read_only": True, "message": message,
                 "config": config_payload(), "preview": None,
-                "chain": {"source": engine.chain_source, "btc_price": engine.btc_price, "updated_at": engine.chain_updated_at, "items": []}}
+                "chain": {"source": engine.chain_source, "btc_price": engine.btc_price, "updated_at": engine.chain_updated_at,
+                          "expiry": observation_expiry, "items": [item.model_dump(mode="json") for item in observation_items]}}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

@@ -353,6 +353,7 @@ svg { display: block; }
 .pp-note { border-top: 1px solid var(--line-soft); padding-top: 18px; margin: 22px 0 0; font-size: 11px; color: var(--quiet); line-height: 1.9; }
 .pp-note a { color: var(--accent); white-space: nowrap; }
 .pp-warning { font-size: 12px; color: var(--warning); }
+.market-notice { margin: -4px 0 18px; padding: 11px 14px; border: 1px solid #5d5035; border-radius: 8px; background: #2b261c; color: var(--warning); font-size: 12px; line-height: 1.8; }
 @media (max-width: 600px) {
   .position-payoff-panel { margin-top: 18px; }
   .pp-heading { align-items: flex-start; flex-direction: column; gap: 12px; }

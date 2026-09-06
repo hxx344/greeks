@@ -52,7 +52,8 @@ function deltaCell(item, side) {
   return `<td class="delta ${side}"><span class="delta-value">${value.toFixed(3)}</span><span class="delta-track"><i style="width:${Math.min(100, Math.abs(value) * 100)}%"></i></span></td>`;
 }
 function renderChain(items, preview) {
-  const filtered = (items || []).filter((item) => item.expiry === preview?.expiry);
+  const expiryTime = Date.parse(preview?.expiry || '');
+  const filtered = (items || []).filter((item) => Date.parse(item.expiry) === expiryTime);
   const strikes = [...new Set(filtered.map((item) => Number(item.strike)))].sort((a, b) => a - b);
   const mid = Number(preview?.btc_price) || (strikes.length ? strikes.reduce((a, b) => a + b, 0) / strikes.length : 0);
   const atmStrike = strikes.reduce((nearest, strike) => Math.abs(strike - mid) < Math.abs(nearest - mid) ? strike : nearest, strikes[0]);
@@ -226,13 +227,14 @@ function tradeResultMessage(payload, action) {
 function updateTradeControls() {
   const live = Boolean(window.__liveEnabled);
   const confirmed = $('confirm').checked;
-  if (!$('openTrade').dataset.busy) $('openTrade').textContent = live ? '确认并开仓四腿' : '模拟开仓四腿';
+  if (!$('openTrade').dataset.busy) $('openTrade').textContent = window.__marketReadOnly ? '仅供查看 · 禁止开仓' : (live ? '确认并开仓四腿' : '模拟开仓四腿');
   if (!$('closeTrade').dataset.busy) $('closeTrade').textContent = live ? '确认并平仓四腿' : '模拟平仓四腿';
   if (!$('openTrade').dataset.busy) $('openTrade').disabled = Boolean(window.__tradingBlocked || window.__openingBlocked || window.__strategyUnavailable) || (live && !confirmed);
   if (!$('closeTrade').dataset.busy) $('closeTrade').disabled = Boolean(window.__tradingBlocked) || (live && !confirmed);
   $('rfqCreate').disabled = Boolean(window.__tradingBlocked || window.__openingBlocked || window.__strategyUnavailable);
 }
 function clearStrategyDisplay(message) {
+  $('marketNotice').hidden = true;
   if ($('chainPanel')) $('chainPanel').dataset.availability = 'unavailable';
   $('legs').className = 'legs strategy-empty';
   window.__latestPreview = null;
@@ -266,7 +268,10 @@ async function loadMarket() {
     if ($('modeBox')) $('modeBox').dataset.mode = config.environment || (enabled ? 'live' : 'dry-run');
     const modeLabel = config.environment === "testnet" ? "TESTNET" : (enabled ? "LIVE" : "MAINNET DATA / DRY");
     window.__tradingBlocked = Boolean(config.trading_blocked_reason);
-    window.__strategyUnavailable = !preview;
+    window.__marketReadOnly = payload.read_only === true || payload.status === 'waiting_for_listing';
+    window.__strategyUnavailable = !preview || window.__marketReadOnly;
+    $('marketNotice').hidden = !window.__marketReadOnly;
+    $('marketNotice').textContent = payload.message || '备用盘口仅供查看，禁止开仓和询价。';
     $('chainSource').textContent = chain.source.toUpperCase();
     $('refreshRate').textContent = config.market_refresh_seconds;
     $('nextOpen').textContent = config.open_time;
@@ -276,10 +281,21 @@ async function loadMarket() {
     updateTradeControls();
     if (payload.status === 'waiting_for_listing') {
       clearStrategyDisplay('等待周日到期合约上线');
+      if (chain.expiry && chain.items?.length) {
+        $('chainPanel').dataset.availability = 'ready';
+        window.__latestChain = chain.items;
+        renderChain(chain.items, {expiry: chain.expiry, btc_price: chain.btc_price, legs: []});
+        $('expiry').textContent = `仅查看 · ${new Date(chain.expiry).toLocaleDateString('zh-CN', {month: '2-digit', day: '2-digit', timeZone: 'UTC'})}`;
+        $('legSummary').textContent = 'VIEW ONLY';
+        $('marketNotice').textContent = payload.message;
+        $('marketNotice').hidden = false;
+        $('modeTitle').textContent = '备用盘口 · 仅供查看';
+        $('modeText').textContent = '周日合约上线后自动恢复策略。备用合约不可开仓或询价，已有持仓仍可按原规则平仓。';
+      }
       $('btcPrice').textContent = chain.btc_price ? money(chain.btc_price) : '--';
       $('environment').textContent = modeLabel;
       $('statusValue').dataset.state = config.trading_blocked_reason ? 'error' : 'waiting';
-      $('statusValue').textContent = config.trading_blocked_reason ? '交易已阻止' : '等待合约上线';
+      $('statusValue').textContent = config.trading_blocked_reason ? '交易已阻止' : (chain.expiry && chain.items?.length ? '备用盘口 · 只读' : '等待合约上线');
       $('statusSub').textContent = config.trading_blocked_reason || payload.message;
       $('updateText').textContent = '行情已连接 · 自动检查合约';
       $('updateDot').style.background = '#d6bc86';

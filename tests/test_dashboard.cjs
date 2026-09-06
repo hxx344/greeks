@@ -205,6 +205,37 @@ test('actual market errors remain distinct from listing wait', async () => {
   assert.equal(element('openTrade').disabled, true);
 });
 
+test('observation chain is visible without enabling orders and automatically returns to Sunday strategy', async () => {
+  const {context, element, pending} = dashboard();
+  const payload = marketPayload(true);
+  payload.read_only = true;
+  payload.message = '周日未上线，后天到期盘口仅供查看';
+  payload.chain.expiry = '2026-09-09T08:00:00+00:00';
+  payload.chain.items = [{symbol:'BTC-9SEP26-100000-C',expiry:'2026-09-09T08:00:00Z',option_type:'Call',strike:100000,delta:.5,bid:500,ask:510,mark_price:505}];
+  element('confirm').checked = true;
+  pending[0].resolve({ok:true,text:async()=>JSON.stringify(payload)});
+  await new Promise(setImmediate);
+  assert.equal(element('chainPanel').dataset.availability, 'ready');
+  assert.match(element('chain').innerHTML, /500.00/);
+  assert.equal(element('marketNotice').hidden, false);
+  assert.match(element('statusValue').textContent, /只读/);
+  assert.match(element('expiry').textContent, /09\/09/);
+  assert.equal(context.window.__latestPreview, null);
+  assert.equal(element('creditValue').textContent, '--');
+  assert.equal(element('openTrade').disabled, true);
+  assert.equal(element('rfqCreate').disabled, true);
+  assert.equal(element('closeTrade').disabled, false);
+  context.updateTradeControls();
+  assert.equal(element('openTrade').disabled, true);
+  const ready = context.loadMarket();
+  pending.at(-1).resolve({ok:true,text:async()=>JSON.stringify(marketPayload(false))});
+  await ready;
+  assert.equal(element('marketNotice').hidden, true);
+  assert.equal(element('openTrade').disabled, false);
+  assert.equal(element('rfqCreate').disabled, false);
+  assert.equal(element('statusValue').textContent, '策略就绪');
+});
+
 test('listing wait keeps state failure visible and closing blocked', async () => {
   const {element, pending} = dashboard();
   const payload = marketPayload(true);

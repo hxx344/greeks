@@ -33,6 +33,7 @@
     <section class="workspace" id="market" aria-label="盘口与执行">
       <div class="panel chain-panel" id="chainPanel" data-depth="compact">
         <div class="panel-head"><div><div class="kicker">01 / MARKET</div><h2>期权链<span class="heading-detail">双侧盘口</span></h2></div><div class="head-right"><span class="spot-tag">BTC <b id="btcPrice">--</b></span><span id="chainSource" class="source-tag">--</span><span id="expiry" class="expiry-tag">到期 --</span></div></div>
+        <p id="marketNotice" class="market-notice" role="status" hidden></p>
         <div class="chain-toolbar"><span>到期日 <b id="targetDate">--</b></span><span>每 <b id="refreshRate">10</b> 秒更新</span><span id="legSummary" class="leg-summary">BUY 2 · SELL 2</span><button id="toggleDepth" class="table-toggle" type="button" aria-pressed="false">完整盘口 ↗</button><span class="legend"><i class="legend-buy"></i>Bid 买价<i class="legend-sell"></i>Ask 卖价</span></div>
         <div class="chain-wrap" tabindex="0" role="region" aria-label="双侧期权盘口，可横向滚动">
           <table class="chain-table" aria-label="BTC 期权链">

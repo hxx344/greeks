@@ -8,15 +8,21 @@ import httpx
 from app.config import Settings
 from app.engine import TradingEngine
 from app.main import app
-from app.strategy import demo_chain
+from app.models import OpenRequest, RfqCreateRequest
+from app.strategy import SundayExpiryUnavailable, demo_chain
+from pydantic import SecretStr
 
 
 class MarketAvailabilityTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.now = datetime(2026, 9, 7, 23, 45, tzinfo=timezone.utc)
+        for module in ("app.main", "app.engine"):
+            clock = patch(f"{module}.datetime", wraps=datetime)
+            clock.start().now.return_value = self.now
+            self.addCleanup(clock.stop)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.engine = TradingEngine(Settings(_env_file=None, state_file=f"{directory.name}/state.json"))
-        self.now = datetime.now(timezone.utc)
         self.sunday_chain = demo_chain(self.now)
         self.engine.chain = [item.model_copy(update={"expiry": item.expiry + timedelta(days=1)}) for item in self.sunday_chain]
         self.engine.chain_source = "bybit"
@@ -49,6 +55,35 @@ class MarketAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         data = (await self.request()).json()
         self.assertEqual(data["status"], "ready")
         self.assertEqual(len(data["preview"]["legs"]), 4)
+
+    async def test_two_calendar_days_ahead_quotes_are_read_only_and_sunday_recovers(self):
+        expiry = (self.now + timedelta(days=2)).replace(hour=8, minute=0)
+        observation = [item.model_copy(update={"expiry": expiry, "symbol": f"observe-{i}"}) for i, item in enumerate(self.sunday_chain)]
+        self.engine.chain.extend(observation)
+        data = (await self.request()).json()
+        self.assertTrue(data["read_only"])
+        self.assertIsNone(data["preview"])
+        self.assertIsNone(self.engine.preview)
+        self.assertEqual(data["chain"]["expiry"], expiry.isoformat())
+        self.assertEqual(len(data["chain"]["items"]), len(observation))
+        self.assertTrue(all(item["symbol"].startswith("observe-") for item in data["chain"]["items"]))
+        self.assertIn("仅供查看", data["message"])
+        self.assertEqual((await self.request("/api/strategy/preview?quantity=0.01")).status_code, 422)
+        with self.assertRaises(SundayExpiryUnavailable):
+            await self.engine.open_position(OpenRequest(quantity=.01))
+        self.assertEqual(self.engine.positions, [])
+        self.engine.settings.bybit_api_key = SecretStr("test-key")
+        self.engine.settings.bybit_api_secret = SecretStr("test-secret")
+        self.engine.client.rfq_config = AsyncMock(return_value={"counterparties": ["TEST"]})
+        self.engine.client.create_rfq = AsyncMock()
+        with self.assertRaises(SundayExpiryUnavailable):
+            await self.engine.create_rfq(RfqCreateRequest(quantity=.01))
+        self.engine.client.create_rfq.assert_not_awaited()
+        self.engine.chain.extend(self.sunday_chain)
+        ready = (await self.request()).json()
+        self.assertEqual(ready["status"], "ready")
+        self.assertFalse(ready.get("read_only", False))
+        self.assertTrue(all(not item["symbol"].startswith("observe-") for item in ready["chain"]["items"]))
 
     async def test_stale_missing_or_unavailable_market_is_not_listing_wait(self):
         for source, updated in (("bybit", self.now - timedelta(minutes=5)), ("bybit", None), ("unavailable", self.now)):
