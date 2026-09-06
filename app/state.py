@@ -2,7 +2,7 @@ from typing import Literal
 from math import isfinite
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from .models import ExecutionRecord
+from .models import ExecutionRecord, PerformanceSample
 
 
 class JournalEntry(BaseModel):
@@ -38,6 +38,7 @@ class EngineState(BaseModel):
     performance_executions: dict[str, ExecutionRecord] = Field(default_factory=dict)
     performance_start_ms: int | None = None
     performance_cursor_ms: int | None = None
+    performance_samples: dict[str, list[PerformanceSample]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def check_sizes(self):

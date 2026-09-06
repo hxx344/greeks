@@ -125,7 +125,7 @@ test('position chart preserves payoff but removes stale spot, and clears closed 
 test('performance view keeps currencies separate and explains pending and open groups', () => {
   const {context, element} = dashboard();
   const payload = {network:'testnet',credentials_available:true,groups:[
-    {id:'closed-a',currency:'USDT',status:'closed',opened_at:'2026-09-01T00:00:00Z',closed_at:'2026-09-02T00:00:00Z',leg_count:4,net_pnl:12,open_fee:1,close_fee:1,delivery_fee:0,issues:[],fills:[]},
+    {id:'closed-a',currency:'USDT',status:'closed',eligible:true,closure_kind:'expiry',opened_at:'2026-09-01T00:00:00Z',closed_at:'2026-09-02T00:00:00Z',leg_count:4,net_pnl:12,open_fee:1,close_fee:1,delivery_fee:0,issues:[],fills:[]},
     {id:'pending-b',currency:'USDT',status:'pending',opened_at:null,leg_count:4,net_pnl:null,issues:['成交记录待补齐'],fills:[]},
     {id:'open-c',currency:'USDC',status:'open',opened_at:null,leg_count:4,net_pnl:0,floating_pnl:20,issues:[],fills:[]}],
     series:[{currency:'USDT',total_pnl:12,closed_count:1,wins:1,max_drawdown:0,points:[{group_id:'closed-a',time:'2026-09-02T00:00:00Z',pnl:12,cumulative:12}]}]};
@@ -134,7 +134,7 @@ test('performance view keeps currencies separate and explains pending and open g
   assert.equal(element('performanceTotal').textContent, '$12');
   assert.match(element('performanceGroups').innerHTML, /pending-b/);
   assert.doesNotMatch(element('performanceGroups').innerHTML, /open-c/);
-  assert.match(element('performanceGroups').innerHTML, /尚未计入累计收益曲线/);
+  assert.match(element('performanceGroups').innerHTML, /不纳入综合统计/);
   assert.doesNotMatch(element('performanceChart').innerHTML, /NaN|Infinity/);
   element('performanceCurrency').value = 'USDC';
   context.renderPerformance(payload);
@@ -142,6 +142,22 @@ test('performance view keeps currencies separate and explains pending and open g
   assert.match(element('performanceGroups').innerHTML, /open-c/);
   assert.doesNotMatch(element('performanceGroups').innerHTML, /closed-a/);
   assert.match(element('performanceChart').innerHTML, /暂无已核实/);
+});
+
+test('sampled charts use real time, bounded smooth paths, and break at missing samples', () => {
+  const {context} = dashboard();
+  const chart = context.performanceChart({currency:'USDT',sample_seconds:60,points:[
+    {time:'2026-09-01T00:00:00Z',cumulative:1,pnl:1},
+    {time:'2026-09-01T00:01:00Z',cumulative:4,pnl:4},
+    {time:'2026-09-01T00:02:00Z',cumulative:2,pnl:2},
+    {time:'2026-09-01T02:00:00Z',cumulative:8,pnl:8,terminal:true}]},310);
+  assert.match(chart, / C/);
+  assert.doesNotMatch(chart, / H| V|NaN|Infinity/);
+  assert.match(chart, /1 段采样缺口/);
+  assert.match(chart, /3 个真实采样点/);
+  const old = context.performanceChart({currency:'USDT',points:[{time:'2026-09-01T02:00:00Z',cumulative:8,pnl:8,terminal:true}]});
+  assert.match(old, /历史无持仓采样/);
+  assert.doesNotMatch(old, / C/);
 });
 
 test('testnet mode requires confirmation and reports exchange fills as testnet', async () => {

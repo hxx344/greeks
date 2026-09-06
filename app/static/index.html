@@ -84,11 +84,11 @@
     <section class="panel performance-panel" id="performance" aria-labelledby="performanceTitle">
       <div class="panel-head"><div><div class="kicker">PERFORMANCE / LIVE STRATEGY</div><h2 id="performanceTitle">策略实盘收益<span class="heading-detail">按每次组合开仓累计</span></h2></div><span id="performanceMode" class="source-tag">等待同步</span></div>
       <div class="performance-toolbar"><p id="performanceStatus">正在同步收益台账…</p><select id="performanceCurrency" aria-label="收益结算币种"><option value="USDT">USDT</option></select><button id="reloadPerformance" class="link-button">刷新收益 ↗</button></div>
-      <div class="performance-summary"><div><span>已结束组合累计净收益</span><strong id="performanceTotal">--</strong></div><div><span>已结束组合</span><strong id="performanceClosed">0</strong></div><div><span>已结束组合胜率</span><strong id="performanceWinRate">--</strong></div><div><span>累计收益最大回撤</span><strong id="performanceDrawdown">--</strong></div></div>
+      <div class="performance-summary"><div><span>到期组合综合净收益</span><strong id="performanceTotal">--</strong></div><div><span>纳入统计的到期组合</span><strong id="performanceClosed">0</strong></div><div><span>到期组合胜率</span><strong id="performanceWinRate">--</strong></div><div><span>到期组合采样最大回撤</span><strong id="performanceDrawdown">--</strong></div></div>
       <div id="performanceChart" class="pp-chart"><div class="empty">等待实盘收益记录</div></div>
       <div class="performance-list-head"><h3>每次开仓收益详情</h3><span id="performanceCoverage">等待同步</span></div>
       <div id="performanceGroups"><div class="empty">等待组合记录</div></div>
-      <p class="pp-note">曲线按每组完全平仓或交割时累计已核实净收益，包含开仓、平仓及交割手续费；未结束和待核对组合不计入曲线。按结算币种分别统计，不含账户充值、提现和无关交易。台账持续保存，历史覆盖范围以同步起点为准。<a href="https://bybit-exchange.github.io/docs/v5/position/close-position" target="_blank" rel="noopener noreferrer">交易所收益记录 ↗</a></p>
+      <p class="pp-note">综合统计仅纳入已核实持有至到期的组合，提前平仓或部分减仓的整组均不纳入。持仓期间定时保存真实盈亏采样；到期后将采样路径与最终净收益纳入综合曲线，包含已知交易费用和最终交割手续费。历史未采样时段不补造数据，断网缺口断开显示。按结算币种分别统计，不含账户充值、提现和无关交易。台账持续保存，历史覆盖范围以同步起点为准。<a href="https://bybit-exchange.github.io/docs/v5/position/close-position" target="_blank" rel="noopener noreferrer">交易所收益记录 ↗</a></p>
     </section>
     <section class="panel rfq-panel" id="rfq" aria-labelledby="rfqTitle">
       <div class="panel-head"><div><div class="kicker">04 / BLOCK TRADING</div><h2 id="rfqTitle">组合询价<span class="heading-detail">RFQ</span></h2></div><span id="rfqStatus" class="source-tag">未创建</span></div>

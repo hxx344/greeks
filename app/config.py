@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     live_trading: bool = False
     trading_mode: Literal["dry-run", "testnet", "live"] | None = None
     reconciliation_seconds: float = Field(default=15.0, ge=1, le=300)
+    performance_sample_seconds: int = Field(default=60, ge=15, le=3600)
     live_confirmation: str = ""
     max_risk_usd: float = Field(default=2500.0, gt=0)
     leg_qty: float = Field(default=1.0, gt=0)

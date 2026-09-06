@@ -151,6 +151,7 @@ performance_cache = SnapshotCache(15)
 async def dashboard_performance():
     async def build():
         await engine.sync_performance()
+        await engine.sample_performance()
         account = await account_cache.get(_build_account_dashboard)
         return engine.performance_report(positions_available=account["positions"].get("available", False) and not engine.lock.locked(),
                                          positions=[Position.model_validate(item) for item in account["positions"]["items"]])

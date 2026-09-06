@@ -418,3 +418,8 @@ svg { display: block; }
   .performance-detail { padding: 16px 12px; }.performance-metrics { grid-template-columns: 1fr 1fr; gap: 16px 10px; }.performance-metrics strong { font-size: 16px; }
   .performance-fills > div { grid-template-columns: 1fr; }
 }
+
+.performance-sample-note { font-size: 10px; color: var(--quiet); padding: 0 14px 12px; margin: 0; }
+.performance-sample-title { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin: 22px 0 12px; font-size: 12px; }
+.performance-sample-title span { font-size: 10px; font-weight: 400; color: var(--quiet); }
+.performance-detail .performance-fills { margin-top: 20px; }

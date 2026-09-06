@@ -4,10 +4,12 @@ Closed position totalPnl is already net of fees:
 https://bybit-exchange.github.io/docs/v5/position/close-position
 """
 import asyncio
+import re
+from itertools import groupby
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
-from .models import ExecutionRecord
+from .models import ExecutionRecord, PerformanceSample
 
 
 ZERO = Decimal(0)
@@ -36,7 +38,18 @@ def settlement_currency(symbol):
     return "USDT" if symbol.endswith("-USDT") else "USDC"
 
 
-def build_performance(groups, executions, links, journal, positions=(), positions_available=False):
+def option_expiry(symbol):
+    match = re.fullmatch(r"BTC-(\d{1,2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})-\d+(?:\.\d+)?-[CP](?:-USDT|-USDC)?", symbol.upper())
+    if not match:
+        return None
+    months = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+    try:
+        return datetime(2000 + int(match[3]), months.index(match[2]) + 1, int(match[1]), 8, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def build_performance(groups, executions, links, journal, positions=(), positions_available=False, samples=None, sample_seconds=60):
     """Only uniquely attributable, completely reconciled round trips enter the curve."""
     buckets = {}
     for key, group in groups.items():
@@ -141,6 +154,13 @@ def build_performance(groups, executions, links, journal, positions=(), position
                 bucket["issues"].append("开仓成交历史尚未补齐")
         closed = bool(lots) and all(lot["remaining"] <= EPS for lot in lots)
         source, delivery_fee = "executions", ZERO
+        early_close = any(option_expiry(item.symbol) and item.exec_time < option_expiry(item.symbol) for item in bucket["closes"])
+        # Even an unmatched partial fill is evidence of an early reduction.
+        early_close = early_close or any(
+            (item.opening_group or groups.get(links.get(item.order_link_id) or item.execution_group, {}).get("opening_group")) == key
+            and option_expiry(item.symbol) and item.exec_time < option_expiry(item.symbol)
+            for item in ordered)
+        verified_expiry = False
         # Exchange closure evidence replaces, never adds to, fill-based P&L.
         evidence = meta.get("closure_evidence", {})
         targets = expected or actual or {(symbol, leg["side"]): number(leg["qty"]) for symbol, leg in meta.get("legs", {}).items() if "qty" in leg and "side" in leg}
@@ -148,6 +168,7 @@ def build_performance(groups, executions, links, journal, positions=(), position
             try:
                 net, opening_fee, closing_fee, delivery, premium = ZERO, ZERO, ZERO, ZERO, ZERO
                 opened_times, closed_times, currencies, seen = [], [], set(), set()
+                expiry_verified, evidence_early = True, False
                 for (symbol, side), qty in targets.items():
                     if qty <= EPS:
                         continue
@@ -164,6 +185,9 @@ def build_performance(groups, executions, links, journal, positions=(), position
                         closed_at = datetime.fromtimestamp(int(row["closeTime"]) / 1000, timezone.utc)
                         if closed_at < opened_at or (meta.get("created_at") and opened_at < stamp(meta["created_at"])):
                             raise ValueError("Invalid closure times")
+                        expiry = option_expiry(symbol)
+                        evidence_early = evidence_early or bool(expiry and closed_at < expiry) or number(row["totalCloseFee"]) != 0
+                        expiry_verified = expiry_verified and expiry is not None and closed_at >= expiry
                         total += number(row["qty"])
                         net += number(row["totalPnl"])
                         opening_fee += number(row["totalOpenFee"])
@@ -180,6 +204,8 @@ def build_performance(groups, executions, links, journal, positions=(), position
                 bucket.update(realized=net, open_fee=opening_fee, close_fee=closing_fee, premium=premium,
                               opened=min(opened_times), closed=max(closed_times), currencies=currencies, issues=[])
                 closed, source, delivery_fee = True, "exchange_closed_positions", delivery
+                early_close = early_close or evidence_early
+                verified_expiry = expiry_verified and not early_close
             except (ValueError, KeyError, TypeError, InvalidOperation, OverflowError):
                 if not closed:
                     bucket["issues"].append("交割或平仓收益待核对")
@@ -211,6 +237,13 @@ def build_performance(groups, executions, links, journal, positions=(), position
             else:
                 floating = amount(total_float)
         currency = next(iter(bucket["currencies"])) if len(bucket["currencies"]) == 1 else "待确认"
+        expiries = {option_expiry(symbol) for symbol, _ in (actual or targets)}
+        expiry = next(iter(expiries)) if len(expiries) == 1 else None
+        eligible = closed and not issues and verified_expiry and expiry is not None
+        closure_kind = "early" if early_close else "expiry" if eligible else "unknown" if closed else "holding"
+        exclusion = "" if eligible else "有提前平仓（含部分减仓），整组不纳入综合统计" if early_close else "到期结算证据待核实" if closed else "持仓尚未到期结束"
+        remaining_fees = sum((lot["fee"] * lot["remaining"] / lot["qty"] for lot in lots), ZERO)
+        sampled_pnl = amount(bucket["realized"] + number(floating) - remaining_fees) if floating is not None and not issues else None
         rows.append(dict(id=key, opened_at=(bucket["opened"].isoformat() if bucket["opened"] else meta.get("created_at")),
                          closed_at=bucket["closed"].isoformat() if closed and bucket["closed"] else None,
                          currency=currency, status="pending" if issues else "closed" if closed else "open", issues=issues,
@@ -218,25 +251,78 @@ def build_performance(groups, executions, links, journal, positions=(), position
                          open_fee=amount(bucket["open_fee"]) if lots or source != "executions" else None,
                          close_fee=amount(bucket["close_fee"]) if lots or source != "executions" else None, delivery_fee=amount(delivery_fee),
                          net_pnl=None if issues else amount(bucket["realized"]), floating_pnl=floating,
+                         mark_to_market_pnl=sampled_pnl, expiry=expiry.isoformat() if expiry else None, eligible=eligible,
+                         closure_kind=closure_kind, exclusion_reason=exclusion,
                          remaining_qty=amount(sum((lot["remaining"] for lot in lots), ZERO)) if not closed else 0,
                          source=source, fills=[item.model_dump(mode="json") for item in [*(lot["execution"] for lot in lots), *bucket["closes"]]]))
     rows.sort(key=lambda row: (row["opened_at"] or "", row["id"]), reverse=True)
+    for row in rows:
+        history = sorted((sample.model_dump(mode="json") if isinstance(sample, PerformanceSample) else dict(sample)
+                          for sample in (samples or {}).get(row["id"], [])), key=lambda sample: sample["time"])
+        if row["status"] == "closed" and row["closed_at"]:
+            history = [sample for sample in history if not sample.get("terminal") and stamp(sample["time"]) < stamp(row["closed_at"])]
+            history.append(dict(time=row["closed_at"], pnl=row["net_pnl"], terminal=True))
+        row["samples"] = history
+        row["sample_count"] = sum(not point.get("terminal") for point in history)
     series = []
-    for currency in sorted({row["currency"] for row in rows if row["status"] == "closed"}):
-        completed = sorted((row for row in rows if row["status"] == "closed" and row["currency"] == currency), key=lambda row: (row["closed_at"], row["id"]))
+    for currency in sorted({row["currency"] for row in rows if row["eligible"]}):
+        completed = sorted((row for row in rows if row["eligible"] and row["currency"] == currency), key=lambda row: (row["closed_at"], row["id"]))
         total, peak, drawdown = ZERO, ZERO, ZERO
-        points = []
-        for row in completed:
-            total += number(row["net_pnl"])
+        timeline = sorted((dict(point, group_id=row["id"]) for row in completed for point in row["samples"]), key=lambda point: (stamp(point["time"]), point["group_id"]))
+        points, latest = [], {}
+        for _, simultaneous in groupby(timeline, key=lambda point: stamp(point["time"])):
+            for point in simultaneous:
+                total += number(point["pnl"]) - latest.get(point["group_id"], ZERO)
+                latest[point["group_id"]] = number(point["pnl"])
             peak = max(peak, total)
             drawdown = max(drawdown, peak - total)
-            points.append(dict(time=row["closed_at"], group_id=row["id"], pnl=row["net_pnl"], cumulative=amount(total)))
+            points.append(dict(point, cumulative=amount(total)))
         series.append(dict(currency=currency, points=points, total_pnl=amount(total), closed_count=len(completed),
-                           wins=sum(row["net_pnl"] > 0 for row in completed), max_drawdown=amount(drawdown)))
+                           wins=sum(row["net_pnl"] > 0 for row in completed), max_drawdown=amount(drawdown),
+                           sample_seconds=sample_seconds,
+                           sampled_count=sum(row["sample_count"] for row in completed), unsampled_count=sum(row["sample_count"] == 0 for row in completed)))
     return dict(groups=rows, series=series, unassigned_closes=unassigned)
 
 
 class PerformanceMixin:
+    async def sample_performance(self):
+        now = datetime.now(timezone.utc)
+        if self.state_error or self.lock.locked() or (self.performance_sampled_at and
+                (now - self.performance_sampled_at).total_seconds() < self.settings.performance_sample_seconds):
+            return
+        async with self.lock:
+            try:
+                positions, available = [], False
+                if self.settings.bybit_api_key and self.settings.bybit_api_secret:
+                    positions = self._parse_positions(await self.client.positions())
+                    await self.load_recent_executions()
+                    available = True
+                sampled_at = datetime.now(timezone.utc)
+                report = build_performance(self.execution_groups, self.performance_executions.values(), self.execution_group_links,
+                                           self.order_journal, positions, available)
+                changed = False
+                for row in report["groups"]:
+                    history = self.performance_samples.get(row["id"], [])
+                    if row["status"] == "closed" and row["closed_at"]:
+                        point = PerformanceSample(time=stamp(row["closed_at"]), pnl=row["net_pnl"], terminal=True)
+                        updated = [sample for sample in history if not sample.terminal and sample.time < point.time] + [point]
+                    elif row["status"] == "open" and row["mark_to_market_pnl"] is not None and row["expiry"] and sampled_at < stamp(row["expiry"]):
+                        if history and (sampled_at - history[-1].time).total_seconds() < self.settings.performance_sample_seconds:
+                            continue
+                        updated = history + [PerformanceSample(time=sampled_at, pnl=row["mark_to_market_pnl"])]
+                    else:
+                        continue
+                    if updated != history:
+                        self.performance_samples[row["id"]] = updated
+                        changed = True
+                if changed:
+                    self._save_state()
+                self.performance_sampled_at = sampled_at
+                self.performance_sample_error = None
+            except Exception as exc:
+                self.performance_sample_error = "持仓盈亏采样失败，保留已有采样；缺失时段不补造数据"
+                self.log("WARNING", f"Performance sampling failed: {type(exc).__name__}")
+
     def _archive_performance(self, records):
         changed = False
         for record in records:
@@ -291,12 +377,16 @@ class PerformanceMixin:
     async def performance_loop(self):
         while True:
             await self.sync_performance()
-            await asyncio.sleep(30)
+            await self.sample_performance()
+            await asyncio.sleep(min(30, self.settings.performance_sample_seconds))
 
     def performance_report(self, positions_available=False, positions=None):
         report = build_performance(self.execution_groups, self.performance_executions.values(), self.execution_group_links,
-                                   self.order_journal, self.positions if positions is None else positions, positions_available)
+                                   self.order_journal, self.positions if positions is None else positions, positions_available,
+                                   self.performance_samples, self.settings.performance_sample_seconds)
         return {**report, "network": "testnet" if self.settings.private_testnet else "mainnet", "updated_at": self.performance_updated_at,
                 "history_start_ms": self.performance_start_ms, "history_cursor_ms": self.performance_cursor_ms,
                 "syncing": self.performance_cursor_ms is not None and self.performance_cursor_ms < int(datetime.now(timezone.utc).timestamp() * 1000) - 120000,
-                "error": self.state_error or self.performance_error, "credentials_available": bool(self.settings.bybit_api_key and self.settings.bybit_api_secret)}
+                "error": self.state_error or self.performance_error or self.performance_sample_error,
+                "sample_seconds": self.settings.performance_sample_seconds,
+                "credentials_available": bool(self.settings.bybit_api_key and self.settings.bybit_api_secret)}

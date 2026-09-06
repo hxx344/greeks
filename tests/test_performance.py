@@ -1,11 +1,11 @@
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from app.config import Settings
 from app.engine import TradingEngine
-from app.models import ExecutionRecord, Position
+from app.models import ExecutionRecord, PerformanceSample, Position
 from app.performance import build_performance
 
 
@@ -20,6 +20,47 @@ def fill(identity, side, qty, price, fee, day, group="a", opening=None, symbol=S
 
 
 class PerformanceTests(unittest.TestCase):
+    def expiry_group(self, total=97, early_fee=0, close_time=None):
+        row = {"symbol":SYMBOL,"side":"Sell","qty":"1","openTime":int(NOW.timestamp()*1000),
+            "closeTime":int((close_time or NOW+timedelta(days=5,hours=8)).timestamp()*1000),"avgEntryPrice":"100",
+            "totalPnl":str(total),"totalOpenFee":"1","totalCloseFee":str(early_fee),"deliveryFee":"2"}
+        return {"type":"open","created_at":NOW.isoformat(),"status":"closed", "legs":{SYMBOL:{"side":"Sell","qty":1}},
+                "closure_evidence":{f"{SYMBOL}|Sell":[row]}}
+
+    def test_only_expiry_combinations_contribute_sampled_returns(self):
+        groups = {"held":self.expiry_group(), "early":self.expiry_group(999,close_time=NOW+timedelta(days=2)),
+                  "partial":self.expiry_group(333,early_fee=1)}
+        # Distinct position history identities avoid ambiguous evidence reuse.
+        partial_evidence = groups["partial"]["closure_evidence"][f"{SYMBOL}|Sell"][0]
+        partial_evidence["openTime"] += 1000
+        samples = {"held":[PerformanceSample(time=NOW+timedelta(hours=1),pnl=-1),PerformanceSample(time=NOW+timedelta(hours=2),pnl=120),
+                           PerformanceSample(time=NOW+timedelta(hours=3),pnl=40)],
+                   "early":[PerformanceSample(time=NOW+timedelta(hours=2),pnl=999)]}
+        report = build_performance(groups, [], {}, {}, samples=samples)
+        self.assertEqual(len(report["series"]), 1)
+        series = report["series"][0]
+        self.assertEqual(series["closed_count"], 1)
+        self.assertEqual(series["total_pnl"], 97)
+        self.assertEqual([point["cumulative"] for point in series["points"]], [-1,120,40,97])
+        self.assertEqual(series["max_drawdown"], 80)
+        self.assertEqual(series["sampled_count"], 3)
+        self.assertEqual({row["id"] for row in report["groups"] if row["eligible"]}, {"held"})
+
+    def test_zero_fee_partial_early_close_excludes_whole_group_after_expiry(self):
+        groups = {"a":self.expiry_group()}
+        records = [fill("open","Sell",1,100,1,0),fill("partial","Buy",.2,50,0,1,"c","a")]
+        report = build_performance(groups, records, {}, {})
+        self.assertEqual(report["groups"][0]["status"], "closed")
+        self.assertEqual(report["groups"][0]["closure_kind"], "early")
+        self.assertFalse(report["groups"][0]["eligible"])
+        self.assertEqual(report["series"], [])
+
+    def test_late_manual_close_without_settlement_evidence_does_not_count_as_expiry(self):
+        records = [fill("open","Sell",1,100,1,0),fill("late","Buy",1,50,1,6,"c","a")]
+        row = build_performance({}, records, {}, {})["groups"][0]
+        self.assertEqual(row["closure_kind"], "unknown")
+        self.assertFalse(row["eligible"])
+
     def test_nonfinite_exchange_values_are_rejected_before_archival(self):
         with self.assertRaises(ValueError):
             fill("invalid", "Buy", 1, float("nan"), 1, 0)
@@ -35,7 +76,8 @@ class PerformanceTests(unittest.TestCase):
         records.append(fill("close2", "Buy", 1.5, 120, .3, 2, "close", "a"))
         report = build_performance({}, records, {}, {})
         self.assertEqual(report["groups"][0]["net_pnl"], -22.2)
-        self.assertEqual(report["series"][0]["max_drawdown"], 22.2)
+        self.assertEqual(report["series"], [])
+        self.assertEqual(report["groups"][0]["closure_kind"], "early")
 
     def test_groups_and_currencies_never_mix_and_curve_uses_closing_time(self):
         records = [fill("a-open", "Buy", 1, 100, 1, 0), fill("b-open", "Buy", 1, 100, 1, 1, "b"),
@@ -43,10 +85,9 @@ class PerformanceTests(unittest.TestCase):
             fill("c-open", "Buy", 1, 100, 1, 0, "c", symbol=SYMBOL[:-5]),
             fill("c-close", "Sell", 1, 130, 1, 4, "cc", "c", symbol=SYMBOL[:-5])]
         report = build_performance({}, records, {}, {})
-        usdt = next(series for series in report["series"] if series["currency"] == "USDT")
-        self.assertEqual([p["cumulative"] for p in usdt["points"]], [18, 6])
-        self.assertEqual(usdt["max_drawdown"], 12)
-        self.assertEqual(len(report["series"]), 2)
+        self.assertEqual(report["series"], [])
+        self.assertEqual({row["currency"] for row in report["groups"]}, {"USDT", "USDC"})
+        self.assertTrue(all(row["closure_kind"] == "early" for row in report["groups"]))
 
     def test_missing_history_and_ambiguous_manual_close_are_not_profit(self):
         records = [fill("open", "Buy", 1, 100, 1, 0), fill("close", "Sell", 1, 120, 1, 1, "c", "a")]
@@ -64,11 +105,11 @@ class PerformanceTests(unittest.TestCase):
 
     def test_verified_delivery_is_net_of_fees_and_not_double_counted(self):
         evidence = {"symbol":SYMBOL,"side":"Sell","qty":"1","openTime":int(NOW.timestamp()*1000),
-            "closeTime":int((NOW+timedelta(days=5)).timestamp()*1000),"avgEntryPrice":"100",
+            "closeTime":int((NOW+timedelta(days=5,hours=8)).timestamp()*1000),"avgEntryPrice":"100",
             "totalPnl":"97","totalOpenFee":"1","totalCloseFee":"0","deliveryFee":"2"}
         groups = {"a": {"type":"open","created_at":NOW.isoformat(),"status":"closed",
             "legs":{SYMBOL:{"side":"Sell","qty":1}},"closure_evidence":{f"{SYMBOL}|Sell":[evidence,evidence]}}}
-        report = build_performance(groups, [fill("open","Sell",1,100,1,0),fill("close","Buy",1,0,0,5,"c","a")], {}, {})
+        report = build_performance(groups, [fill("open","Sell",1,100,1,0),fill("close","Buy",1,0,0,5,"c","a").model_copy(update={"exec_time":NOW+timedelta(days=5,hours=8)})], {}, {})
         self.assertEqual(report["groups"][0]["net_pnl"], 97)
         self.assertEqual(report["groups"][0]["delivery_fee"], 2)
         self.assertEqual(report["series"][0]["total_pnl"], 97)
@@ -106,6 +147,32 @@ class PerformancePersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(restored.state_error)
         self.assertEqual(len(restored.performance_executions), 150)
         self.assertEqual(restored.performance_executions["1"].exec_time, NOW)
+
+    async def test_sampling_is_real_fee_adjusted_throttled_and_persistent(self):
+        self.engine._archive_performance([fill("open","Buy",1,100,1,0)])
+        self.engine.load_recent_executions = AsyncMock(return_value=[])
+        self.engine.client.positions = AsyncMock(return_value=[dict(symbol=SYMBOL,side="Buy",size="1",avgPrice="100",markPrice="110",unrealisedPnl="10")])
+        with patch("app.performance.datetime", wraps=datetime) as clock:
+            clock.now.return_value = NOW+timedelta(days=1)
+            await self.engine.sample_performance()
+            await self.engine.sample_performance()
+            self.assertEqual(len(self.engine.performance_samples["a"]), 1)
+            self.assertEqual(self.engine.performance_samples["a"][0].pnl, 9)
+            clock.now.return_value += timedelta(seconds=60)
+            self.engine.client.positions.return_value[0]["markPrice"] = "125"
+            await self.engine.sample_performance()
+        self.assertEqual([p.pnl for p in self.engine.performance_samples["a"]], [9,24])
+        self.assertEqual(self.engine.performance_report()["series"], [])
+        restored = TradingEngine(self.settings)
+        self.assertEqual([p.pnl for p in restored.performance_samples["a"]], [9,24])
+        self.assertIsNone(restored.state_error)
+
+    async def test_failed_position_sampling_does_not_invent_points(self):
+        self.engine._archive_performance([fill("open","Buy",1,100,1,0)])
+        self.engine.client.positions = AsyncMock(side_effect=RuntimeError("offline"))
+        await self.engine.sample_performance()
+        self.assertEqual(self.engine.performance_samples, {})
+        self.assertIsNotNone(self.engine.performance_sample_error)
 
     async def test_history_cursor_only_advances_after_complete_success(self):
         now = datetime.now(timezone.utc)

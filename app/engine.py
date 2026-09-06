@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from .bybit import BybitClient
 from .config import Settings
-from .models import AccountHealth, CloseRequest, ExecutionRecord, LogEntry, OpenRequest, OrderResult, Position, StrategyPreview
+from .models import AccountHealth, CloseRequest, ExecutionRecord, LogEntry, OpenRequest, OrderResult, PerformanceSample, Position, StrategyPreview
 from .strategy import build_iron_condor
 from .orders import OrderExecutor
 from .state import EngineState
@@ -49,6 +49,9 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
         self.performance_error = None
         self.performance_updated_at = None
         self.performance_lock = asyncio.Lock()
+        self.performance_samples: dict[str, list[PerformanceSample]] = {}
+        self.performance_sampled_at = None
+        self.performance_sample_error = None
         self.reconciliation_last_success = None
         self.reconciliation_error = None
         self.reconciliation_started_at = datetime.now(timezone.utc)
@@ -84,6 +87,7 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
             self.performance_executions = {key: ExecutionRecord.model_validate(value) for key, value in state["performance_executions"].items()}
             self.performance_start_ms = state["performance_start_ms"]
             self.performance_cursor_ms = state["performance_cursor_ms"]
+            self.performance_samples = {key: [PerformanceSample.model_validate(sample) for sample in values] for key, values in state["performance_samples"].items()}
             self.state_error = None
         except FileNotFoundError:
             return
@@ -104,7 +108,7 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
                                 active_strategy_sizes=self.active_strategy_sizes, active_strategy_group_id=self.active_strategy_group_id,
                                 rfq_state=self.rfq_state, execution_groups=self.execution_groups, execution_group_links=self.execution_group_links,
                                 pm_baseline=self.pm_baseline, order_journal=self.order_journal, performance_executions=self.performance_executions,
-                                performance_start_ms=self.performance_start_ms, performance_cursor_ms=self.performance_cursor_ms)
+                                performance_start_ms=self.performance_start_ms, performance_cursor_ms=self.performance_cursor_ms, performance_samples=self.performance_samples)
             payload = json.dumps(state.model_dump(mode="json"), allow_nan=False)
             target.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, prefix=target.name + ".", suffix=".tmp", delete=False) as stream:

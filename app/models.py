@@ -136,6 +136,13 @@ class Position(BaseModel):
     source: str = "demo"
 
 
+class PerformanceSample(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+    time: datetime
+    pnl: float
+    terminal: bool = False
+
+
 class LogEntry(BaseModel):
     timestamp: datetime
     level: Literal["INFO", "WARNING", "ERROR"]
