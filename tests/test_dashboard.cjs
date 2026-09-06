@@ -81,6 +81,69 @@ function execution(id, second, side, qty, price, fee, close = false, extra = {})
     fee_currency: 'USDT', reduce_only: close, order_link_id: `ic-${close ? 'close-' : ''}${id}-0`, ...extra};
 }
 
+function marketPayload(waiting) {
+  return {
+    status: waiting ? 'waiting_for_listing' : 'ready',
+    message: '周日到期合约尚未上线，系统将自动检查；上线后生成四腿策略。',
+    config: {live_enabled: true, market_refresh_seconds: 10, quote_stale_seconds: 30, max_risk_usd: 2500, open_time: 'Friday 21:00 UTC'},
+    chain: {source: 'bybit', btc_price: 100000, items: []},
+    preview: waiting ? null : {expiry: '2026-09-13T08:00:00Z', market_timestamp: new Date().toISOString(), legs: [], btc_price: 100000, net_credit_usd: 42},
+  };
+}
+
+test('listing wait clears stale strategy and permits closing, then recovers automatically', async () => {
+  const {context, element, pending} = dashboard();
+  const deliver = async (payload) => {
+    pending.at(-1).resolve({ok: true, text: async () => JSON.stringify(payload)});
+    await new Promise(setImmediate);
+  };
+  element('confirm').checked = true;
+  await deliver(marketPayload(false));
+  assert.equal(element('statusValue').textContent, '策略就绪');
+  assert.equal(element('creditValue').textContent, '$42');
+  const waiting = context.loadMarket();
+  await deliver(marketPayload(true));
+  await waiting;
+  assert.equal(element('statusValue').textContent, '等待合约上线');
+  assert.doesNotMatch(element('updateText').textContent, /异常|重试/);
+  assert.match(element('btcPrice').textContent, /100,000/);
+  assert.equal(element('creditValue').textContent, '--');
+  assert.equal(context.window.__latestPreview, null);
+  assert.match(element('legs').textContent, /等待/);
+  assert.equal(element('payoffStats').textContent, '等待可用策略');
+  assert.equal(element('openTrade').disabled, true);
+  assert.equal(element('rfqCreate').disabled, true);
+  assert.equal(element('closeTrade').disabled, false);
+  const ready = context.loadMarket();
+  await deliver(marketPayload(false));
+  await ready;
+  assert.equal(element('statusValue').textContent, '策略就绪');
+  assert.equal(element('openTrade').disabled, false);
+  assert.equal(element('rfqCreate').disabled, false);
+});
+
+test('actual market errors remain distinct from listing wait', async () => {
+  const {element, pending} = dashboard();
+  pending[0].resolve({ok: false, text: async () => JSON.stringify({detail: '行情已过期'})});
+  await new Promise(setImmediate);
+  assert.equal(element('statusValue').textContent, '行情异常');
+  assert.equal(element('statusSub').textContent, '行情已过期');
+  assert.equal(element('updateText').textContent, '等待重试');
+  assert.equal(element('openTrade').disabled, true);
+});
+
+test('listing wait keeps state failure visible and closing blocked', async () => {
+  const {element, pending} = dashboard();
+  const payload = marketPayload(true);
+  payload.config.trading_blocked_reason = 'State file unreadable';
+  element('confirm').checked = true;
+  pending[0].resolve({ok: true, text: async () => JSON.stringify(payload)});
+  await new Promise(setImmediate);
+  assert.equal(element('statusValue').textContent, '交易已阻止');
+  assert.equal(element('statusSub').textContent, 'State file unreadable');
+  assert.equal(element('closeTrade').disabled, true);
+});
+
 test('FIFO consumes partial fills and apportions fees exactly once', () => {
   const {context, element} = dashboard();
   const open1 = execution('o1', 1, 'Buy', 2, 100, 2);

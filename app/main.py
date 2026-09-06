@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -15,6 +16,7 @@ from .engine import TradingEngine
 from .cache import SnapshotCache
 from .lease import StateLease
 from .security import authorize_dashboard
+from .strategy import SundayExpiryUnavailable
 from .models import CloseRequest, OpenRequest, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest
 
 # The dashboard polls several endpoints frequently; HTTP 200 access lines are
@@ -106,7 +108,19 @@ async def dashboard_market(quantity: float | None = Query(default=None, gt=0, al
     try:
         strategy = await engine.make_preview(quantity)
         expiry_items = [item for item in engine.chain if item.expiry == strategy.expiry]
-        return {"config": config_payload(), "preview": strategy.model_dump(mode="json"), "chain": {"source": engine.chain_source, "btc_price": engine.btc_price, "updated_at": engine.chain_updated_at, "items": [item.model_dump(mode="json") for item in expiry_items]}}
+        return {"status": "ready", "config": config_payload(), "preview": strategy.model_dump(mode="json"), "chain": {"source": engine.chain_source, "btc_price": engine.btc_price, "updated_at": engine.chain_updated_at, "items": [item.model_dump(mode="json") for item in expiry_items]}}
+    except SundayExpiryUnavailable as exc:
+        # Missing quotes for an existing Sunday contract are not a listing wait.
+        now = datetime.now(timezone.utc)
+        has_sunday = any(item.expiry > now and item.expiry.weekday() == 6 for item in engine.chain)
+        age = (now - engine.chain_updated_at).total_seconds() if engine.chain_updated_at else None
+        if engine.chain_source != "bybit" or age is None or not 0 <= age <= settings.quote_stale_seconds:
+            raise HTTPException(status_code=503, detail="行情暂不可用或已过期，无法确认周日到期合约是否上线") from exc
+        if has_sunday or not engine.chain:
+            raise HTTPException(status_code=422, detail="周日到期合约报价暂不足以构建策略") from exc
+        return {"status": "waiting_for_listing", "message": "周日到期合约尚未上线，系统将自动检查；上线后生成四腿策略。",
+                "config": config_payload(), "preview": None,
+                "chain": {"source": engine.chain_source, "btc_price": engine.btc_price, "updated_at": engine.chain_updated_at, "items": []}}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -138,7 +152,7 @@ async def chain():
 
 @app.post("/api/market/refresh")
 async def refresh_market():
-    items = await engine.refresh_chain(force=True)
+    items = await engine.refresh_chain(force=True, refresh_instruments=True)
     return {"source": engine.chain_source, "count": len(items)}
 
 

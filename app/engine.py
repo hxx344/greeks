@@ -151,7 +151,7 @@ class TradingEngine:
         except Exception as exc:
             self.log("WARNING", f"Could not capture pre-trade portfolio margin baseline: {exc}")
 
-    async def refresh_chain(self, force: bool = False) -> list:
+    async def refresh_chain(self, force: bool = False, refresh_instruments: bool = False) -> list:
         now = datetime.now(timezone.utc)
         if not force and self.chain and self.chain_updated_at and (now - self.chain_updated_at).total_seconds() < max(1, self.settings.market_refresh_seconds - 1):
             return self.chain
@@ -160,7 +160,7 @@ class TradingEngine:
             if not force and self.chain and self.chain_updated_at and (now - self.chain_updated_at).total_seconds() < max(1, self.settings.market_refresh_seconds - 1):
                 return self.chain
             try:
-                instruments_stale = not self.raw_instruments or not self.instruments_updated_at or (now - self.instruments_updated_at).total_seconds() >= self.settings.instrument_refresh_seconds
+                instruments_stale = refresh_instruments or not self.raw_instruments or not self.instruments_updated_at or (now - self.instruments_updated_at).total_seconds() >= self.settings.instrument_refresh_seconds
                 if instruments_stale:
                     raw_instruments, raw_tickers, underlying = await asyncio.gather(self.client.instruments(), self.client.tickers(), self.client.underlying_ticker())
                     self.raw_instruments = raw_instruments

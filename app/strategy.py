@@ -4,6 +4,10 @@ from math import isfinite
 from .models import OptionInstrument, StrategyLeg, StrategyPreview
 
 
+class SundayExpiryUnavailable(ValueError):
+    """The strategy's expiry is not currently available in the chain."""
+
+
 def _nearest(options: list[OptionInstrument], target: float) -> OptionInstrument:
     return min(options, key=lambda item: abs(abs(item.delta) - target))
 
@@ -12,7 +16,7 @@ def choose_expiry(options: list[OptionInstrument], now: datetime, target_dte: in
     del target_dte  # Kept for API compatibility; this strategy is calendar-based.
     expiries = sorted({item.expiry for item in options if item.expiry > now and item.expiry.weekday() == 6})
     if not expiries:
-        raise ValueError("No future Sunday BTC option expiry available")
+        raise SundayExpiryUnavailable("No future Sunday BTC option expiry available")
     return expiries[0]
 
 

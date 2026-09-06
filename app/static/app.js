@@ -60,7 +60,8 @@ function payoffAt(price, preview) {
 }
 function renderPayoff(preview) {
   const canvas = $('payoffChart');
-  if (!canvas || !preview?.legs?.length) return;
+  if (!canvas) return;
+  if (!preview?.legs?.length) { canvas.width = canvas.width; $('payoffStats').textContent = '等待可用策略'; return; }
   const rect = canvas.getBoundingClientRect();
   const ratio = window.devicePixelRatio || 1;
   canvas.width = Math.max(1, Math.floor(rect.width * ratio)); canvas.height = Math.max(1, Math.floor(rect.height * ratio));
@@ -201,8 +202,24 @@ function updateTradeControls() {
   const confirmed = $('confirm').checked;
   if (!$('openTrade').dataset.busy) $('openTrade').textContent = live ? '确认并开仓四腿' : '模拟开仓四腿';
   if (!$('closeTrade').dataset.busy) $('closeTrade').textContent = live ? '确认并平仓四腿' : '模拟平仓四腿';
-  if (!$('openTrade').dataset.busy) $('openTrade').disabled = Boolean(window.__tradingBlocked) || (live && !confirmed);
+  if (!$('openTrade').dataset.busy) $('openTrade').disabled = Boolean(window.__tradingBlocked || window.__strategyUnavailable) || (live && !confirmed);
   if (!$('closeTrade').dataset.busy) $('closeTrade').disabled = Boolean(window.__tradingBlocked) || (live && !confirmed);
+  $('rfqCreate').disabled = Boolean(window.__tradingBlocked || window.__strategyUnavailable);
+}
+function clearStrategyDisplay(message) {
+  window.__latestPreview = null;
+  window.__latestChain = [];
+  for (const id of ['creditValue', 'lossValue', 'marginValue', 'maintenanceValue', 'costValue', 'rrValue']) {
+    if ($(id)) $(id).textContent = '--';
+  }
+  $('marginSub').textContent = '等待可用策略';
+  $('feeSub').textContent = '等待可用策略';
+  renderChain([], null);
+  $('chain').innerHTML = `<tr><td colspan="19" class="empty-cell">${esc(message)}</td></tr>`;
+  $('chainCount').textContent = message;
+  $('legs').textContent = message;
+  $('expiry').textContent = '周日到期';
+  renderPayoff(null);
 }
 async function loadMarket() {
   if (window.__marketLoading) { window.__marketReloadPending = true; return; }
@@ -212,14 +229,34 @@ async function loadMarket() {
     const marketUrl = Number.isFinite(requestedQty) && requestedQty > 0 ? `/api/dashboard/market?quantity=${encodeURIComponent(requestedQty)}` : '/api/dashboard/market';
     const payload = await getJson(marketUrl);
     const {config, preview, chain} = payload;
+    window.__liveEnabled = config.live_enabled;
+    window.__tradingBlocked = Boolean(config.trading_blocked_reason);
+    window.__strategyUnavailable = !preview;
+    $('chainSource').textContent = chain.source.toUpperCase();
+    $('refreshRate').textContent = config.market_refresh_seconds;
+    $('nextOpen').textContent = config.open_time;
+    $('riskSub').textContent = `风险上限 ${money(config.max_risk_usd)}`;
+    $('modeTitle').textContent = config.live_enabled ? '实盘模式已启用' : '模拟模式';
+    $('modeText').textContent = config.live_enabled ? '确认后将向 Bybit 发送 BBO 限价订单。' : '不会向交易所发送订单。';
+    updateTradeControls();
+    if (payload.status === 'waiting_for_listing') {
+      clearStrategyDisplay('等待周日到期合约上线');
+      $('btcPrice').textContent = chain.btc_price ? money(chain.btc_price) : '--';
+      $('environment').textContent = config.live_enabled ? 'LIVE' : 'MAINNET DATA / DRY';
+      $('statusValue').textContent = config.trading_blocked_reason ? '交易已阻止' : '等待合约上线';
+      $('statusSub').textContent = config.trading_blocked_reason || payload.message;
+      $('updateText').textContent = '行情已连接 · 自动检查合约';
+      $('updateDot').style.background = '#f2bd62';
+      return;
+    }
     window.__latestPreview = preview;
     window.__latestChain = chain.items || []; $('btcPrice').textContent = preview.btc_price ? money(preview.btc_price) : '--';
     $('environment').textContent = chain.source === 'bybit' ? (config.live_enabled ? 'LIVE' : 'MAINNET DATA / DRY') : 'UNAVAILABLE';
     $('creditValue').textContent = money(preview.net_credit_usd); $('lossValue').textContent = money(preview.max_loss_usd); $('marginValue').textContent = money(preview.estimated_margin_usd); $('marginSub').textContent = preview.margin_mode === 'PORTFOLIO_MARGIN' ? 'PM 压力测试估算' : 'Bybit Order IM'; $('maintenanceValue').textContent = money(preview.estimated_maintenance_margin_usd); $('costValue').textContent = money(preview.estimated_trading_cost_usd); $('feeSub').textContent = `Taker ${(Number(preview.estimated_fee_rate) * 100).toFixed(3)}% · 单腿上限 ${(Number(preview.fee_cap_pct) * 100).toFixed(0)}%`; if ($('rrValue')) $('rrValue').textContent = `${preview.risk_reward}x`; $('riskSub').textContent = `风险上限 ${money(config.max_risk_usd)}`;
     const quoteTime = preview.market_timestamp ? new Date(preview.market_timestamp) : new Date(); const age = Math.max(0, Math.round((Date.now() - quoteTime.getTime()) / 1000));
-    $('statusValue').textContent = age > config.quote_stale_seconds ? '行情过期' : '策略就绪'; $('statusSub').textContent = `${chain.source === 'bybit' ? 'Bybit 主网行情' : '行情不可用'} · ${age}s 前`; $('expiry').textContent = `到期 ${new Date(preview.expiry).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit',timeZone:'UTC'})}`; $('chainSource').textContent = chain.source.toUpperCase();  $('refreshRate').textContent = config.market_refresh_seconds; $('nextOpen').textContent = config.open_time; $('modeTitle').textContent = config.live_enabled ? '实盘模式已启用' : '模拟模式'; $('modeText').textContent = config.live_enabled ? '确认后将向 Bybit 发送 BBO 限价订单。' : '不会向交易所发送订单。'; window.__liveEnabled = config.live_enabled; window.__tradingBlocked = Boolean(config.trading_blocked_reason); updateTradeControls(); renderChain(chain.items, preview); renderLegs(preview.legs); renderPayoff(preview); $('updateText').textContent = `行情 ${age}s · 每 ${config.market_refresh_seconds}s 更新`; $('updateDot').style.background = age > config.quote_stale_seconds ? '#ef8989' : '#d7f36b';
+    $('statusValue').textContent = age > config.quote_stale_seconds ? '行情过期' : '策略就绪'; $('statusSub').textContent = `${chain.source === 'bybit' ? 'Bybit 主网行情' : '行情不可用'} · ${age}s 前`; $('expiry').textContent = `到期 ${new Date(preview.expiry).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit',timeZone:'UTC'})}`; renderChain(chain.items, preview); renderLegs(preview.legs); renderPayoff(preview); $('updateText').textContent = `行情 ${age}s · 每 ${config.market_refresh_seconds}s 更新`; $('updateDot').style.background = age > config.quote_stale_seconds ? '#ef8989' : '#d7f36b';
     if (config.trading_blocked_reason) { $('statusValue').textContent = '交易已阻止'; $('statusSub').textContent = config.trading_blocked_reason; }
-  } catch (error) { $('statusValue').textContent = '行情异常'; $('statusSub').textContent = error.message; $('updateText').textContent = '等待重试'; $('updateDot').style.background = '#ef8989'; }
+  } catch (error) { window.__strategyUnavailable = true; clearStrategyDisplay('策略暂不可用'); updateTradeControls(); $('statusValue').textContent = '行情异常'; $('statusSub').textContent = error.message; $('updateText').textContent = '等待重试'; $('updateDot').style.background = '#ef8989'; }
   finally {
     window.__marketLoading = false;
     if (window.__marketReloadPending) { window.__marketReloadPending = false; void loadMarket(); }
