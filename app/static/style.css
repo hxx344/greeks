@@ -225,7 +225,7 @@ svg { display: block; }
 .execution-row { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 5px 8px; padding: 10px 0; font-size: 9px; border-bottom: 1px solid var(--line-soft); }
 .execution-row strong { width: 100%; font: 9px var(--mono); overflow-wrap: anywhere; }
 .exec-fee { color: var(--negative); }
-.health { margin-top: 22px; }
+.health { margin: 0 0 22px; }
 .health-content { display: grid; grid-template-columns: 1fr 1fr 2fr; gap: 24px; align-items: center; }
 .health-metric { padding: 3px 0 10px; }
 .health-metric>div:first-child { display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 11px; }
@@ -314,7 +314,7 @@ svg { display: block; }
   .execution { display: flex; }.execution .mode-box { padding-bottom: 20px; border-bottom: 1px solid var(--line); }.execution .field { margin-top: 20px; }.execution .confirm { margin: 20px 0 0; }.execution .primary { margin-top: 20px; }.execution .microcopy { margin: 13px 0 20px; }.execution .schedule { margin-top: 0; }
   .bottom-grid { margin-top: 18px; }.legs { grid-template-columns: 1fr; }.leg { padding: 14px 12px; }.leg-title { font-size: 11px; }.leg-symbol { font-size: 9px; }.leg-price small { font-size: 8px; }.payoff-title { font-size: 11px; }.payoff-chart-wrap { height: 235px; }.payoff-stats { grid-template-columns: 1fr 1fr; gap: 16px 12px; }.payoff-stat:nth-child(3) { padding-left: 0; border-left: 0; }.payoff-stat strong { font-size: 16px; }
   .activity-panel { display: block; }.activity-panel .logs { height: 170px; }.activity-panel .subhead.log-title { margin-top: 24px; }.activity-panel .positions { margin-bottom: 0; }
-  .health { margin-top: 18px; }.health-content { grid-template-columns: 1fr; gap: 20px; }.health-values { grid-template-columns: 1fr 1fr; row-gap: 20px; }.health-values>div:nth-child(3) { border-left: 0; padding-left: 0; }.pm-details { grid-template-columns: 1fr; }
+  .health { margin: 0 0 18px; }.health-content { grid-template-columns: 1fr; gap: 20px; }.health-values { grid-template-columns: 1fr 1fr; row-gap: 20px; }.health-values>div:nth-child(3) { border-left: 0; padding-left: 0; }.pm-details { grid-template-columns: 1fr; }
   .rfq-panel { margin-top: 18px; }.rfq-controls { flex-wrap: wrap; }.rfq-controls p { width: 100%; margin-bottom: 10px; font-size: 11px; }.rfq-controls .button { flex: 1; }.rfq-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }.rfq-meta>span { min-width: 0; }.rfq-meta b { display: block; margin: 4px 0 0; font-size: 9px; }.rfq-quote { padding: 14px; }.rfq-quote>div:first-child { flex-direction: column; gap: 6px; }.rfq-quote-values { gap: 14px; font-size: 11px; }.rfq-execute { width: 100%; }.rfq-leg-row { grid-template-columns: 1fr 1fr; gap: 6px; font-size: 10px; }.rfq-leg-row strong { grid-column: 1/-1; }
   .page-footer { margin-top: 24px; gap: 20px 12px; flex-wrap: wrap; }.page-footer small { display: none; }.page-footer>span:nth-child(2) { font-size: 8px; }.page-footer>span:nth-child(2) .text-divider { margin: 0 5px; }.page-footer a { width: 100%; }.notice { bottom: 16px; right: 16px; }
 }
