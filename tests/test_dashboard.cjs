@@ -22,6 +22,7 @@ function dashboard() {
       return new Promise((resolve) => pending.push({url, resolve}));
     },
   });
+  vm.runInContext(fs.readFileSync(`${__dirname}/../app/static/position-payoff.js`, 'utf8'), context);
   vm.runInContext(fs.readFileSync(`${__dirname}/../app/static/app.js`, 'utf8'), context);
   return {context, element, pending};
 }
@@ -73,6 +74,51 @@ test('quantity changes during a request coalesce into a fresh request', async ()
   await new Promise(setImmediate);
   assert.equal(pending.length, 2);
   assert.match(pending[1].url, /quantity=0.03/);
+});
+
+test('in-page trade feedback preserves incomplete fills and error detail', () => {
+  const {context, element} = dashboard();
+  context.showTradeResult({live: true, results: [
+    {symbol: 'A', status: 'filled'}, {symbol: 'B', status: 'unknown', message: '等待交易所确认'},
+  ]}, '开仓');
+  assert.equal(element('notice').hidden, false);
+  assert.equal(element('notice').dataset.tone, 'error');
+  assert.match(element('noticeText').textContent, /尚未全部确认成交/);
+  assert.match(element('noticeText').textContent, /B：unknown（等待交易所确认）/);
+});
+
+test('account connection failure hides stale health metrics', async () => {
+  const {context, element} = dashboard();
+  element('healthUnavailable').style.display = 'none';
+  element('healthContent').style.display = 'grid';
+  await context.loadAccount();
+  assert.equal(element('healthUnavailable').style.display, 'block');
+  assert.equal(element('healthContent').style.display, 'none');
+  assert.equal(element('healthMode').textContent, '账户连接异常');
+  assert.match(element('positionPayoffContent').innerHTML, /持仓更新失败/);
+});
+
+test('position chart preserves payoff but removes stale spot, and clears closed positions', () => {
+  const {context, element} = dashboard();
+  context.window.__positionSnapshot = [{symbol:'BTC-13Sep99-100000-C-USDT',side:'Buy',size:.1,avg_price:100,unrealised_pnl:3}];
+  context.window.__positionMarket = {price:102000,timestamp:Date.now(),staleSeconds:30};
+  context.renderPositionPayoff();
+  assert.match(element('positionPayoffContent').innerHTML, /pp-spot-dot/);
+  assert.match(element('positionPayoffContent').innerHTML, /到期盈利区/);
+  assert.doesNotMatch(element('positionPayoffContent').innerHTML, /NaN|Infinity/);
+  context.window.__positionMarket.timestamp -= 60000;
+  context.renderPositionPayoff();
+  assert.doesNotMatch(element('positionPayoffContent').innerHTML, /pp-spot-dot/);
+  assert.match(element('positionPayoffContent').innerHTML, /等待现价/);
+  assert.match(element('positionPayoffContent').innerHTML, /pp-line/);
+  context.window.__positionError = true;
+  context.renderPositionPayoff();
+  assert.doesNotMatch(element('positionPayoffContent').innerHTML, /pp-line/);
+  context.window.__positionError = false;
+  context.window.__positionSnapshot = [];
+  context.renderPositionPayoff();
+  assert.match(element('positionPayoffContent').innerHTML, /暂无可计算/);
+  assert.doesNotMatch(element('positionPayoffContent').innerHTML, /pp-line/);
 });
 
 test('testnet mode requires confirmation and reports exchange fills as testnet', async () => {

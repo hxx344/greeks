@@ -4,6 +4,27 @@ const num = (value, digits = 2) => Number(value || 0).toLocaleString('en-US', {m
 const utcTime = (value) => new Date(value).toLocaleTimeString('en-GB', {hour12: false, timeZone: 'UTC'});
 const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;'}[char]));
 const optionalMoney = (value) => value === null || value === undefined ? '--' : money(value);
+const marginLabel = (value) => ({REGULAR_MARGIN: '常规保证金', PORTFOLIO_MARGIN: '组合保证金', ISOLATED_MARGIN: '逐仓保证金'}[value] || value || 'UTA');
+
+function showNotice(message, title = '操作结果', tone = 'info') {
+  const notice = $('notice');
+  $('noticeTitle').textContent = title;
+  $('noticeText').textContent = message;
+  notice.dataset.tone = tone;
+  notice.hidden = false;
+}
+function showTradeResult(payload, action) {
+  const complete = payload.results?.length && payload.results.every((item) => ['filled', 'simulated'].includes(item.status));
+  showNotice(tradeResultMessage(payload, action), `${action}结果`, complete ? 'info' : 'error');
+}
+$('dismissNotice')?.addEventListener('click', () => { $('notice').hidden = true; });
+$('toggleDepth')?.addEventListener('click', () => {
+  const full = $('chainPanel').dataset.depth !== 'full';
+  $('chainPanel').dataset.depth = full ? 'full' : 'compact';
+  $('toggleDepth').textContent = full ? '精简盘口 ↙' : '完整盘口 ↗';
+  $('toggleDepth').setAttribute('aria-pressed', String(full));
+  for (const heading of document.querySelectorAll('.call-head, .put-head')) heading.colSpan = full ? 9 : 5;
+});
 
 async function getJson(url, options) {
   const response = await fetch(url, options);
@@ -33,7 +54,8 @@ function deltaCell(item, side) {
 function renderChain(items, preview) {
   const filtered = (items || []).filter((item) => item.expiry === preview?.expiry);
   const strikes = [...new Set(filtered.map((item) => Number(item.strike)))].sort((a, b) => a - b);
-  const mid = strikes.length ? strikes.reduce((a, b) => a + b, 0) / strikes.length : 0;
+  const mid = Number(preview?.btc_price) || (strikes.length ? strikes.reduce((a, b) => a + b, 0) / strikes.length : 0);
+  const atmStrike = strikes.reduce((nearest, strike) => Math.abs(strike - mid) < Math.abs(nearest - mid) ? strike : nearest, strikes[0]);
   const strategyStrikes = (preview?.legs || []).map((leg) => Number(leg.strike)).filter((strike) => strikes.includes(strike));
   const nearby = strikes.slice().sort((a, b) => Math.abs(a - mid) - Math.abs(b - mid)).slice(0, 12);
   const focus = [...new Set([...nearby, ...strategyStrikes])].sort((a, b) => a - b);
@@ -42,7 +64,7 @@ function renderChain(items, preview) {
     const call = filtered.find((item) => item.option_type === 'Call' && Number(item.strike) === strike);
     const put = filtered.find((item) => item.option_type === 'Put' && Number(item.strike) === strike);
     const selectedRow = [call, put].some((item) => item && selected.has(item.symbol));
-    return `<tr class="${Math.abs(strike - mid) < 1 ? 'atm ' : ''}${selectedRow ? 'selected' : ''}">${quoteCell(call,'volume')}${quoteCell(call,'open_interest')}${deltaCell(call,'call')}${quoteCell(call,'bid_size')}${quoteCell(call,'bid','bid')}${quoteCell(call,'mark_price','mark')}${quoteCell(call,'ask','ask')}${quoteCell(call,'ask_size')}${positionCell(call,selected)}<td class="strike">${strike.toLocaleString()}</td>${positionCell(put,selected)}${quoteCell(put,'ask_size')}${quoteCell(put,'ask','ask')}${quoteCell(put,'mark_price','mark')}${quoteCell(put,'bid','bid')}${quoteCell(put,'bid_size')}${deltaCell(put,'put')}${quoteCell(put,'open_interest')}${quoteCell(put,'volume')}</tr>`;
+    return `<tr class="${strike === atmStrike ? 'atm ' : ''}${selectedRow ? 'selected' : ''}">${quoteCell(call,'volume')}${quoteCell(call,'open_interest')}${deltaCell(call,'call')}${quoteCell(call,'bid_size')}${quoteCell(call,'bid','bid')}${quoteCell(call,'mark_price','mark')}${quoteCell(call,'ask','ask')}${quoteCell(call,'ask_size')}${positionCell(call,selected)}<td class="strike">${strike.toLocaleString()}</td>${positionCell(put,selected)}${quoteCell(put,'ask_size')}${quoteCell(put,'ask','ask')}${quoteCell(put,'mark_price','mark')}${quoteCell(put,'bid','bid')}${quoteCell(put,'bid_size')}${deltaCell(put,'put')}${quoteCell(put,'open_interest')}${quoteCell(put,'volume')}</tr>`;
   }).join('');
     $('chainCount').textContent = `${filtered.length} 个合约 · 展示 ${focus.length} 个行权价`;
   $('targetDate').textContent = preview?.expiry ? new Date(preview.expiry).toLocaleDateString('zh-CN', {month: 'short', day: 'numeric', timeZone: 'UTC'}) : '--';
@@ -72,18 +94,22 @@ function renderPayoff(preview) {
   const samples = Array.from({length: 121}, (_, index) => { const price = low + (high - low) * index / 120; return {price, pnl: payoffAt(price, preview)}; });
   const values = samples.map((point) => point.pnl); const min = Math.min(...values, 0); const max = Math.max(...values, 0); const pad = Math.max(50, (max - min) * 0.12); const yMin = min - pad; const yMax = max + pad; const left = 48; const right = 15; const top = 18; const bottom = 28;
   const x = (price) => left + (price - low) / (high - low) * (width - left - right); const y = (pnl) => top + (yMax - pnl) / (yMax - yMin) * (height - top - bottom);
-  ctx.clearRect(0, 0, width, height); ctx.font = '10px Inter, system-ui, sans-serif';
-  for (let index = 0; index <= 4; index += 1) { const pnl = yMin + (yMax - yMin) * index / 4; const yp = y(pnl); ctx.strokeStyle = '#22313a'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(left, yp); ctx.lineTo(width - right, yp); ctx.stroke(); ctx.fillStyle = '#71818d'; ctx.fillText(`${pnl >= 0 ? '+' : ''}${Math.round(pnl).toLocaleString()}`, 5, yp + 3); }
-  const zeroY = y(0); ctx.strokeStyle = '#71838b'; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(left, zeroY); ctx.lineTo(width - right, zeroY); ctx.stroke(); ctx.setLineDash([]);
-  ctx.beginPath(); samples.forEach((point, index) => index ? ctx.lineTo(x(point.price), y(point.pnl)) : ctx.moveTo(x(point.price), y(point.pnl))); ctx.lineTo(x(samples[samples.length - 1].price), zeroY); ctx.lineTo(x(samples[0].price), zeroY); ctx.closePath(); ctx.fillStyle = 'rgba(79, 156, 103, .18)'; ctx.fill();
-  ctx.beginPath(); samples.forEach((point, index) => index ? ctx.lineTo(x(point.price), y(point.pnl)) : ctx.moveTo(x(point.price), y(point.pnl))); ctx.strokeStyle = '#d7f36b'; ctx.lineWidth = 2.4; ctx.stroke();
-  for (const strike of strikes) { const xp = x(strike); ctx.strokeStyle = '#53646d'; ctx.setLineDash([2, 4]); ctx.beginPath(); ctx.moveTo(xp, top); ctx.lineTo(xp, height - bottom); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = '#aab9bf'; ctx.textAlign = 'center'; ctx.fillText(`${Math.round(strike).toLocaleString()}`, xp, height - 9); }
-  const spot = Number(preview.btc_price || 0); if (spot >= low && spot <= high) { const xp = x(spot); ctx.strokeStyle = '#f2bd62'; ctx.setLineDash([5, 3]); ctx.beginPath(); ctx.moveTo(xp, top); ctx.lineTo(xp, height - bottom); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = '#f2bd62'; ctx.textAlign = 'center'; ctx.fillText(`BTC ${Math.round(spot).toLocaleString()}`, xp, 11); }
+  ctx.clearRect(0, 0, width, height); ctx.font = '10px Segoe UI, system-ui, sans-serif';
+  for (let index = 0; index <= 4; index += 1) { const pnl = yMin + (yMax - yMin) * index / 4; const yp = y(pnl); ctx.strokeStyle = '#26352a'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(left, yp); ctx.lineTo(width - right, yp); ctx.stroke(); ctx.fillStyle = '#8d9e91'; ctx.fillText(`${pnl >= 0 ? '+' : ''}${Math.round(pnl).toLocaleString()}`, 5, yp + 3); }
+  const zeroY = y(0); ctx.strokeStyle = '#667e6c'; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(left, zeroY); ctx.lineTo(width - right, zeroY); ctx.stroke(); ctx.setLineDash([]);
+  ctx.beginPath(); samples.forEach((point, index) => index ? ctx.lineTo(x(point.price), y(point.pnl)) : ctx.moveTo(x(point.price), y(point.pnl))); ctx.lineTo(x(samples[samples.length - 1].price), zeroY); ctx.lineTo(x(samples[0].price), zeroY); ctx.closePath();
+  ctx.save(); ctx.clip();
+  ctx.fillStyle = 'rgba(155, 205, 176, .10)'; ctx.fillRect(left, top, width - left - right, zeroY - top);
+  ctx.fillStyle = 'rgba(223, 159, 153, .06)'; ctx.fillRect(left, zeroY, width - left - right, height - bottom - zeroY);
+  ctx.restore();
+  ctx.beginPath(); samples.forEach((point, index) => index ? ctx.lineTo(x(point.price), y(point.pnl)) : ctx.moveTo(x(point.price), y(point.pnl))); ctx.strokeStyle = '#bedcc6'; ctx.lineWidth = 2.4; ctx.stroke();
+  for (const strike of strikes) { const xp = x(strike); ctx.strokeStyle = '#405e49'; ctx.setLineDash([2, 4]); ctx.beginPath(); ctx.moveTo(xp, top); ctx.lineTo(xp, height - bottom); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = '#a9bbaf'; ctx.textAlign = 'center'; ctx.fillText(`${Math.round(strike).toLocaleString()}`, xp, height - 9); }
+  const spot = Number(preview.btc_price || 0); if (spot >= low && spot <= high) { const xp = x(spot); ctx.strokeStyle = '#d6bc86'; ctx.setLineDash([5, 3]); ctx.beginPath(); ctx.moveTo(xp, top); ctx.lineTo(xp, height - bottom); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = '#d6bc86'; ctx.textAlign = 'center'; ctx.fillText(`BTC ${Math.round(spot).toLocaleString()}`, xp, 11); }
   const breaks = []; for (let index = 1; index < samples.length; index += 1) { if ((samples[index - 1].pnl < 0) !== (samples[index].pnl < 0)) { const a = samples[index - 1]; const b = samples[index]; breaks.push(a.price + (0 - a.pnl) * (b.price - a.price) / (b.pnl - a.pnl)); } }
   const maxProfit = Math.max(...values); const maxLoss = Math.min(...values); const current = spot ? payoffAt(spot, preview) : 0;
-  $('payoffStats').innerHTML = `<div class="payoff-stat"><span>当前盈亏</span><strong class="${current >= 0 ? 'profit' : 'loss'}">${money(current)}</strong></div><div class="payoff-stat"><span>最大收益</span><strong class="profit">${money(maxProfit)}</strong></div><div class="payoff-stat"><span>最大风险</span><strong class="loss">${money(maxLoss)}</strong></div><div class="payoff-stat"><span>盈亏平衡</span><strong>${breaks.length ? breaks.map((point) => Math.round(point).toLocaleString()).join(' / ') : '--'}</strong></div>`;
+  $('payoffStats').innerHTML = `<div class="payoff-stat"><span>现价对应到期盈亏</span><strong class="${current >= 0 ? 'profit' : 'loss'}">${money(current)}</strong></div><div class="payoff-stat"><span>最大收益</span><strong class="profit">${money(maxProfit)}</strong></div><div class="payoff-stat"><span>最大风险</span><strong class="loss">${money(maxLoss)}</strong></div><div class="payoff-stat"><span>盈亏平衡</span><strong>${breaks.length ? breaks.map((point) => Math.round(point).toLocaleString()).join(' / ') : '--'}</strong></div>`;
 }
-function renderLegs(legs) { $('legs').innerHTML = (legs || []).map((leg) => `<div class="leg"><span class="leg-mark ${leg.side.toLowerCase()}">${leg.side === 'Sell' ? 'S' : 'B'} ${leg.option_type[0]}</span><div><div class="leg-title">${leg.side === 'Sell' ? '卖出' : '买入'} ${leg.option_type} · Δ ${Number(leg.delta).toFixed(3)}</div><div class="leg-symbol">${esc(leg.symbol)}</div></div><div class="leg-price"><strong>${money(leg.mark_price)}</strong><small>目标 ${Number(leg.target_delta).toFixed(2)}</small><small>预估费 ${money(leg.estimated_fee_usd)} / 封顶 ${money(leg.fee_cap_usd)}</small></div></div>`).join(''); }
+function renderLegs(legs) { $('legs').className = 'legs'; $('legs').innerHTML = (legs || []).map((leg) => `<div class="leg"><span class="leg-mark ${leg.side.toLowerCase()}">${leg.side === 'Sell' ? 'S' : 'B'} ${leg.option_type[0]}</span><div><div class="leg-title">${leg.side === 'Sell' ? '卖出' : '买入'} ${leg.option_type} · Δ ${Number(leg.delta).toFixed(3)}</div><div class="leg-symbol">${esc(leg.symbol)}</div></div><div class="leg-price"><strong>${money(leg.mark_price)}</strong><small>目标 ${Number(leg.target_delta).toFixed(2)}</small><small>预估费 ${money(leg.estimated_fee_usd)} / 封顶 ${money(leg.fee_cap_usd)}</small></div></div>`).join(''); }
 function renderPositions(items) { $('positions').className = items.length ? 'positions' : 'positions empty'; $('positions').innerHTML = items.length ? items.map((p) => `<div class="position-row"><strong>${esc(p.symbol)}</strong><span>${esc(p.side)} · ${p.size}</span><span class="${p.unrealised_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}">${money(p.unrealised_pnl)}</span></div>`).join('') : '暂无持仓'; }
 function renderLogs(items) { $('logs').innerHTML = (items || []).slice(0, 20).map((log) => `<div class="log-line"><span class="log-time">${utcTime(log.timestamp)}</span><span class="log-level ${log.level}">${log.level}</span><span>${esc(log.message)}</span></div>`).join(''); }
 function renderPortfolioMargin(health) {
@@ -207,6 +233,8 @@ function updateTradeControls() {
   $('rfqCreate').disabled = Boolean(window.__tradingBlocked || window.__openingBlocked || window.__strategyUnavailable);
 }
 function clearStrategyDisplay(message) {
+  if ($('chainPanel')) $('chainPanel').dataset.availability = 'unavailable';
+  $('legs').className = 'legs strategy-empty';
   window.__latestPreview = null;
   window.__latestChain = [];
   for (const id of ['creditValue', 'lossValue', 'marginValue', 'maintenanceValue', 'costValue', 'rrValue']) {
@@ -229,9 +257,13 @@ async function loadMarket() {
     const marketUrl = Number.isFinite(requestedQty) && requestedQty > 0 ? `/api/dashboard/market?quantity=${encodeURIComponent(requestedQty)}` : '/api/dashboard/market';
     const payload = await getJson(marketUrl);
     const {config, preview, chain} = payload;
+    window.__positionMarket = {price: Number(chain.btc_price || preview?.btc_price || 0), timestamp: Date.parse(chain.updated_at || preview?.market_timestamp || ''), staleSeconds: Number(config.quote_stale_seconds || 30)};
+    renderPositionPayoff();
     window.__liveEnabled = config.trading_enabled ?? config.live_enabled;
     window.__openingBlocked = Boolean(config.opening_blocked_reason);
     const enabled = window.__liveEnabled;
+    $('environment').dataset.mode = config.environment || (enabled ? 'live' : 'dry-run');
+    if ($('modeBox')) $('modeBox').dataset.mode = config.environment || (enabled ? 'live' : 'dry-run');
     const modeLabel = config.environment === "testnet" ? "TESTNET" : (enabled ? "LIVE" : "MAINNET DATA / DRY");
     window.__tradingBlocked = Boolean(config.trading_blocked_reason);
     window.__strategyUnavailable = !preview;
@@ -246,20 +278,23 @@ async function loadMarket() {
       clearStrategyDisplay('等待周日到期合约上线');
       $('btcPrice').textContent = chain.btc_price ? money(chain.btc_price) : '--';
       $('environment').textContent = modeLabel;
+      $('statusValue').dataset.state = config.trading_blocked_reason ? 'error' : 'waiting';
       $('statusValue').textContent = config.trading_blocked_reason ? '交易已阻止' : '等待合约上线';
       $('statusSub').textContent = config.trading_blocked_reason || payload.message;
       $('updateText').textContent = '行情已连接 · 自动检查合约';
-      $('updateDot').style.background = '#f2bd62';
+      $('updateDot').style.background = '#d6bc86';
       return;
     }
+    if ($('chainPanel')) $('chainPanel').dataset.availability = 'ready';
     window.__latestPreview = preview;
     window.__latestChain = chain.items || []; $('btcPrice').textContent = preview.btc_price ? money(preview.btc_price) : '--';
     $('environment').textContent = chain.source === 'bybit' ? (modeLabel) : 'UNAVAILABLE';
     $('creditValue').textContent = money(preview.net_credit_usd); $('lossValue').textContent = money(preview.max_loss_usd); $('marginValue').textContent = money(preview.estimated_margin_usd); $('marginSub').textContent = preview.margin_mode === 'PORTFOLIO_MARGIN' ? 'PM 压力测试估算' : 'Bybit Order IM'; $('maintenanceValue').textContent = money(preview.estimated_maintenance_margin_usd); $('costValue').textContent = money(preview.estimated_trading_cost_usd); $('feeSub').textContent = `Taker ${(Number(preview.estimated_fee_rate) * 100).toFixed(3)}% · 单腿上限 ${(Number(preview.fee_cap_pct) * 100).toFixed(0)}%`; if ($('rrValue')) $('rrValue').textContent = `${preview.risk_reward}x`; $('riskSub').textContent = `风险上限 ${money(config.max_risk_usd)}`;
     const quoteTime = preview.market_timestamp ? new Date(preview.market_timestamp) : new Date(); const age = Math.max(0, Math.round((Date.now() - quoteTime.getTime()) / 1000));
-    $('statusValue').textContent = age > config.quote_stale_seconds ? '行情过期' : '策略就绪'; $('statusSub').textContent = `${chain.source === 'bybit' ? (config.market_testnet ? 'Bybit 测试网行情' : 'Bybit 主网行情') : '行情不可用'} · ${age}s 前`; $('expiry').textContent = `到期 ${new Date(preview.expiry).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit',timeZone:'UTC'})}`; renderChain(chain.items, preview); renderLegs(preview.legs); renderPayoff(preview); $('updateText').textContent = `行情 ${age}s · 每 ${config.market_refresh_seconds}s 更新`; $('updateDot').style.background = age > config.quote_stale_seconds ? '#ef8989' : '#d7f36b';
-    if (config.trading_blocked_reason || config.opening_blocked_reason) { $('statusValue').textContent = '交易已阻止'; $('statusSub').textContent = config.trading_blocked_reason || 'RFQ 状态待确认，后台正在对账'; }
-  } catch (error) { window.__strategyUnavailable = true; clearStrategyDisplay('策略暂不可用'); updateTradeControls(); $('statusValue').textContent = '行情异常'; $('statusSub').textContent = error.message; $('updateText').textContent = '等待重试'; $('updateDot').style.background = '#ef8989'; }
+    $('statusValue').dataset.state = age > config.quote_stale_seconds ? 'waiting' : 'ready';
+    $('statusValue').textContent = age > config.quote_stale_seconds ? '行情过期' : '策略就绪'; $('statusSub').textContent = `${chain.source === 'bybit' ? (config.market_testnet ? 'Bybit 测试网行情' : 'Bybit 主网行情') : '行情不可用'} · ${age}s 前`; $('expiry').textContent = `到期 ${new Date(preview.expiry).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit',timeZone:'UTC'})}`; renderChain(chain.items, preview); renderLegs(preview.legs); renderPayoff(preview); $('updateText').textContent = `行情 ${age}s · 每 ${config.market_refresh_seconds}s 更新`; $('updateDot').style.background = age > config.quote_stale_seconds ? '#df9f99' : '#bedcc6';
+    if (config.trading_blocked_reason || config.opening_blocked_reason) { $('statusValue').dataset.state = 'error'; $('statusValue').textContent = '交易已阻止'; $('statusSub').textContent = config.trading_blocked_reason || 'RFQ 状态待确认，后台正在对账'; }
+  } catch (error) { window.__positionMarket = null; renderPositionPayoff(); window.__strategyUnavailable = true; clearStrategyDisplay('策略暂不可用'); updateTradeControls(); $('statusValue').dataset.state = 'error'; $('statusValue').textContent = '行情异常'; $('statusSub').textContent = error.message; $('updateText').textContent = '等待重试'; $('updateDot').style.background = '#df9f99'; }
   finally {
     window.__marketLoading = false;
     if (window.__marketReloadPending) { window.__marketReloadPending = false; void loadMarket(); }
@@ -271,17 +306,21 @@ async function loadAccount() {
   try {
     const payload = await getJson('/api/dashboard/account');
     const {positions, logs, health, executions} = payload;
+    window.__positionSnapshot = positions.items || [];
+    window.__positionError = positions.available === false;
+    renderPositionPayoff();
     renderPositions(positions.items || []); renderLogs(logs.items || []); renderExecutions(executions.items || []);
     window.__latestExecutions = executions.items || [];
-    $('healthMode').textContent = health.available ? (health.margin_mode || 'UTA') : '仅实盘'; $('healthUnavailable').style.display = health.available ? 'none' : 'block'; $('healthContent').style.display = health.available ? 'grid' : 'none'; if (health.available) { const im = Number(health.initial_margin_rate || 0) * 100; const mm = Number(health.maintenance_margin_rate || 0) * 100; $('imRate').textContent = `${im.toFixed(2)}%`; $('mmRate').textContent = `${mm.toFixed(2)}%`; $('imBar').style.width = `${Math.min(100, im)}%`; $('mmBar').style.width = `${Math.min(100, mm)}%`; $('availableBalance').textContent = money(health.available_balance_usd); $('marginBalance').textContent = money(health.margin_balance_usd); $('totalEquity').textContent = money(health.total_equity_usd); $('accountMode').textContent = health.margin_mode || '--'; renderPortfolioMargin(health); }
-  } catch (error) { $('healthUnavailable').textContent = error.message; }
+    $('healthMode').textContent = health.available ? marginLabel(health.margin_mode) : '未连接账户'; $('healthUnavailable').textContent = health.message || '连接账户后，将显示余额、保证金和风险指标。'; $('healthUnavailable').style.display = health.available ? 'none' : 'block'; $('healthContent').style.display = health.available ? 'grid' : 'none'; if (health.available) { const im = Number(health.initial_margin_rate || 0) * 100; const mm = Number(health.maintenance_margin_rate || 0) * 100; $('imRate').textContent = `${im.toFixed(2)}%`; $('mmRate').textContent = `${mm.toFixed(2)}%`; $('imBar').style.width = `${Math.min(100, im)}%`; $('mmBar').style.width = `${Math.min(100, mm)}%`; $('availableBalance').textContent = money(health.available_balance_usd); $('marginBalance').textContent = money(health.margin_balance_usd); $('totalEquity').textContent = money(health.total_equity_usd); $('accountMode').textContent = marginLabel(health.margin_mode); renderPortfolioMargin(health); }
+  } catch (error) { window.__positionError = true; renderPositionPayoff(); $('healthMode').textContent = '账户连接异常'; $('healthUnavailable').textContent = error.message; $('healthUnavailable').style.display = 'block'; $('healthContent').style.display = 'none'; }
   finally { window.__accountLoading = false; }
 }
 async function load() { await Promise.allSettled([loadMarket(), loadAccount()]); }
-async function openTrade() { const button = $('openTrade'); button.dataset.busy = '1'; button.disabled = true; button.textContent = '执行中…'; try { const result = await getJson('/api/trading/open', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, quantity:Number($('quantity').value)})}); window.alert(tradeResultMessage(result, '开仓')); await load(); } catch (error) { window.alert(error.message); } finally { delete button.dataset.busy; updateTradeControls(); } }
+async function openTrade() { const button = $('openTrade'); button.dataset.busy = '1'; button.disabled = true; button.textContent = '执行中…'; try { const result = await getJson('/api/trading/open', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, quantity:Number($('quantity').value)})}); showTradeResult(result, '开仓'); await load(); } catch (error) { showNotice(error.message, '操作未完成', 'error'); } finally { delete button.dataset.busy; updateTradeControls(); } }
 function tick() { $('clock').textContent = `${new Date().toLocaleTimeString('en-GB',{hour12:false,timeZone:'UTC'})} UTC`; }
+setInterval(renderPositionPayoff, 10000);
 $('refresh').addEventListener('click', async () => { try { await getJson('/api/market/refresh',{method:'POST'}); await loadMarket(); } catch (error) { $('statusSub').textContent = error.message; } }); $('reloadPositions').addEventListener('click', loadAccount); $('openTrade').addEventListener('click', openTrade); $('confirm').addEventListener('change', updateTradeControls); tick(); setInterval(tick,1000);
-let payoffResizeFrame; window.addEventListener('resize', () => { cancelAnimationFrame(payoffResizeFrame); payoffResizeFrame = requestAnimationFrame(() => { if (window.__latestPreview) renderPayoff(window.__latestPreview); }); });
+let payoffResizeFrame; window.addEventListener('resize', () => { cancelAnimationFrame(payoffResizeFrame); payoffResizeFrame = requestAnimationFrame(() => { if (window.__latestPreview) renderPayoff(window.__latestPreview); renderPositionPayoff(); }); });
 window.__desiredQty = window.localStorage.getItem('ic-quantity') || '';
 const quantityField = $('quantity');
 const quantityPreset = $('quantityPreset');
@@ -297,7 +336,7 @@ const refreshEstimate = () => { const value = Number(quantityField.value); if (v
 quantityPreset.addEventListener('change', () => { if (quantityPreset.value !== 'custom') { quantityField.value = quantityPreset.value; refreshEstimate(); } });
 quantityField.addEventListener('change', refreshEstimate);
 loadMarket().finally(loadAccount); setInterval(loadMarket, 10000); setInterval(loadAccount, 15000);
-async function closeTrade() { const button = $('closeTrade'); button.dataset.busy = '1'; button.disabled = true; button.textContent = '执行中…'; try { const result = await getJson('/api/trading/close', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked})}); window.alert(tradeResultMessage(result, '平仓')); await load(); } catch (error) { window.alert(error.message); } finally { delete button.dataset.busy; updateTradeControls(); } }
+async function closeTrade() { const button = $('closeTrade'); button.dataset.busy = '1'; button.disabled = true; button.textContent = '执行中…'; try { const result = await getJson('/api/trading/close', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked})}); showTradeResult(result, '平仓'); await load(); } catch (error) { showNotice(error.message, '操作未完成', 'error'); } finally { delete button.dataset.busy; updateTradeControls(); } }
 $('closeTrade').addEventListener('click', closeTrade);
 function quoteNet(quote, side, state) { const requested = new Map((state.legs || []).map((leg) => [leg.symbol, leg.side])); return (quote[side === 'Buy' ? 'quoteBuyList' : 'quoteSellList'] || []).reduce((sum, item) => { const requestedSide = requested.get(item.symbol) || 'Buy'; const takerSide = side === 'Sell' ? requestedSide : (requestedSide === 'Buy' ? 'Sell' : 'Buy'); return sum + (takerSide === 'Sell' ? 1 : -1) * Number(item.price || 0) * Number(item.qty || 0); }, 0); }
 function quoteLegCount(quote) { return new Set((quote.quoteSellList || []).map((item) => item.symbol)).size; }
@@ -314,8 +353,7 @@ function renderRfq(state) {
   document.querySelectorAll('.rfq-execute').forEach((button) => button.addEventListener('click', executeRfq));
 }
 async function loadRfq() { if (window.__rfqLoading) return; window.__rfqLoading = true; try { renderRfq(await getJson('/api/rfq/status')); } catch (error) { $('rfqStatus').textContent = error.message; } finally { window.__rfqLoading = false; } }
-async function createRfq() { try { await getJson('/api/rfq/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, counterparties:[], quantity:Number($('quantity').value)})}); await loadRfq(); } catch (error) { window.alert(error.message); } }
-async function executeRfq(event) { const button = event.currentTarget; try { await getJson('/api/rfq/execute', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, rfq_id:button.dataset.rfq, quote_id:button.dataset.quote, quote_side:button.dataset.side})}); await loadRfq(); } catch (error) { window.alert(error.message); } }
-async function cancelRfq() { try { const state = await getJson('/api/rfq/status?refresh=false'); if (!state.rfq_id) throw new Error('没有活动 RFQ'); await getJson('/api/rfq/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, rfq_id:state.rfq_id})}); await loadRfq(); } catch (error) { window.alert(error.message); } }
+async function createRfq() { try { await getJson('/api/rfq/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, counterparties:[], quantity:Number($('quantity').value)})}); await loadRfq(); } catch (error) { showNotice(error.message, '操作未完成', 'error'); } }
+async function executeRfq(event) { const button = event.currentTarget; try { await getJson('/api/rfq/execute', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, rfq_id:button.dataset.rfq, quote_id:button.dataset.quote, quote_side:button.dataset.side})}); await loadRfq(); } catch (error) { showNotice(error.message, '操作未完成', 'error'); } }
+async function cancelRfq() { try { const state = await getJson('/api/rfq/status?refresh=false'); if (!state.rfq_id) throw new Error('没有活动 RFQ'); await getJson('/api/rfq/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, rfq_id:state.rfq_id})}); await loadRfq(); } catch (error) { showNotice(error.message, '操作未完成', 'error'); } }
 $('rfqCreate').addEventListener('click', createRfq); $('rfqCancel').addEventListener('click', cancelRfq); setInterval(loadRfq, 3000); loadRfq();
-const rfqPanel = $('rfqStatus')?.closest('.rfq-panel'); const workspace = document.querySelector('.workspace'); if (rfqPanel && workspace) workspace.before(rfqPanel);

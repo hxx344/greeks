@@ -66,7 +66,7 @@ Bybit 非 VIP 期权基础费率：Taker 0.03%、Maker 0.02%；单笔交易手�
 
 ```bash
 uv run --locked python -m unittest discover -s tests -t . -v
-node tests/test_dashboard.cjs
+node --test tests/test_dashboard.cjs tests/test_position_payoff.cjs
 node --check app/static/app.js
 ```
 

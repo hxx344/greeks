@@ -138,6 +138,7 @@ async def dashboard_account():
 
 async def _build_account_dashboard():
     position_result, health_result, execution_result = await asyncio.gather(engine.load_positions(), engine.load_account_health(), engine.load_recent_executions(), return_exceptions=True)
+    positions_available = not isinstance(position_result, Exception)
     if isinstance(position_result, Exception):
         engine.log("WARNING", f"Could not refresh dashboard positions: {position_result}")
         position_result = engine.positions
@@ -147,7 +148,7 @@ async def _build_account_dashboard():
     if isinstance(execution_result, Exception):
         engine.log("WARNING", f"Could not refresh dashboard executions: {execution_result}")
         execution_result = engine.last_executions
-    return {"positions": {"items": [item.model_dump(mode="json") for item in position_result]}, "health": health_result.model_dump(mode="json"), "executions": {"items": [item.model_dump(mode="json") for item in execution_result]}, "logs": {"items": [item.model_dump(mode="json") for item in engine.logs]}}
+    return {"positions": {"available": positions_available, "items": [item.model_dump(mode="json") for item in position_result]}, "health": health_result.model_dump(mode="json"), "executions": {"items": [item.model_dump(mode="json") for item in execution_result]}, "logs": {"items": [item.model_dump(mode="json") for item in engine.logs]}}
 
 
 @app.get("/api/chain")

@@ -3,22 +3,92 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>BTC Options · Iron Condor Desk</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260903-8" />
+  <meta name="theme-color" content="#0d1110" />
+  <title>CONDOR · BTC 期权策略台</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260908-2" />
 </head>
 <body>
-  <header class="topbar"><div class="brand"><span class="brand-mark">IC</span><div><strong>Iron Condor Desk</strong><small>BTC OPTIONS / BYBIT</small></div></div><div class="top-meta"><span id="environment" class="status-chip">连接中</span><span id="clock" class="clock">--:--:-- UTC</span></div></header>
-  <main class="shell">
-    <section class="intro"><div><div class="kicker">WEEKLY VOLATILITY BOOK</div><h1>BTC 铁鹰策略台</h1><p>用 Delta 目标构建周度收益区间，实时观察保护翼、波动率和可执行报价。</p></div><div class="intro-actions"><span class="update-state"><i id="updateDot"></i><span id="updateText">行情同步中</span></span><button id="refresh" class="button ghost">立即刷新</button></div></section>
-    <section class="stats"><article><span>净权利金</span><strong id="creditValue">--</strong><small>每组策略</small></article><article><span>最大风险</span><strong id="lossValue">--</strong><small id="riskSub">风险上限 --</small></article><article><span>保证金需求</span><strong id="marginValue">--</strong><small id="marginSub">官方公式估算</small></article><article><span>维护保证金</span><strong id="maintenanceValue">--</strong><small>短期权 MM</small></article><article><span>交易成本</span><strong id="costValue">--</strong><small id="feeSub">手续费率 --</small></article><article><span>标的状态</span><strong id="statusValue">准备中</strong><small id="statusSub">等待行情</small></article></section>
-    <section class="health panel"><div class="health-head"><div><div class="kicker">ACCOUNT HEALTH</div><h2>账户保证金健康度</h2></div><span id="healthMode" class="source-tag">仅实盘</span></div><div id="healthUnavailable" class="health-unavailable">未连接实盘账户，配置 API Key 后显示真实账户数据。</div><div id="healthContent" class="health-content"><div class="health-metric"><div><span>初始保证金率</span><b id="imRate">--</b></div><div class="progress"><i id="imBar"></i></div></div><div class="health-metric"><div><span>维护保证金率</span><b id="mmRate">--</b></div><div class="progress danger"><i id="mmBar"></i></div></div><div class="health-values"><div><span>可用余额</span><strong id="availableBalance">--</strong></div><div><span>保证金余额</span><strong id="marginBalance">--</strong></div><div><span>总权益</span><strong id="totalEquity">--</strong></div><div><span>账户模式</span><strong id="accountMode">--</strong></div></div></div></section>
-    <section class="workspace">
-      <div class="panel chain-panel"><div class="panel-head"><div><div class="kicker">LIVE OPTION CHAIN</div><h2>期权链 · 双侧盘口</h2></div><div class="head-right"><span class="spot-tag">BTC <b id="btcPrice">--</b></span><span id="chainSource" class="source-tag">--</span><span id="expiry" class="expiry-tag">到期 --</span></div></div><div class="chain-toolbar"><span>目标到期日 <b id="targetDate">--</b></span><span>每 <b id="refreshRate">10</b> 秒自动更新</span><span id="legSummary" class="leg-summary">BUY 2 · SELL 2</span><span class="legend"><i class="legend-sell"></i>Ask / 卖出 <i class="legend-buy"></i>Bid / 买入</span></div><div class="chain-wrap"><table class="chain-table"><thead><tr><th colspan="9" class="call-head">CALLS</th><th class="strike-head">STRIKE</th><th colspan="9" class="put-head">PUTS</th></tr><tr><th>24H VOL</th><th>OPEN</th><th>DELTA</th><th>BID SIZE</th><th>BID</th><th>MARK</th><th>ASK</th><th>ASK SIZE</th><th>POSITION</th><th></th><th>POSITION</th><th>ASK SIZE</th><th>ASK</th><th>MARK</th><th>BID</th><th>BID SIZE</th><th>DELTA</th><th>OPEN</th><th>24H VOL</th></tr></thead><tbody id="chain"></tbody></table></div><div class="chain-foot"><span id="chainCount">--</span><span>绿色 = Bid · 红色 = Ask · 中线 = ATM</span></div></div>
-      <aside class="panel execution"><div class="panel-head"><div><div class="kicker">EXECUTION GUARD</div><h2>执行控制</h2></div><span class="lock-badge">SAFE</span></div><div class="mode-box"><span class="mode-icon">✓</span><div><strong id="modeTitle">模拟模式</strong><p id="modeText">不会向交易所发送订单。</p></div></div><div class="field"><label for="quantityPreset">每腿数量</label><div class="quantity-row"><select id="quantityPreset"><option value="0.01">0.01</option><option value="0.05">0.05</option><option value="0.1">0.10</option><option value="0.25">0.25</option><option value="0.5">0.50</option><option value="1" selected>1.00</option><option value="custom">自定义</option></select><input id="quantity" type="number" min="0.01" step="0.01" value="1" /></div><small class="field-hint">数量会即时重算保证金和交易成本</small></div><label class="confirm"><input id="confirm" type="checkbox" /><span>我已核对四腿、报价和风险上限</span></label><button id="openTrade" class="button primary">模拟开仓四腿</button><button id="closeTrade" class="button close-button">一键平仓四腿</button><p class="microcopy">实盘订单需要服务端开启 LIVE_TRADING，并且每次请求显式确认。</p><div class="schedule"><span>计划开仓</span><strong id="nextOpen">周五 21:00 UTC</strong></div></aside>
+  <a class="skip-link" href="#overview">跳转到策略总览</a>
+  <header class="topbar">
+    <a class="brand" href="#overview" aria-label="CONDOR 策略总览">
+      <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><path d="M5 23 11 9h10l6 14M8 18h16M12 23l4-9 4 9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <span><strong>CONDOR<span class="brand-dot">.</span></strong><small>OPTIONS WORKSPACE</small></span>
+    </a>
+    <nav class="top-nav" aria-label="页面导航"><a href="#overview">总览</a><a href="#market">期权链</a><a href="#position-payoff">持仓</a><a href="#account">账户</a><a href="#rfq">组合询价</a></nav>
+    <div class="top-meta"><span id="environment" class="status-chip">连接中</span><span id="clock" class="clock">--:--:-- UTC</span></div>
+  </header>
+  <main class="shell" id="overview">
+    <section class="intro" aria-labelledby="pageTitle">
+      <div><div class="kicker"><span class="eyebrow-line"></span>BTC / IRON CONDOR</div><h1 id="pageTitle">以结构，定义风险边界<span class="heading-dot">.</span></h1><p>BTC 铁鹰策略台<span class="text-divider">/</span>行情、组合与执行，一览有序。</p></div>
+      <div class="intro-actions"><span class="update-state"><i id="updateDot"></i><span id="updateText">行情同步中</span></span><button id="refresh" class="button ghost"><svg class="icon" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M16 8a6.2 6.2 0 1 0-.4 5M16 3v5h-5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>立即刷新</button></div>
     </section>
-    <section class="bottom-grid"><div class="panel strategy-panel"><div class="panel-head"><div><div class="kicker">STRATEGY BLUEPRINT</div><h2>四腿结构</h2></div><span class="muted">目标 Delta · 实际 Delta</span></div><div id="legs" class="legs"></div><div class="payoff"><div class="payoff-title"><span>到期盈亏曲线 · USD</span><span class="muted">按当前报价估算</span></div><div class="payoff-chart-wrap"><canvas id="payoffChart" aria-label="到期盈亏曲线"></canvas></div><div id="payoffStats" class="payoff-stats"></div></div></div><div class="panel activity-panel"><div class="panel-head"><div><div class="kicker">ACCOUNT ACTIVITY</div><h2>仓位与事件</h2></div><button id="reloadPositions" class="link-button">更新</button></div><div class="subhead">当前仓位</div><div id="positions" class="positions empty">暂无持仓</div><div class="subhead log-title">系统日志</div><div id="logs" class="logs"></div><div class="subhead log-title">成交与手续费</div><div id="executions" class="executions empty">暂无成交记录</div></div></section>
+    <section class="stats" aria-label="策略指标">
+      <article class="metric-featured"><span>净权利金 <small>NET CREDIT</small></span><strong id="creditValue">--</strong><small>每组策略 · USD</small></article>
+      <article><span>最大风险 <small>MAX LOSS</small></span><strong id="lossValue">--</strong><small id="riskSub">风险上限 --</small></article>
+      <article><span>保证金需求 <small>INITIAL MARGIN</small></span><strong id="marginValue">--</strong><small id="marginSub">官方公式估算</small></article>
+      <article><span>维护保证金 <small>MAINTENANCE</small></span><strong id="maintenanceValue">--</strong><small>短期权 MM</small></article>
+      <article><span>交易成本 <small>EST. FEES</small></span><strong id="costValue">--</strong><small id="feeSub">手续费率 --</small></article>
+      <article class="metric-status"><span>行情状态 <small>MARKET STATUS</small></span><strong id="statusValue">准备中</strong><small id="statusSub">等待行情</small></article>
+    </section>
+    <section class="workspace" id="market" aria-label="盘口与执行">
+      <div class="panel chain-panel" id="chainPanel" data-depth="compact">
+        <div class="panel-head"><div><div class="kicker">01 / MARKET</div><h2>期权链<span class="heading-detail">双侧盘口</span></h2></div><div class="head-right"><span class="spot-tag">BTC <b id="btcPrice">--</b></span><span id="chainSource" class="source-tag">--</span><span id="expiry" class="expiry-tag">到期 --</span></div></div>
+        <div class="chain-toolbar"><span>到期日 <b id="targetDate">--</b></span><span>每 <b id="refreshRate">10</b> 秒更新</span><span id="legSummary" class="leg-summary">BUY 2 · SELL 2</span><button id="toggleDepth" class="table-toggle" type="button" aria-pressed="false">完整盘口 ↗</button><span class="legend"><i class="legend-buy"></i>Bid 买价<i class="legend-sell"></i>Ask 卖价</span></div>
+        <div class="chain-wrap" tabindex="0" role="region" aria-label="双侧期权盘口，可横向滚动">
+          <table class="chain-table" aria-label="BTC 期权链">
+            <thead><tr><th colspan="5" class="call-head" scope="colgroup">CALLS <span>看涨期权</span></th><th class="strike-head" scope="col">STRIKE</th><th colspan="5" class="put-head" scope="colgroup"><span>看跌期权</span> PUTS</th></tr><tr><th scope="col">24H VOL</th><th scope="col">OI</th><th scope="col">DELTA</th><th scope="col">BID SIZE</th><th scope="col">BID</th><th scope="col">MARK</th><th scope="col">ASK</th><th scope="col">ASK SIZE</th><th scope="col">LEG</th><th scope="col">行权价</th><th scope="col">LEG</th><th scope="col">ASK SIZE</th><th scope="col">ASK</th><th scope="col">MARK</th><th scope="col">BID</th><th scope="col">BID SIZE</th><th scope="col">DELTA</th><th scope="col">OI</th><th scope="col">24H VOL</th></tr></thead>
+            <tbody id="chain"></tbody>
+          </table>
+        </div>
+        <div class="chain-foot"><span id="chainCount">等待合约数据</span><span>高亮为策略腿 <span class="text-divider">·</span> B 买入 / S 卖出</span></div>
+      </div>
+      <aside class="panel execution" aria-labelledby="executionTitle">
+        <div class="panel-head"><div><div class="kicker">EXECUTION</div><h2 id="executionTitle">执行控制</h2></div><span class="lock-badge">LIMIT / BBO</span></div>
+        <div class="mode-box" id="modeBox"><span class="mode-icon" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none"><path d="m10 2 6 2.5v5c0 4-6 7-6 7s-6-3-6-7v-5L10 2Z" stroke="currentColor" stroke-width="1.3"/><path d="m7 9 2 2 4-4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></span><div><strong id="modeTitle">模拟模式</strong><p id="modeText">不会向交易所发送订单。</p></div></div>
+        <div class="field"><label for="quantityPreset">每腿数量 <span>BTC</span></label><div class="quantity-row"><select id="quantityPreset" aria-label="每腿数量预设"><option value="0.01">0.01</option><option value="0.05">0.05</option><option value="0.1">0.10</option><option value="0.25">0.25</option><option value="0.5">0.50</option><option value="1" selected>1.00</option><option value="custom">自定义</option></select><input id="quantity" aria-label="自定义每腿数量" type="number" min="0.01" step="0.01" value="1" /></div><small class="field-hint">调整数量后，自动重算保证金与交易成本。</small></div>
+        <label class="confirm"><input id="confirm" type="checkbox" /><span>我已核对四腿、报价和风险上限</span></label>
+        <button id="openTrade" class="button primary">模拟开仓四腿</button><button id="closeTrade" class="button close-button">模拟平仓四腿</button>
+        <p class="microcopy">发送交易所订单前需要明确确认。四腿分别执行，成交进度可能不同。</p>
+        <div class="schedule"><span>计划开仓 <small>FRIDAY ENTRY</small></span><strong id="nextOpen">周五 21:00 UTC</strong></div>
+      </aside>
+    </section>
+    <section class="bottom-grid" aria-label="策略与活动">
+      <div class="panel strategy-panel">
+        <div class="panel-head"><div><div class="kicker">02 / STRATEGY</div><h2>组合结构</h2></div><span class="muted">双侧卖出 · 远端保护</span></div>
+        <div id="legs" class="legs"></div>
+        <div class="payoff"><div class="payoff-title"><span>到期盈亏曲线 <small>USD</small></span><span class="muted">按当前报价估算</span></div><div class="payoff-chart-wrap"><canvas id="payoffChart" aria-label="到期盈亏曲线，非当前持仓浮动盈亏"></canvas></div><div id="payoffStats" class="payoff-stats"></div></div>
+      </div>
+      <div class="panel activity-panel">
+        <div class="panel-head"><div><div class="kicker">ACTIVITY</div><h2>仓位与事件</h2></div><button id="reloadPositions" class="link-button">刷新 ↗</button></div>
+        <div class="subhead">当前仓位<span>POSITIONS</span></div><div id="positions" class="positions empty">暂无持仓</div>
+        <div class="subhead log-title">系统日志<span>EVENT LOG</span></div><div id="logs" class="logs"></div>
+        <div class="subhead log-title">成交与手续费<span>FILLS</span></div><div id="executions" class="executions empty">暂无成交记录</div>
+      </div>
+    </section>
+    <section class="panel position-payoff-panel" id="position-payoff" aria-labelledby="positionPayoffTitle">
+      <div class="panel-head"><div><div class="kicker">POSITION / EXPIRY PAYOFF</div><h2 id="positionPayoffTitle">持仓到期盈亏<span class="heading-detail">当前所处阶段</span></h2></div><span id="positionPayoffCount" class="source-tag">等待同步</span></div>
+      <div id="positionPayoffContent"><div class="empty">等待持仓同步…</div></div>
+      <p class="pp-note">假设当前剩余持仓持有至到期，按开仓均价计算；不含交易与交割手续费、已平仓盈亏。不同到期日、结算币种分别展示。现价标记表示“若以此价格到期”的情景，实际交割以结算价为准。<a href="https://www.bybit.com/en/help-center/article/P-L-Calculations-Options" target="_blank" rel="noopener noreferrer">计算口径 ↗</a></p>
+    </section>
+    <section class="health panel" id="account" aria-labelledby="healthTitle">
+      <div class="health-head"><div><div class="kicker">03 / ACCOUNT</div><h2 id="healthTitle">账户保证金健康度</h2></div><span id="healthMode" class="source-tag">未连接账户</span></div>
+      <div id="healthUnavailable" class="health-unavailable">连接账户后，将显示余额、保证金和风险指标。</div>
+      <div id="healthContent" class="health-content" style="display:none">
+        <div class="health-metric"><div><span>初始保证金率</span><b id="imRate">--</b></div><div class="progress"><i id="imBar"></i></div></div>
+        <div class="health-metric"><div><span>维护保证金率</span><b id="mmRate">--</b></div><div class="progress danger"><i id="mmBar"></i></div></div>
+        <div class="health-values"><div><span>可用余额</span><strong id="availableBalance">--</strong></div><div><span>保证金余额</span><strong id="marginBalance">--</strong></div><div><span>总权益</span><strong id="totalEquity">--</strong></div><div><span>账户模式</span><strong id="accountMode">--</strong></div></div>
+      </div>
+    </section>
+    <section class="panel rfq-panel" id="rfq" aria-labelledby="rfqTitle">
+      <div class="panel-head"><div><div class="kicker">04 / BLOCK TRADING</div><h2 id="rfqTitle">组合询价<span class="heading-detail">RFQ</span></h2></div><span id="rfqStatus" class="source-tag">未创建</span></div>
+      <div class="rfq-controls"><p>向可用做市商发送四腿组合询价<span>比较整组报价，再确认执行。</span></p><input id="rfqCounterparties" type="hidden" /><button id="rfqCreate" class="button ghost">创建 RFQ ↗</button><button id="rfqCancel" class="button close-button">取消询价</button></div>
+      <div class="rfq-meta"><span>询价 ID <b id="rfqId">--</b></span><span>类型 <b id="rfqType">--</b></span><span>有效期 <b id="rfqExpires">--</b></span><span>报价数 <b id="rfqQuoteCount">0</b></span></div>
+      <div id="rfqQuotes" class="rfq-quotes empty">暂无报价</div>
+    </section>
+    <footer class="page-footer"><span>CONDOR<span class="brand-dot">.</span><small>BTC OPTIONS WORKSPACE</small></span><span>周五开仓 <span class="text-divider">/</span> 周日到期 <span class="text-divider">/</span> UTC</span><a href="#overview">返回顶部 ↑</a></footer>
   </main>
-  <section class="panel rfq-panel"><div class="panel-head"><div><div class="kicker">RFQ COMBINATION</div><h2>组合询价</h2></div><span id="rfqStatus" class="source-tag">未创建</span></div><div class="rfq-controls"><input id="rfqCounterparties" type="text" placeholder="做市商 deskCode，逗号分隔" /><button id="rfqCreate" class="button ghost">创建 RFQ</button><button id="rfqCancel" class="button close-button">取消 RFQ</button></div><div class="rfq-meta"><span>RFQ ID <b id="rfqId">--</b></span><span>有效期 <b id="rfqExpires">--</b></span><span>报价数 <b id="rfqQuoteCount">0</b></span></div><div id="rfqQuotes" class="rfq-quotes empty">暂无报价</div></section>
-  <script src="/static/app.js?v=20260903-8"></script>
+  <aside id="notice" class="notice" role="status" aria-live="polite" aria-atomic="true" hidden><div><strong id="noticeTitle">操作结果</strong><button id="dismissNotice" class="notice-dismiss" aria-label="关闭操作提示">×</button></div><p id="noticeText"></p></aside>
+  <script src="/static/position-payoff.js?v=20260908-2"></script>
+  <script src="/static/app.js?v=20260908-2"></script>
 </body>
 </html>

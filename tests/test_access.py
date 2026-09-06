@@ -89,6 +89,17 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValidationError):
             Settings(_env_file=None, dashboard_password="short")
 
+    async def test_dashboard_marks_failed_position_refresh_unavailable(self):
+        from app.main import _build_account_dashboard
+        from app.models import AccountHealth
+
+        with patch("app.main.engine.load_positions", new=AsyncMock(side_effect=RuntimeError("offline"))), patch("app.main.engine.load_account_health", new=AsyncMock(return_value=AccountHealth())), patch("app.main.engine.load_recent_executions", new=AsyncMock(return_value=[])), patch("app.main.engine.positions", []):
+            payload = await _build_account_dashboard()
+            self.assertFalse(payload["positions"]["available"])
+        with patch("app.main.engine.load_positions", new=AsyncMock(return_value=[])), patch("app.main.engine.load_account_health", new=AsyncMock(return_value=AccountHealth())), patch("app.main.engine.load_recent_executions", new=AsyncMock(return_value=[])):
+            payload = await _build_account_dashboard()
+            self.assertTrue(payload["positions"]["available"])
+
 
 class CacheTests(unittest.IsolatedAsyncioTestCase):
     async def test_cached_payloads_are_isolated_and_expire(self):
