@@ -1,0 +1,4 @@
+include uv.lock
+include .env.example
+include REVIEW.md
+recursive-include tests *.py *.cjs

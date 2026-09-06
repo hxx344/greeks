@@ -1,15 +1,14 @@
 # BTC Options Iron Condor
 
-一个带可视化面板的 Bybit BTC 期权 Iron Condor 系统。默认是 `dry-run`：会读取 Bybit 主网公开行情、计算选腿并记录模拟订单，但不会发送真实订单。`BYBIT_TESTNET` 只控制私有仓位和下单 API。
+一个带可视化面板的 Bybit BTC 期权 Iron Condor 系统。默认是 `dry-run`：读取 Bybit 主网公开行情、计算选腿并记录模拟订单。显式设置 `TRADING_MODE=testnet` 后，行情、合约、账户和下单均使用测试网；`TRADING_MODE=live` 使用主网，并仍要求 `LIVE_TRADING=true`。
 
 ## 启动
 
 ```powershell
-py -m venv .venv
-.\\.venv\\Scripts\\Activate.ps1
-pip install -e .
+py -m pip install uv==0.12.10
+uv sync --locked
 Copy-Item .env.example .env
-uvicorn app.main:app --reload
+uv run --locked uvicorn app.main:app --reload
 ```
 
 打开 http://127.0.0.1:8000 。
@@ -33,7 +32,7 @@ uvicorn app.main:app --reload
 * `.env` 中 `LIVE_TRADING=true`
 * `BYBIT_API_KEY` 和 `BYBIT_API_SECRET` 已设置
 * 请求体中的 `confirm_live=true`
-* `BYBIT_TESTNET=false`（建议先使用测试网）
+* `TRADING_MODE=live`；未设置新模式时，兼容旧配置 `BYBIT_TESTNET=false`
 
 默认风险上限为 `MAX_RISK_USD=2500`。策略采用固定周历：仅允许 UTC 周五实盘开仓，四条腿必须属于同一个 UTC 周日到期日；`TARGET_DTE_DAYS` 仅为旧配置兼容项，不再用于滚动选择“开仓后两天”的合约。
 开仓同时检查预估最大亏损与保证金，两者均不得超过风险上限。实盘开仓与 RFQ 执行要求行情不超过 `QUOTE_STALE_SECONDS`；启用实盘后，未明确确认的开平仓请求会被拒绝。
@@ -66,9 +65,38 @@ Bybit 非 VIP 期权基础费率：Taker 0.03%、Maker 0.02%；单笔交易手�
 安装项目依赖后运行：
 
 ```bash
-python -m unittest discover -s tests -v
+uv run --locked python -m unittest discover -s tests -t . -v
 node tests/test_dashboard.cjs
 node --check app/static/app.js
 ```
 
 测试使用模拟行情、模拟交易所响应和临时状态文件，不会发出真实订单。前端测试使用 Node.js 内置测试框架验证订单结果提示、执行中按钮状态和数量变更后的请求合并，不需要安装 npm 依赖。
+
+
+## 模式、恢复与可复现构建
+
+新模式优先于旧开关。未设置 `TRADING_MODE` 的现有配置保持旧行为：只有 `LIVE_TRADING=true`、`BYBIT_TESTNET=false` 和有效凭据同时存在才允许主网订单，旧测试网配置不会因为升级自动开始下单。`TRADING_MODE=dry-run` 永远模拟；模拟时 `BYBIT_TESTNET` 仍选择账户查询/RFQ 询价使用的网络，公开行情来自主网。RFQ 询价本身需要凭据，其执行仍受交易模式限制。
+
+测试网配置示例（填写测试网专用凭据）：
+
+```dotenv
+TRADING_MODE=testnet
+LIVE_TRADING=false
+BYBIT_TESTNET=true
+STATE_FILE=data/testnet_state.json
+AUTO_OPEN=false
+```
+
+测试网普通开平仓和 RFQ 执行也要求请求中的 `confirm_live=true`，前端勾选确认框后发送。该字段名为兼容保留；响应 `orders_submitted` 表示进入交易所订单流程，`live` 只表示主网，具体是否成交仍以各腿状态为准。周五开仓、周日到期与风险限制在测试网同样适用。测试网缺少策略合约时继续等待，不使用主网合约代替。
+
+主网使用 `TRADING_MODE=live`、`LIVE_TRADING=true` 和主网凭据。每个网络使用独立状态文件；新状态保存 `exchange_network`，加载不同网络的状态会阻止交易。含交易记录但尚未标记网络的旧状态不会被新测试网模式直接接管。现有 `.env` 和交易状态不会由安装或测试修改。
+
+`RECONCILIATION_SECONDS` 默认 15 秒。后台在启动后自动核对未决单腿订单、RFQ 和已有策略，即使没有打开页面也继续工作。对账与下单共用同一把锁，执行中的订单不会被后台误撤。失败后在后续周期继续核对；状态文件故障时停止交易状态更新。`/api/health` 返回未决订单数量、RFQ 是否未决、最长等待秒数、最近成功时间和对账错误；旧记录缺少创建时间时，等待时长从本次启动计算。对账持续失败或长时间未成功时健康状态为 `degraded`。
+
+普通开仓、RFQ 执行和新建询价均不能绕过未决 RFQ。创建、执行及取消意图在请求前落盘；响应丢失后保留询价 ID、关联 ID、选中报价和四腿信息。后台按身份查询实时记录，缺失时查询历史；不能从账户出现同名四腿推断 RFQ 已成交。取消应答不会直接清除询价记录。接口依据：[RFQ 实时记录](https://bybit-exchange.github.io/docs/v5/rfq/trade/rfq-realtime)、[RFQ 历史](https://bybit-exchange.github.io/docs/v5/rfq/trade/rfq-list)。
+
+策略到期结算或在交易所外部平仓后，系统要求完整仓位查询中对应方向归零，并取得本次开仓之后、同合约同方向且数量足够的平仓记录，再次查询仓位确认后才清理对应本地腿。证据随策略归档，重启后不会重新恢复已归档策略。历史记录延迟、缺少开仓时间、错误分页或证据不充分时保留跟踪，并显示对账原因；不会仅凭空仓响应或到期日删除跟踪。自动历史查询按最多七天的窗口分页，最多回溯 180 天；具体交割或外部平仓信息保存在返回的证据字段中。接口依据：[已平仓期权记录](https://bybit-exchange.github.io/docs/v5/position/close-position)。
+
+依赖版本和下载哈希保存在 `uv.lock`，安装使用 `uv sync --locked`。`uv build` 生成包含页面静态文件的 wheel 与源码包。GitHub Actions 已配置 Windows/Linux、Python 3.11/3.13 的依赖校验、后端测试、前端测试与打包。建议按上面的 `-t .` 命令运行测试，以启用 HTTP 网络隔离；测试使用模拟交易所响应，不访问真实账户。
+
+RFQ 生命周期拆分到 `app/rfq.py`，订单恢复与仓位归档拆分到 `app/reconciliation.py`；它们通过 mixin 共用引擎状态和事务锁，保留原有调用接口。

@@ -10,6 +10,16 @@ dependencies = [
   "pydantic-settings>=2.5.0",
 ]
 
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.setuptools.package-data]
+app = ["static/*.html", "static/*.css", "static/*.js"]
+
 [tool.uvicorn]
 factory = false
 host = "0.0.0.0"

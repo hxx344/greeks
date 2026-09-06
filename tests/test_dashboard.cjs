@@ -75,6 +75,33 @@ test('quantity changes during a request coalesce into a fresh request', async ()
   assert.match(pending[1].url, /quantity=0.03/);
 });
 
+test('testnet mode requires confirmation and reports exchange fills as testnet', async () => {
+  const {context, element, pending} = dashboard();
+  const payload = marketPayload(false);
+  Object.assign(payload.config, {environment: 'testnet', live_enabled: false, trading_enabled: true, market_testnet: true});
+  pending[0].resolve({ok: true, text: async () => JSON.stringify(payload)});
+  await new Promise(setImmediate);
+  assert.equal(element('modeTitle').textContent, '测试网模式已启用');
+  assert.equal(element('environment').textContent, 'TESTNET');
+  assert.match(element('statusSub').textContent, /测试网行情/);
+  assert.equal(element('openTrade').disabled, true);
+  element('confirm').checked = true;
+  context.updateTradeControls();
+  assert.equal(element('openTrade').disabled, false);
+  assert.match(context.tradeResultMessage({live: false, orders_submitted: true, environment: 'testnet', results: [{status: 'filled'}]}, '开仓'), /测试网开仓订单已全部成交/);
+});
+
+test('unresolved RFQ disables ordinary opening and new inquiries', async () => {
+  const {context, element, pending} = dashboard();
+  const payload = marketPayload(false);
+  payload.config.opening_blocked_reason = 'Unresolved RFQ';
+  element('confirm').checked = true;
+  pending[0].resolve({ok: true, text: async () => JSON.stringify(payload)});
+  await new Promise(setImmediate);
+  assert.equal(element('openTrade').disabled, true);
+  assert.equal(element('rfqCreate').disabled, true);
+});
+
 function execution(id, second, side, qty, price, fee, close = false, extra = {}) {
   return {exec_id: id, exec_time: `2026-09-04T12:00:${String(second).padStart(2, '0')}Z`,
     symbol: 'BTC-OPTION', side, exec_qty: qty, exec_price: price, exec_fee: fee,

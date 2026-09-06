@@ -7,19 +7,21 @@ from math import isclose, isfinite
 from pathlib import Path
 from uuid import uuid4
 
-from .bybit import BybitClient, BybitError
+from .bybit import BybitClient
 from .config import Settings
-from .models import AccountHealth, CloseRequest, ExecutionRecord, LogEntry, OpenRequest, OrderResult, Position, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest, StrategyPreview
+from .models import AccountHealth, CloseRequest, ExecutionRecord, LogEntry, OpenRequest, OrderResult, Position, StrategyPreview
 from .strategy import build_iron_condor
 from .orders import OrderExecutor
 from .state import EngineState
 from .risk import maximum_loss
+from .rfq import RfqMixin
+from .reconciliation import ReconciliationMixin
 
 
-class TradingEngine:
+class TradingEngine(RfqMixin, ReconciliationMixin):
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.client = BybitClient(settings.bybit_api_key, settings.bybit_api_secret, settings.bybit_testnet, settings.recv_window_ms)
+        self.client = BybitClient(settings.bybit_api_key, settings.bybit_api_secret, settings.private_testnet, settings.recv_window_ms, market_testnet=settings.environment == "testnet")
         self.chain = []
         self.chain_source = "demo"
         self.chain_updated_at: datetime | None = None
@@ -40,6 +42,9 @@ class TradingEngine:
         self.pm_baseline: dict = {}
         self.order_journal: dict[str, dict] = {}
         self.state_error: str | None = None
+        self.reconciliation_last_success = None
+        self.reconciliation_error = None
+        self.reconciliation_started_at = datetime.now(timezone.utc)
         self._load_state()
         self.account_health = AccountHealth(available=False, message="Live account credentials are not configured")
         self.last_executions: list[ExecutionRecord] = []
@@ -53,6 +58,13 @@ class TradingEngine:
                 raise ValueError(f"Invalid JSON number: {value}")
             parsed = json.loads(Path(self.settings.state_file).read_text(encoding="utf-8"), parse_constant=reject_constant)
             state = EngineState.model_validate(parsed).model_dump()
+            network = "testnet" if self.settings.private_testnet else "mainnet"
+            recorded_network = state.get("exchange_network")
+            has_trades = bool(state.get("order_journal") or state.get("active_strategy_symbols") or state.get("rfq_state"))
+            if recorded_network and recorded_network != network:
+                raise ValueError("State belongs to another exchange network")
+            if not recorded_network and has_trades and self.settings.environment == "testnet":
+                raise ValueError("Legacy trading state cannot be adopted by testnet")
             self.last_open_week = state.get("last_open_week")
             self.active_strategy_symbols = set(state.get("active_strategy_symbols", []))
             self.active_strategy_sizes = {key: float(value) for key, value in (state.get("active_strategy_sizes") or {}).items()}
@@ -78,7 +90,7 @@ class TradingEngine:
         target = Path(self.settings.state_file)
         temp = None
         try:
-            state = EngineState(last_open_week=self.last_open_week, active_strategy_symbols=sorted(self.active_strategy_symbols),
+            state = EngineState(exchange_network="testnet" if self.settings.private_testnet else "mainnet", last_open_week=self.last_open_week, active_strategy_symbols=sorted(self.active_strategy_symbols),
                                 active_strategy_sizes=self.active_strategy_sizes, active_strategy_group_id=self.active_strategy_group_id,
                                 rfq_state=self.rfq_state, execution_groups=self.execution_groups, execution_group_links=self.execution_group_links,
                                 pm_baseline=self.pm_baseline, order_journal=self.order_journal)
@@ -262,7 +274,7 @@ class TradingEngine:
         if link in self.order_journal:
             raise ValueError("Order link has already been used; reconcile it instead of resubmitting")
         self.order_journal[link] = {"symbol": leg.symbol, "side": leg.side, "qty": qty,
-                                    "reduce_only": reduce_only, "status": "unknown", "terminal": False, "filledQty": 0.0}
+                                    "reduce_only": reduce_only, "status": "unknown", "terminal": False, "filledQty": 0.0, "created_at": datetime.now(timezone.utc).isoformat()}
         self._save_state()
         executor = OrderExecutor(self.client, self.settings, self.log)
         guard = None if reduce_only else lambda price: self._reserve_execution_price(link, leg.symbol, price)
@@ -298,31 +310,25 @@ class TradingEngine:
     async def follow_bbo_order(self, leg, qty: float, order_link_id: str, reduce_only: bool = False) -> dict:
         return await self._execute_order(leg, qty, order_link_id, reduce_only)
 
-    async def _reconcile_pending_orders(self) -> None:
-        executor = OrderExecutor(self.client, self.settings, self.log)
-        async def reconcile(link, entry):
-            outcome = await executor.reconcile(entry["symbol"], entry["side"], entry["qty"], link, entry)
-            self._record_order(link, outcome)
-        await asyncio.gather(*(reconcile(link, dict(entry)) for link, entry in list(self.order_journal.items()) if not entry.get("terminal")))
-        if any(not entry.get("terminal") for entry in self.order_journal.values()):
-            raise ValueError("Unresolved orders remain; verify exchange orders before trading again")
-
     async def open_position(self, request: OpenRequest, scheduled: bool = False) -> list[OrderResult]:
         async with self.lock:
             self._require_trading_state()
-            if self.settings.can_trade_live and not request.confirm_live:
+            if self.settings.can_send_orders and not request.confirm_live:
                 raise ValueError("Live opening requires explicit confirmation")
             qty = request.quantity or self.settings.leg_qty
             preview = await self.make_preview(qty)
-            live = bool(request.confirm_live and self.settings.can_trade_live)
+            live = bool(request.confirm_live and self.settings.can_send_orders)
             if live:
+                self._require_resolved_rfq()
                 await self._reconcile_pending_orders()
+                if self.active_strategy_symbols:
+                    await self._sync_positions()
                 if self.active_strategy_symbols:
                     raise ValueError("Close the tracked strategy before opening another")
                 self._validate_open_calendar(preview.expiry)
             if live and scheduled and not self.is_open_window():
                 raise ValueError(f"Live orders are only allowed during Friday {self.settings.open_hour_utc:02d}:{self.settings.open_minute_utc:02d} UTC window")
-            if request.confirm_live and not self.settings.can_trade_live:
+            if request.confirm_live and not self.settings.can_send_orders:
                 self.log("WARNING", "Live confirmation received but live trading is disabled; using dry-run")
             if qty <= 0:
                 raise ValueError("Quantity must be greater than zero")
@@ -428,254 +434,6 @@ class TradingEngine:
             result.message = replacement.get("message")
             self.log("WARNING", f"Market fallback for {leg.symbol}: requested only remaining quantity {remaining}")
 
-    async def create_rfq(self, request: RfqCreateRequest) -> dict:
-        async with self.lock:
-            return await self._create_rfq(request)
-
-    async def _create_rfq(self, request: RfqCreateRequest) -> dict:
-        self._require_trading_state()
-        if self.rfq_state.get("rfq_id") and self.rfq_state.get("status") not in {"Canceled", "Expired", "Filled", "Failed"}:
-            raise ValueError("An RFQ is already active; resolve it before creating another")
-        if not self.settings.bybit_api_key or not self.settings.bybit_api_secret:
-            raise ValueError("Bybit API credentials are not configured")
-        counterparties = list(request.counterparties)
-        rfq_config = {}
-        try:
-            rfq_config = await self.client.rfq_config()
-        except Exception as exc:
-            if not counterparties:
-                raise
-            self.log("WARNING", f"Could not load RFQ config; using specified counterparties: {exc}")
-        strategy_type = "custom"
-        for item in rfq_config.get("strategyTypes") or []:
-            name = str(item.get("strategyName", "") if isinstance(item, dict) else item)
-            normalized = name.replace(" ", "").replace("_", "").lower()
-            if "ironcondor" in normalized:
-                strategy_type = name
-                break
-        if not counterparties:
-            available = rfq_config.get("counterparties") or []
-            counterparties = [item.get("deskCode") if isinstance(item, dict) else str(item) for item in available]
-            counterparties = [item for item in counterparties if item]
-            max_lp = int(rfq_config.get("maxLP") or len(counterparties) or 0)
-            counterparties = counterparties[:max_lp] if max_lp else counterparties
-        if not counterparties:
-            raise ValueError("Bybit returned no available RFQ counterparties")
-        preview = await self.make_preview(request.quantity or self.settings.leg_qty)
-        self._validate_market_snapshot()
-        self._validate_risk(preview)
-        qty = request.quantity or self.settings.leg_qty
-        legs = [{"category": "option", "symbol": leg.symbol, "side": leg.side, "qty": str(qty)} for leg in preview.legs]
-        # Bybit RFQ link IDs allow letters and numbers only.
-        rfq_link_id = f"icrfq{uuid4().hex[:16]}"
-        result = await self.client.create_rfq(counterparties, legs, rfq_link_id, strategy_type)
-        self.rfq_state = {"rfq_id": result.get("rfqId", ""), "rfq_link_id": result.get("rfqLinkId", rfq_link_id), "strategy_type": strategy_type, "status": result.get("status", "Active"), "expires_at": result.get("expiresAt"), "counterparties": counterparties, "legs": legs, "quotes": [], "updated_at": datetime.now(timezone.utc).isoformat()}
-        self._save_state()
-        self.log("INFO", f"RFQ created: {self.rfq_state['rfq_id']}")
-        return self.rfq_state
-
-    async def refresh_rfq(self) -> dict:
-        async with self.lock:
-            return await self._refresh_rfq()
-
-    async def _refresh_rfq(self) -> dict:
-        self._require_trading_state()
-        if not self.rfq_state.get("rfq_id"):
-            return self.rfq_state
-        rfq_id = self.rfq_state["rfq_id"]
-        rfqs, quotes = await asyncio.gather(self.client.rfq_realtime(rfq_id), self.client.quote_realtime(rfq_id))
-        if rfqs:
-            self.rfq_state.update({"status": rfqs[0].get("status", self.rfq_state.get("status")), "expires_at": rfqs[0].get("expiresAt", self.rfq_state.get("expires_at"))})
-        if self.rfq_state.get("status") == "Filled":
-            self._track_filled_rfq()
-        self.rfq_state["quotes"] = quotes
-        self.rfq_state["updated_at"] = datetime.now(timezone.utc).isoformat()
-        self._save_state()
-        return self.rfq_state
-
-    async def execute_rfq(self, request: RfqExecuteRequest) -> dict:
-        async with self.lock:
-            return await self._execute_rfq(request)
-
-    async def _execute_rfq(self, request: RfqExecuteRequest) -> dict:
-        self._require_trading_state()
-        if not self.settings.can_trade_live:
-            raise ValueError("Live trading is disabled")
-        if not request.confirm_live:
-            raise ValueError("RFQ execution requires explicit confirmation")
-        if request.quote_side != "Sell":
-            raise ValueError("This Iron Condor workflow only accepts the Sell quote direction")
-        if request.rfq_id != self.rfq_state.get("rfq_id"):
-            raise ValueError("RFQ is not the active inquiry")
-        if self.rfq_state.get("selected_quote_id") or self.rfq_state.get("status") in {"Filled", "PendingFill", "Canceled", "Expired", "Failed", "ExecutionUnknown"}:
-            raise ValueError("RFQ is no longer available for execution")
-        await self._reconcile_pending_orders()
-        if self.active_strategy_symbols:
-            raise ValueError("Close the tracked strategy before opening another")
-        await self.refresh_chain()
-        self._validate_market_snapshot()
-        self._validate_rfq_quote(request)
-        await self._capture_pm_baseline("rfq_open")
-        self._validate_market_snapshot()
-        self._validate_rfq_quote(request)
-        # Persist the intent before submitting: an ambiguous network failure
-        # must not permit a second execution of the same inquiry.
-        self.rfq_state.update({"status": "ExecutionUnknown", "selected_quote_id": request.quote_id, "selected_quote_side": request.quote_side})
-        self._save_state()
-        result = await self.client.execute_quote(request.rfq_id, request.quote_id, request.quote_side)
-        self.rfq_state.update({"status": result.get("status", "PendingFill"), "selected_quote_id": request.quote_id, "selected_quote_side": request.quote_side, "updated_at": datetime.now(timezone.utc).isoformat()})
-        self._save_state()
-        self.log("INFO", f"RFQ quote execution submitted: {request.quote_id}")
-        return {**self.rfq_state, "execution": result}
-
-    def _validate_rfq_quote(self, request: RfqExecuteRequest) -> None:
-        quote = next((item for item in self.rfq_state.get("quotes", []) if item.get("quoteId") == request.quote_id), None)
-        if quote is None:
-            raise ValueError("Quote is not available or has expired")
-        now_ms = datetime.now(timezone.utc).timestamp() * 1000
-        for deadline in (quote.get("expiresAt"), self.rfq_state.get("expires_at")):
-            if deadline not in (None, ""):
-                expiry_ms = float(deadline)
-                if not isfinite(expiry_ms) or expiry_ms <= now_ms:
-                    raise ValueError("Quote is not available or has expired")
-        legs = self.rfq_state.get("legs") or []
-        quoted_legs = quote.get("quoteSellList") or []
-        requested = {leg.get("symbol"): leg for leg in legs}
-        quoted = {leg.get("symbol"): leg for leg in quoted_legs}
-        if len(legs) != 4 or len(requested) != 4 or len(quoted_legs) != 4 or set(requested) != set(quoted):
-            raise ValueError("Quote must cover exactly the four requested legs")
-        for symbol, leg in requested.items():
-            quantity = float(quoted[symbol].get("qty", 0) or 0)
-            price = float(quoted[symbol].get("price", 0) or 0)
-            if not isfinite(quantity) or quantity <= 0 or not isclose(quantity, float(leg["qty"]), rel_tol=0, abs_tol=1e-9) or not isfinite(price) or price <= 0:
-                raise ValueError("Quote has an invalid price or mismatched quantity")
-        instruments = {item.symbol: item for item in self.chain if item.symbol in requested}
-        if set(instruments) != set(requested):
-            raise ValueError("RFQ instruments are missing from market data")
-        roles = {(instruments[symbol].option_type, leg.get("side")): instruments[symbol].strike for symbol, leg in requested.items()}
-        if set(roles) != {("Call", "Buy"), ("Call", "Sell"), ("Put", "Buy"), ("Put", "Sell")} or len({float(leg["qty"]) for leg in legs}) != 1:
-            raise ValueError("RFQ must contain four balanced Iron Condor legs")
-        if not roles[("Put", "Buy")] < roles[("Put", "Sell")] < roles[("Call", "Sell")] < roles[("Call", "Buy")]:
-            raise ValueError("RFQ Iron Condor strikes are not ordered correctly")
-        expiries = {item.expiry for item in instruments.values()}
-        if len(expiries) != 1:
-            raise ValueError("RFQ legs must resolve to one common expiry")
-        self._validate_open_calendar(expiries.pop())
-        # A piecewise-linear expiry payoff reaches its minimum at a strike
-        # or an outer boundary. Evaluate the actual quoted legs and prices.
-        credit = sum((1 if leg["side"] == "Sell" else -1) * float(quoted[symbol]["price"]) * float(leg["qty"]) for symbol, leg in requested.items())
-        payoffs = []
-        for spot in [0.0, *(item.strike for item in instruments.values())]:
-            payoff = credit
-            for symbol, leg in requested.items():
-                item = instruments[symbol]
-                intrinsic = max(spot - item.strike, 0) if item.option_type == "Call" else max(item.strike - spot, 0)
-                payoff += (1 if leg["side"] == "Buy" else -1) * intrinsic * float(leg["qty"])
-            payoffs.append(payoff)
-        if max(0.0, -min(payoffs)) > self.settings.max_risk_usd:
-            raise ValueError("RFQ quote exceeds the maximum loss limit")
-
-    def _track_filled_rfq(self, positions: list[Position] | None = None) -> bool:
-        self._require_trading_state()
-        group_id = f"rfq:{self.rfq_state.get('rfq_id', '')}"
-        if self.rfq_state.get("tracking_applied"):
-            return False
-        # Migrate existing tracking without restoring the original quantity
-        # after a partial or complete close, including older state files.
-        already_tracked = self.active_strategy_group_id == group_id or any(
-            group.get("type") == "close" and group.get("opening_group") == group_id
-            for group in self.execution_groups.values()
-        )
-        if already_tracked:
-            self.rfq_state["tracking_applied"] = True
-            self._save_state()
-            return False
-        if self.execution_groups.get(self.active_strategy_group_id, {}).get("order_tracking"):
-            return False
-        legs = self.rfq_state.get("legs") or []
-        execution_submitted = bool(self.rfq_state.get("selected_quote_id")) or self.rfq_state.get("status") == "Filled"
-        if not execution_submitted or len(legs) != 4 or len({leg.get("symbol") for leg in legs}) != 4:
-            return False
-        position_map = {(position.symbol, position.side): position for position in (positions or []) if position.size > 0}
-        if positions is not None and any((leg.get("symbol"), leg.get("side")) not in position_map for leg in legs):
-            return False
-        sizes: dict[str, float] = {}
-        for leg in legs:
-            symbol = str(leg.get("symbol", ""))
-            side = str(leg.get("side", ""))
-            requested_qty = float(leg.get("qty", 0) or 0)
-            if not symbol or side not in {"Buy", "Sell"} or requested_qty <= 0:
-                return False
-            tracked_qty = min(requested_qty, position_map[(symbol, side)].size) if positions is not None else requested_qty
-            sizes[f"{symbol}|{side}"] = tracked_qty
-        self.active_strategy_symbols = {str(leg["symbol"]) for leg in legs}
-        self.active_strategy_sizes = sizes
-        self.active_strategy_group_id = f"rfq:{self.rfq_state.get('rfq_id', '')}"
-        self.rfq_state["tracking_applied"] = True
-        self._save_state()
-        return True
-
-    def _recover_tracked_open_positions(self, positions: list[Position]) -> bool:
-        if self.execution_groups.get(self.active_strategy_group_id, {}).get("order_tracking"):
-            return False
-        position_map = {(position.symbol, position.side): position for position in positions if position.size > 0}
-        candidates: list[tuple[str, str, list[dict]]] = []
-        for group_id, group in self.execution_groups.items():
-            if group.get("type") != "open" or group.get("status") == "closed" or group.get("order_tracking"):
-                continue
-            legs = [{"symbol": symbol, **details} for symbol, details in (group.get("legs") or {}).items()]
-            candidates.append((str(group.get("created_at", "")), group_id, legs))
-        execution_groups: dict[str, dict[tuple[str, str], float]] = {}
-        execution_times: dict[str, str] = {}
-        for execution in self.last_executions:
-            parts = execution.order_link_id.split("-")
-            if execution.reduce_only or len(parts) < 3 or parts[0] != "ic" or parts[1] in {"close", "mkt"}:
-                continue
-            group_id = execution.execution_group or parts[1]
-            if self.execution_groups.get(group_id, {}).get("order_tracking"):
-                continue
-            key = (execution.symbol, execution.side)
-            bucket = execution_groups.setdefault(group_id, {})
-            bucket[key] = bucket.get(key, 0.0) + execution.exec_qty
-            execution_times[group_id] = max(execution_times.get(group_id, ""), execution.exec_time.isoformat())
-        for group_id, legs in execution_groups.items():
-            candidates.append((execution_times.get(group_id, ""), group_id, [{"symbol": symbol, "side": side, "qty": qty} for (symbol, side), qty in legs.items()]))
-        for _, group_id, legs in sorted(candidates, reverse=True):
-            if len(legs) != 4 or len({leg.get("symbol") for leg in legs}) != 4:
-                continue
-            if any((leg.get("symbol"), leg.get("side")) not in position_map for leg in legs):
-                continue
-            sizes = {}
-            for leg in legs:
-                symbol, side = str(leg["symbol"]), str(leg["side"])
-                requested_qty = float(leg.get("qty", 0) or 0)
-                if requested_qty <= 0:
-                    break
-                sizes[f"{symbol}|{side}"] = min(requested_qty, position_map[(symbol, side)].size)
-            if len(sizes) != 4:
-                continue
-            self.active_strategy_symbols = {str(leg["symbol"]) for leg in legs}
-            self.active_strategy_sizes = sizes
-            self.active_strategy_group_id = group_id
-            self._save_state()
-            return True
-        return False
-
-    async def cancel_rfq(self, request: RfqCancelRequest) -> dict:
-        async with self.lock:
-            return await self._cancel_rfq(request)
-
-    async def _cancel_rfq(self, request: RfqCancelRequest) -> dict:
-        self._require_trading_state()
-        if request.rfq_id != self.rfq_state.get("rfq_id"):
-            raise ValueError("RFQ is not the active inquiry")
-        result = await self.client.cancel_rfq(request.rfq_id)
-        canceled_id = request.rfq_id
-        self.rfq_state = {"status": "Canceled", "canceled_rfq_id": canceled_id, "quotes": [], "updated_at": datetime.now(timezone.utc).isoformat()}
-        self._save_state()
-        self.log("INFO", f"RFQ canceled: {canceled_id}")
-        return {**self.rfq_state, "cancellation": result}
-
     def _attach_execution_details(self, results: list[OrderResult]) -> None:
         by_link: dict[str, list[ExecutionRecord]] = {}
         for execution in self.last_executions:
@@ -745,13 +503,13 @@ class TradingEngine:
     async def close_position(self, request: CloseRequest) -> tuple[list[OrderResult], list[ExecutionRecord]]:
         async with self.lock:
             self._require_trading_state()
-            if self.settings.can_trade_live and not request.confirm_live:
+            if self.settings.can_send_orders and not request.confirm_live:
                 raise ValueError("Live closing requires explicit confirmation")
-            live = bool(request.confirm_live and self.settings.can_trade_live)
+            live = bool(request.confirm_live and self.settings.can_send_orders)
             if live:
                 await self._reconcile_pending_orders()
-                raw_positions = await self.client.positions()
-                current = [Position(symbol=item.get("symbol", ""), side=item.get("side", ""), size=float(item.get("size", 0) or 0), avg_price=float(item.get("avgPrice", 0) or 0), mark_price=float(item.get("markPrice", 0) or 0), unrealised_pnl=float(item.get("unrealisedPnl", 0) or 0), source="bybit") for item in raw_positions if float(item.get("size", 0) or 0) > 0]
+                self._require_resolved_rfq()
+                current = await self._sync_positions()
                 if len(self.active_strategy_symbols) < 4:
                     recovered = self._track_filled_rfq(current)
                     if not recovered:
@@ -815,7 +573,7 @@ class TradingEngine:
             if self.settings.auto_open and self.is_open_window(now) and self.last_open_week != week:
                 try:
                     await self.make_preview()
-                    await self.open_position(OpenRequest(confirm_live=self.settings.can_trade_live), scheduled=True)
+                    await self.open_position(OpenRequest(confirm_live=self.settings.can_send_orders), scheduled=True)
                 except Exception as exc:
                     self.log("ERROR", f"Scheduled open failed: {exc}")
             await asyncio.sleep(5)
@@ -829,23 +587,6 @@ class TradingEngine:
                 self.log("WARNING", f"Market refresh loop failed: {exc}")
             elapsed = asyncio.get_running_loop().time() - started
             await asyncio.sleep(max(0.1, self.settings.market_refresh_seconds - elapsed))
-
-    async def load_positions(self) -> list[Position]:
-        if self.settings.can_trade_live:
-            if not self.state_error and not self.lock.locked() and any(not entry.get("terminal") for entry in self.order_journal.values()):
-                async with self.lock:
-                    try:
-                        await self._reconcile_pending_orders()
-                    except ValueError as exc:
-                        self.log("WARNING", str(exc))
-            try:
-                raw = await self.client.positions()
-                self.positions = [Position(symbol=item.get("symbol", ""), side=item.get("side", ""), size=float(item.get("size", 0)), avg_price=float(item.get("avgPrice", 0) or 0), mark_price=float(item.get("markPrice", 0) or 0), unrealised_pnl=float(item.get("unrealisedPnl", 0) or 0), source="bybit") for item in raw if float(item.get("size", 0) or 0) > 0]
-                if not self.state_error and len(self.active_strategy_symbols) < 4 and (self._track_filled_rfq(self.positions) or self._recover_tracked_open_positions(self.positions)):
-                    self.log("INFO", "Recovered tracked Iron Condor legs from the opening task and current Bybit positions")
-            except BybitError as exc:
-                self.log("WARNING", f"Could not load private positions: {exc}")
-        return self.positions
 
     async def load_account_health(self) -> AccountHealth:
         if not self.settings.bybit_api_key or not self.settings.bybit_api_secret:

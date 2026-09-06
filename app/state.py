@@ -24,6 +24,7 @@ class JournalEntry(BaseModel):
 class EngineState(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", allow_inf_nan=False)
     schema_version: Literal[1] = 1
+    exchange_network: Literal["mainnet", "testnet"] | None = None
     last_open_week: str | None
     active_strategy_symbols: list[str]
     active_strategy_sizes: dict[str, float]

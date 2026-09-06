@@ -195,16 +195,16 @@ function tradeResultMessage(payload, action) {
   if (incomplete.length) {
     return `${action}尚未全部确认成交，请核对持仓：\n${incomplete.map((item) => `${item.symbol}：${item.status}${item.message ? `（${item.message}）` : ''}`).join('\n')}`;
   }
-  return payload.live ? `${action}订单已全部成交` : `模拟${action}已记录`;
+  return (payload.orders_submitted ?? payload.live) ? `${payload.environment === "testnet" ? "测试网" : ""}${action}订单已全部成交` : `模拟${action}已记录`;
 }
 function updateTradeControls() {
   const live = Boolean(window.__liveEnabled);
   const confirmed = $('confirm').checked;
   if (!$('openTrade').dataset.busy) $('openTrade').textContent = live ? '确认并开仓四腿' : '模拟开仓四腿';
   if (!$('closeTrade').dataset.busy) $('closeTrade').textContent = live ? '确认并平仓四腿' : '模拟平仓四腿';
-  if (!$('openTrade').dataset.busy) $('openTrade').disabled = Boolean(window.__tradingBlocked || window.__strategyUnavailable) || (live && !confirmed);
+  if (!$('openTrade').dataset.busy) $('openTrade').disabled = Boolean(window.__tradingBlocked || window.__openingBlocked || window.__strategyUnavailable) || (live && !confirmed);
   if (!$('closeTrade').dataset.busy) $('closeTrade').disabled = Boolean(window.__tradingBlocked) || (live && !confirmed);
-  $('rfqCreate').disabled = Boolean(window.__tradingBlocked || window.__strategyUnavailable);
+  $('rfqCreate').disabled = Boolean(window.__tradingBlocked || window.__openingBlocked || window.__strategyUnavailable);
 }
 function clearStrategyDisplay(message) {
   window.__latestPreview = null;
@@ -229,20 +229,23 @@ async function loadMarket() {
     const marketUrl = Number.isFinite(requestedQty) && requestedQty > 0 ? `/api/dashboard/market?quantity=${encodeURIComponent(requestedQty)}` : '/api/dashboard/market';
     const payload = await getJson(marketUrl);
     const {config, preview, chain} = payload;
-    window.__liveEnabled = config.live_enabled;
+    window.__liveEnabled = config.trading_enabled ?? config.live_enabled;
+    window.__openingBlocked = Boolean(config.opening_blocked_reason);
+    const enabled = window.__liveEnabled;
+    const modeLabel = config.environment === "testnet" ? "TESTNET" : (enabled ? "LIVE" : "MAINNET DATA / DRY");
     window.__tradingBlocked = Boolean(config.trading_blocked_reason);
     window.__strategyUnavailable = !preview;
     $('chainSource').textContent = chain.source.toUpperCase();
     $('refreshRate').textContent = config.market_refresh_seconds;
     $('nextOpen').textContent = config.open_time;
     $('riskSub').textContent = `风险上限 ${money(config.max_risk_usd)}`;
-    $('modeTitle').textContent = config.live_enabled ? '实盘模式已启用' : '模拟模式';
-    $('modeText').textContent = config.live_enabled ? '确认后将向 Bybit 发送 BBO 限价订单。' : '不会向交易所发送订单。';
+    $('modeTitle').textContent = enabled ? (config.environment === 'testnet' ? '测试网模式已启用' : '实盘模式已启用') : '模拟模式';
+    $('modeText').textContent = enabled ? (config.environment === 'testnet' ? '确认后将向 Bybit 测试网发送订单。' : '确认后将向 Bybit 主网发送 BBO 限价订单。') : '不会向交易所发送订单。';
     updateTradeControls();
     if (payload.status === 'waiting_for_listing') {
       clearStrategyDisplay('等待周日到期合约上线');
       $('btcPrice').textContent = chain.btc_price ? money(chain.btc_price) : '--';
-      $('environment').textContent = config.live_enabled ? 'LIVE' : 'MAINNET DATA / DRY';
+      $('environment').textContent = modeLabel;
       $('statusValue').textContent = config.trading_blocked_reason ? '交易已阻止' : '等待合约上线';
       $('statusSub').textContent = config.trading_blocked_reason || payload.message;
       $('updateText').textContent = '行情已连接 · 自动检查合约';
@@ -251,11 +254,11 @@ async function loadMarket() {
     }
     window.__latestPreview = preview;
     window.__latestChain = chain.items || []; $('btcPrice').textContent = preview.btc_price ? money(preview.btc_price) : '--';
-    $('environment').textContent = chain.source === 'bybit' ? (config.live_enabled ? 'LIVE' : 'MAINNET DATA / DRY') : 'UNAVAILABLE';
+    $('environment').textContent = chain.source === 'bybit' ? (modeLabel) : 'UNAVAILABLE';
     $('creditValue').textContent = money(preview.net_credit_usd); $('lossValue').textContent = money(preview.max_loss_usd); $('marginValue').textContent = money(preview.estimated_margin_usd); $('marginSub').textContent = preview.margin_mode === 'PORTFOLIO_MARGIN' ? 'PM 压力测试估算' : 'Bybit Order IM'; $('maintenanceValue').textContent = money(preview.estimated_maintenance_margin_usd); $('costValue').textContent = money(preview.estimated_trading_cost_usd); $('feeSub').textContent = `Taker ${(Number(preview.estimated_fee_rate) * 100).toFixed(3)}% · 单腿上限 ${(Number(preview.fee_cap_pct) * 100).toFixed(0)}%`; if ($('rrValue')) $('rrValue').textContent = `${preview.risk_reward}x`; $('riskSub').textContent = `风险上限 ${money(config.max_risk_usd)}`;
     const quoteTime = preview.market_timestamp ? new Date(preview.market_timestamp) : new Date(); const age = Math.max(0, Math.round((Date.now() - quoteTime.getTime()) / 1000));
-    $('statusValue').textContent = age > config.quote_stale_seconds ? '行情过期' : '策略就绪'; $('statusSub').textContent = `${chain.source === 'bybit' ? 'Bybit 主网行情' : '行情不可用'} · ${age}s 前`; $('expiry').textContent = `到期 ${new Date(preview.expiry).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit',timeZone:'UTC'})}`; renderChain(chain.items, preview); renderLegs(preview.legs); renderPayoff(preview); $('updateText').textContent = `行情 ${age}s · 每 ${config.market_refresh_seconds}s 更新`; $('updateDot').style.background = age > config.quote_stale_seconds ? '#ef8989' : '#d7f36b';
-    if (config.trading_blocked_reason) { $('statusValue').textContent = '交易已阻止'; $('statusSub').textContent = config.trading_blocked_reason; }
+    $('statusValue').textContent = age > config.quote_stale_seconds ? '行情过期' : '策略就绪'; $('statusSub').textContent = `${chain.source === 'bybit' ? (config.market_testnet ? 'Bybit 测试网行情' : 'Bybit 主网行情') : '行情不可用'} · ${age}s 前`; $('expiry').textContent = `到期 ${new Date(preview.expiry).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit',timeZone:'UTC'})}`; renderChain(chain.items, preview); renderLegs(preview.legs); renderPayoff(preview); $('updateText').textContent = `行情 ${age}s · 每 ${config.market_refresh_seconds}s 更新`; $('updateDot').style.background = age > config.quote_stale_seconds ? '#ef8989' : '#d7f36b';
+    if (config.trading_blocked_reason || config.opening_blocked_reason) { $('statusValue').textContent = '交易已阻止'; $('statusSub').textContent = config.trading_blocked_reason || 'RFQ 状态待确认，后台正在对账'; }
   } catch (error) { window.__strategyUnavailable = true; clearStrategyDisplay('策略暂不可用'); updateTradeControls(); $('statusValue').textContent = '行情异常'; $('statusSub').textContent = error.message; $('updateText').textContent = '等待重试'; $('updateDot').style.background = '#ef8989'; }
   finally {
     window.__marketLoading = false;
@@ -307,7 +310,7 @@ function quoteSpread(quote, state) { const requested = new Map((state.legs || []
 function renderRfq(state) {
   if (!state || !state.rfq_id || ['Canceled', 'Expired', 'Filled', 'Failed'].includes(state.status)) { $('rfqStatus').textContent = state?.status || '未创建'; $('rfqId').textContent = '--'; $('rfqType').textContent = '--'; $('rfqExpires').textContent = '--'; $('rfqQuoteCount').textContent = '0'; $('rfqQuotes').className = 'rfq-quotes empty'; $('rfqQuotes').textContent = '暂无活动 RFQ'; return; }
   $('rfqStatus').textContent = state.status || '--'; $('rfqId').textContent = state.rfq_id; $('rfqType').textContent = state.strategy_type === 'custom' ? '自定义' : (state.strategy_type || 'custom'); $('rfqExpires').textContent = state.expires_at ? new Date(Number(state.expires_at)).toLocaleTimeString('zh-CN') : '--'; const quotes = (state.quotes || []).slice().sort((a, b) => { const aCount = quoteLegCount(a); const bCount = quoteLegCount(b); const total = (state.legs || []).length; if ((aCount >= total) !== (bCount >= total)) return aCount >= total ? -1 : 1; if ((aCount > 0) !== (bCount > 0)) return aCount > 0 ? -1 : 1; return quoteNet(b, 'Sell', state) - quoteNet(a, 'Sell', state); }); $('rfqQuoteCount').textContent = String(quotes.length);
-  $('rfqQuotes').className = quotes.length ? 'rfq-quotes' : 'rfq-quotes empty'; $('rfqQuotes').innerHTML = quotes.length ? quotes.map((quote) => { const legCount = quoteLegCount(quote); const complete = legCount >= (state.legs || []).length; const disabled = complete ? '' : ' disabled title="报价未覆盖全部策略腿"'; const netDiff = quoteNetDiff(quote, state); return `<div class="rfq-quote"><div><strong>${esc(quote.deskCode || '做市商')} · ${legCount}/${(state.legs || []).length} 腿</strong><span>${esc(quote.status || '--')} · 到期 ${quote.expiresAt ? new Date(Number(quote.expiresAt)).toLocaleTimeString('zh-CN') : '--'}</span></div><div class="rfq-quote-values"><span>Sell 净额 ${quoteNet(quote, 'Sell', state).toFixed(4)}</span><span class="${netDiff >= 0 ? 'rfq-diff-positive' : 'rfq-diff-negative'}">链净额差 ${netDiff >= 0 ? '+' : ''}${netDiff.toFixed(4)}</span><span class="rfq-fee">预估手续费 ${rfqFeeEstimate(quote).toFixed(6)} USDT <small>VIP0 · 50%折扣后最低0.03% · 单腿上限7%</small></span><button class="button ghost rfq-execute" data-rfq="${esc(quote.rfqId || state.rfq_id)}" data-quote="${esc(quote.quoteId || '')}" data-side="Sell"${disabled}>执行 Sell</button></div><div class="rfq-compare-title">Sell 报价方向 · 你的四腿成交方向（Sell 用 Bid1，Buy 用 Ask1）</div><div class="rfq-leg-compare">${quoteLegComparison(quote, 'Sell', state) || '<span>无 Sell 方向报价</span>'}</div></div>`; }).join('') : '等待做市商报价';
+  $('rfqQuotes').className = quotes.length ? 'rfq-quotes' : 'rfq-quotes empty'; $('rfqQuotes').innerHTML = quotes.length ? quotes.map((quote) => { const legCount = quoteLegCount(quote); const complete = legCount >= (state.legs || []).length; const executable = complete && state.status === 'Active' && !state.selected_quote_id; const disabled = executable ? '' : ' disabled title="报价不完整或询价已经提交/结束"'; const netDiff = quoteNetDiff(quote, state); return `<div class="rfq-quote"><div><strong>${esc(quote.deskCode || '做市商')} · ${legCount}/${(state.legs || []).length} 腿</strong><span>${esc(quote.status || '--')} · 到期 ${quote.expiresAt ? new Date(Number(quote.expiresAt)).toLocaleTimeString('zh-CN') : '--'}</span></div><div class="rfq-quote-values"><span>Sell 净额 ${quoteNet(quote, 'Sell', state).toFixed(4)}</span><span class="${netDiff >= 0 ? 'rfq-diff-positive' : 'rfq-diff-negative'}">链净额差 ${netDiff >= 0 ? '+' : ''}${netDiff.toFixed(4)}</span><span class="rfq-fee">预估手续费 ${rfqFeeEstimate(quote).toFixed(6)} USDT <small>VIP0 · 50%折扣后最低0.03% · 单腿上限7%</small></span><button class="button ghost rfq-execute" data-rfq="${esc(quote.rfqId || state.rfq_id)}" data-quote="${esc(quote.quoteId || '')}" data-side="Sell"${disabled}>执行 Sell</button></div><div class="rfq-compare-title">Sell 报价方向 · 你的四腿成交方向（Sell 用 Bid1，Buy 用 Ask1）</div><div class="rfq-leg-compare">${quoteLegComparison(quote, 'Sell', state) || '<span>无 Sell 方向报价</span>'}</div></div>`; }).join('') : '等待做市商报价';
   document.querySelectorAll('.rfq-execute').forEach((button) => button.addEventListener('click', executeRfq));
 }
 async function loadRfq() { if (window.__rfqLoading) return; window.__rfqLoading = true; try { renderRfq(await getJson('/api/rfq/status')); } catch (error) { $('rfqStatus').textContent = error.message; } finally { window.__rfqLoading = false; } }

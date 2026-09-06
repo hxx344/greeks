@@ -12,11 +12,11 @@ class BybitError(RuntimeError):
 
 
 class BybitClient:
-    def __init__(self, api_key: str = "", api_secret: str = "", testnet: bool = True, recv_window: int = 5000):
+    def __init__(self, api_key: str = "", api_secret: str = "", testnet: bool = True, recv_window: int = 5000, market_testnet: bool = False):
         self.api_key = api_key
         self.api_secret = api_secret
         self.recv_window = recv_window
-        self.public_base_url = "https://api.bybit.com"
+        self.public_base_url = "https://api-testnet.bybit.com" if market_testnet else "https://api.bybit.com"
         self.private_base_url = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
         self._client: httpx.AsyncClient | None = None
 
@@ -117,6 +117,42 @@ class BybitClient:
     async def account_info(self) -> dict[str, Any]:
         return await self._request("GET", "/v5/account/info", private=True)
 
+    async def closed_option_positions(self, symbol: str, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+        # The endpoint permits at most seven days per query. Preserve integer
+        # timestamps while adapting identities for the shared pagination checks.
+        rows = []
+        while start_ms <= end_ms:
+            stop = min(end_ms, start_ms + 7 * 86400000 - 1)
+            cursor = None
+            seen = set()
+            for _ in range(100):
+                params = {"category": "option", "symbol": symbol, "startTime": start_ms, "endTime": stop, "limit": 100}
+                if cursor:
+                    params["cursor"] = cursor
+                result = await self._request("GET", "/v5/position/get-closed-positions", params, private=True)
+                page = result.get("list")
+                if not isinstance(page, list) or any(not isinstance(row, dict) for row in page):
+                    raise BybitError("Invalid closed option positions response")
+                rows.extend(page)
+                cursor = result.get("nextPageCursor")
+                if cursor in (None, ""):
+                    break
+                if not isinstance(cursor, str) or cursor in seen:
+                    raise BybitError("Invalid closed option positions cursor")
+                seen.add(cursor)
+            else:
+                raise BybitError("Closed option positions exceeded page limit")
+            start_ms = stop + 1
+        return rows
+
+    async def rfq_history(self, rfq_id: str | None, rfq_link_id: str | None = None) -> list[dict[str, Any]]:
+        params = {"traderType": "request", **({"rfqId": rfq_id} if rfq_id else {"rfqLinkId": rfq_link_id})}
+        result = await self._request("GET", "/v5/rfq/rfq-list", params, private=True)
+        rows = result.get("list")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise BybitError("Invalid RFQ history response")
+        return rows
+
     async def wallet_balance(self) -> dict[str, Any]:
         result = await self._request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT,USDC"}, private=True)
         return (result.get("list") or [{}])[0]
@@ -159,10 +195,12 @@ class BybitClient:
     async def create_rfq(self, counterparties: list[str], legs: list[dict[str, Any]], rfq_link_id: str, strategy_type: str = "custom") -> dict[str, Any]:
         return await self._request("POST", "/v5/rfq/create-rfq", body={"counterparties": counterparties, "rfqLinkId": rfq_link_id, "strategyType": strategy_type, "list": legs}, private=True)
 
-    async def rfq_realtime(self, rfq_id: str | None = None) -> list[dict[str, Any]]:
+    async def rfq_realtime(self, rfq_id: str | None = None, rfq_link_id: str | None = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"traderType": "request"}
         if rfq_id:
             params["rfqId"] = rfq_id
+        elif rfq_link_id:
+            params["rfqLinkId"] = rfq_link_id
         result = await self._request("GET", "/v5/rfq/rfq-realtime", params, private=True)
         return result.get("list", [])
 

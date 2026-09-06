@@ -5,3 +5,5 @@ data/engine_state.json
 data/engine_state.json.lock
 *.egg-info/
 .venv/
+dist/
+build/

@@ -36,7 +36,7 @@ async def lifespan(_: FastAPI):
         tasks = []
         try:
             await engine.refresh_chain(force=True)
-            tasks = [asyncio.create_task(engine.market_loop()), asyncio.create_task(engine.scheduler())]
+            tasks = [asyncio.create_task(engine.market_loop()), asyncio.create_task(engine.scheduler()), asyncio.create_task(engine.reconciliation_loop())]
             yield
         finally:
             for task in tasks:
@@ -90,8 +90,14 @@ async def index():
 
 @app.get("/api/health")
 async def health():
-    return {"status": "degraded" if engine.state_error else "ok", "environment": settings.environment,
-            "live_enabled": settings.can_trade_live, "trading_blocked_reason": engine.state_error}
+    recovery = engine.reconciliation_health()
+    degraded = engine.state_error or recovery["pending_orders"] or recovery["pending_rfq"] or recovery["error"]
+    if settings.can_send_orders:
+        last = recovery["last_success_at"] or engine.reconciliation_started_at
+        degraded = degraded or (datetime.now(timezone.utc) - last).total_seconds() > max(60, settings.reconciliation_seconds * 3)
+    return {"status": "degraded" if degraded else "ok", "environment": settings.environment,
+            "live_enabled": settings.can_trade_live, "trading_enabled": settings.can_send_orders,
+            "trading_blocked_reason": engine.state_error, "reconciliation": recovery}
 
 
 @app.get("/api/config")
@@ -100,7 +106,7 @@ async def config():
 
 
 def config_payload():
-    return {"trading_blocked_reason": engine.state_error, "environment": settings.environment, "live_enabled": settings.can_trade_live, "testnet": settings.bybit_testnet, "auto_open": settings.auto_open, "max_risk_usd": settings.max_risk_usd, "leg_qty": settings.leg_qty, "target_dte_days": settings.target_dte_days, "expiry_rule": "Friday entry / Sunday UTC expiry", "market_refresh_seconds": settings.market_refresh_seconds, "instrument_refresh_seconds": settings.instrument_refresh_seconds, "quote_stale_seconds": settings.quote_stale_seconds, "max_spread_bps": settings.max_spread_bps, "bbo_poll_seconds": settings.bbo_poll_seconds, "bbo_order_timeout_seconds": settings.bbo_order_timeout_seconds, "allow_market_fallback": settings.allow_market_fallback, "failed_leg_retry_delay_seconds": settings.failed_leg_retry_delay_seconds, "failed_leg_position_checks": settings.failed_leg_position_checks, "failed_leg_position_check_interval_seconds": settings.failed_leg_position_check_interval_seconds, "estimated_taker_fee_rate": settings.estimated_taker_fee_rate, "portfolio_margin_buffer_pct": settings.portfolio_margin_buffer_pct, "margin_mode": settings.margin_mode, "option_mm_factor": settings.option_mm_factor, "option_max_im_factor": settings.option_max_im_factor, "option_min_im_factor": settings.option_min_im_factor, "option_liquidation_fee_rate": settings.option_liquidation_fee_rate, "option_fee_cap_pct": settings.option_fee_cap_pct, "open_time": f"Friday {settings.open_hour_utc:02d}:{settings.open_minute_utc:02d} UTC"}
+    return {"trading_blocked_reason": engine.state_error, "environment": settings.environment, "live_enabled": settings.can_trade_live, "trading_enabled": settings.can_send_orders, "testnet": settings.private_testnet, "market_testnet": settings.environment == "testnet", "opening_blocked_reason": "Unresolved RFQ; awaiting reconciliation" if engine._rfq_unresolved() else None, "auto_open": settings.auto_open, "max_risk_usd": settings.max_risk_usd, "leg_qty": settings.leg_qty, "target_dte_days": settings.target_dte_days, "expiry_rule": "Friday entry / Sunday UTC expiry", "market_refresh_seconds": settings.market_refresh_seconds, "instrument_refresh_seconds": settings.instrument_refresh_seconds, "quote_stale_seconds": settings.quote_stale_seconds, "max_spread_bps": settings.max_spread_bps, "bbo_poll_seconds": settings.bbo_poll_seconds, "bbo_order_timeout_seconds": settings.bbo_order_timeout_seconds, "allow_market_fallback": settings.allow_market_fallback, "failed_leg_retry_delay_seconds": settings.failed_leg_retry_delay_seconds, "failed_leg_position_checks": settings.failed_leg_position_checks, "failed_leg_position_check_interval_seconds": settings.failed_leg_position_check_interval_seconds, "estimated_taker_fee_rate": settings.estimated_taker_fee_rate, "portfolio_margin_buffer_pct": settings.portfolio_margin_buffer_pct, "margin_mode": settings.margin_mode, "option_mm_factor": settings.option_mm_factor, "option_max_im_factor": settings.option_max_im_factor, "option_min_im_factor": settings.option_min_im_factor, "option_liquidation_fee_rate": settings.option_liquidation_fee_rate, "option_fee_cap_pct": settings.option_fee_cap_pct, "open_time": f"Friday {settings.open_hour_utc:02d}:{settings.open_minute_utc:02d} UTC"}
 
 
 @app.get("/api/dashboard/market")
@@ -168,7 +174,7 @@ async def preview(quantity: float | None = Query(default=None, gt=0, allow_inf_n
 async def open_trade(request: OpenRequest):
     try:
         results = await engine.open_position(request)
-        return {"results": [item.model_dump(mode="json") for item in results], "executions": [item.model_dump(mode="json") for item in engine.last_executions], "live": settings.can_trade_live and request.confirm_live}
+        return {"results": [item.model_dump(mode="json") for item in results], "executions": [item.model_dump(mode="json") for item in engine.last_executions], "live": settings.can_trade_live and request.confirm_live, "orders_submitted": settings.can_send_orders and request.confirm_live, "environment": settings.environment}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except BybitError as exc:
@@ -184,7 +190,7 @@ async def open_trade(request: OpenRequest):
 async def close_trade(request: CloseRequest):
     try:
         results, executions = await engine.close_position(request)
-        return {"results": [item.model_dump(mode="json") for item in results], "executions": [item.model_dump(mode="json") for item in executions], "live": settings.can_trade_live and request.confirm_live}
+        return {"results": [item.model_dump(mode="json") for item in results], "executions": [item.model_dump(mode="json") for item in executions], "live": settings.can_trade_live and request.confirm_live, "orders_submitted": settings.can_send_orders and request.confirm_live, "environment": settings.environment}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except BybitError as exc:

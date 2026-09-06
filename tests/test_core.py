@@ -125,7 +125,7 @@ class CoreTests(unittest.TestCase):
                 {"symbol": "CALL-LONG", "side": "Buy", "qty": "0.01"},
                 {"symbol": "PUT-LONG", "side": "Buy", "qty": "0.01"},
             ]
-            engine.rfq_state = {"status": "PendingFill", "selected_quote_id": "quote-1", "legs": legs}
+            engine.rfq_state = {"status": "Filled", "selected_quote_id": "quote-1", "legs": legs}
             positions = [Position(symbol=leg["symbol"], side=leg["side"], size=0.01, avg_price=1, mark_price=1, unrealised_pnl=0) for leg in legs]
             self.assertTrue(engine._track_filled_rfq(positions))
             self.assertEqual(engine.active_strategy_symbols, {leg["symbol"] for leg in legs})

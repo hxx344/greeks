@@ -37,7 +37,7 @@ class RecoveryRiskTests(unittest.IsolatedAsyncioTestCase):
         key = f"{leg.symbol}|{leg.side}"
         self.engine.active_strategy_sizes[key] = 0.004
         self.engine._save_state()
-        self.engine.client.rfq_realtime = AsyncMock(return_value=[{"status": "Filled"}])
+        self.engine.client.rfq_realtime = AsyncMock(return_value=[{"rfqId": "rfq-1", "status": "Filled"}])
         self.engine.client.quote_realtime = AsyncMock(return_value=[])
         await self.engine.refresh_rfq()
         self.assertEqual(self.engine.active_strategy_sizes[key], 0.004)

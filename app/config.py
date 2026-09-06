@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -12,6 +13,8 @@ class Settings(BaseSettings):
     bybit_api_secret: str = ""
     bybit_testnet: bool = True
     live_trading: bool = False
+    trading_mode: Literal["dry-run", "testnet", "live"] | None = None
+    reconciliation_seconds: float = Field(default=15.0, ge=1, le=300)
     live_confirmation: str = ""
     max_risk_usd: float = Field(default=2500.0, gt=0)
     leg_qty: float = Field(default=1.0, gt=0)
@@ -52,11 +55,24 @@ class Settings(BaseSettings):
 
     @property
     def environment(self) -> str:
-        return "live" if self.live_trading and not self.bybit_testnet else "testnet"
+        if self.trading_mode is not None:
+            return self.trading_mode
+        return "live" if self.live_trading and not self.bybit_testnet else "dry-run"
+
+    @property
+    def private_testnet(self) -> bool:
+        if self.trading_mode in {"testnet", "live"}:
+            return self.trading_mode == "testnet"
+        return self.bybit_testnet
+
+    @property
+    def can_send_orders(self) -> bool:
+        enabled = self.environment == "testnet" or (self.environment == "live" and self.live_trading)
+        return bool(enabled and self.bybit_api_key and self.bybit_api_secret)
 
     @property
     def can_trade_live(self) -> bool:
-        return bool(self.live_trading and self.bybit_api_key and self.bybit_api_secret and not self.bybit_testnet)
+        return self.environment == "live" and self.can_send_orders
 
 
 @lru_cache
