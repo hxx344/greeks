@@ -166,6 +166,12 @@ class BybitClient:
             params["orderLinkId"] = order_link_id
         return await self._pages("/v5/execution/list", params, private=True, identity="execId", max_items=None if order_link_id else 100)
 
+    async def execution_history(self, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+        if not 0 <= end_ms - start_ms < 7 * 86400000:
+            raise ValueError("Execution history requires a window shorter than seven days")
+        return await self._pages("/v5/execution/list", {"category": "option", "baseCoin": "BTC", "startTime": start_ms,
+                                 "endTime": end_ms, "limit": 100}, private=True, identity="execId", max_items=None)
+
     async def order(self, symbol: str, order_link_id: str) -> dict[str, Any] | None:
         params = {"category": "option", "symbol": symbol, "orderLinkId": order_link_id}
         # Closed realtime records can disappear after an exchange restart.

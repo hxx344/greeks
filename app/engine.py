@@ -16,9 +16,10 @@ from .state import EngineState
 from .risk import maximum_loss
 from .rfq import RfqMixin
 from .reconciliation import ReconciliationMixin
+from .performance import PerformanceMixin
 
 
-class TradingEngine(RfqMixin, ReconciliationMixin):
+class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
     def __init__(self, settings: Settings):
         self.settings = settings
         self.client = BybitClient(settings.bybit_api_key, settings.bybit_api_secret, settings.private_testnet, settings.recv_window_ms, market_testnet=settings.environment == "testnet")
@@ -42,6 +43,12 @@ class TradingEngine(RfqMixin, ReconciliationMixin):
         self.pm_baseline: dict = {}
         self.order_journal: dict[str, dict] = {}
         self.state_error: str | None = None
+        self.performance_executions: dict[str, ExecutionRecord] = {}
+        self.performance_start_ms = None
+        self.performance_cursor_ms = None
+        self.performance_error = None
+        self.performance_updated_at = None
+        self.performance_lock = asyncio.Lock()
         self.reconciliation_last_success = None
         self.reconciliation_error = None
         self.reconciliation_started_at = datetime.now(timezone.utc)
@@ -74,6 +81,9 @@ class TradingEngine(RfqMixin, ReconciliationMixin):
             self.execution_group_links = state.get("execution_group_links") or {}
             self.pm_baseline = state.get("pm_baseline") or {}
             self.order_journal = state.get("order_journal") or {}
+            self.performance_executions = {key: ExecutionRecord.model_validate(value) for key, value in state["performance_executions"].items()}
+            self.performance_start_ms = state["performance_start_ms"]
+            self.performance_cursor_ms = state["performance_cursor_ms"]
             self.state_error = None
         except FileNotFoundError:
             return
@@ -93,8 +103,9 @@ class TradingEngine(RfqMixin, ReconciliationMixin):
             state = EngineState(exchange_network="testnet" if self.settings.private_testnet else "mainnet", last_open_week=self.last_open_week, active_strategy_symbols=sorted(self.active_strategy_symbols),
                                 active_strategy_sizes=self.active_strategy_sizes, active_strategy_group_id=self.active_strategy_group_id,
                                 rfq_state=self.rfq_state, execution_groups=self.execution_groups, execution_group_links=self.execution_group_links,
-                                pm_baseline=self.pm_baseline, order_journal=self.order_journal)
-            payload = json.dumps(state.model_dump(), allow_nan=False)
+                                pm_baseline=self.pm_baseline, order_journal=self.order_journal, performance_executions=self.performance_executions,
+                                performance_start_ms=self.performance_start_ms, performance_cursor_ms=self.performance_cursor_ms)
+            payload = json.dumps(state.model_dump(mode="json"), allow_nan=False)
             target.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, prefix=target.name + ".", suffix=".tmp", delete=False) as stream:
                 temp = Path(stream.name)
@@ -485,7 +496,7 @@ class TradingEngine(RfqMixin, ReconciliationMixin):
                 chain_price = float(baseline.get("chain_price", 0) or 0) if baseline else None
                 strategy_side = baseline.get("side")
                 chain_diff = ((1 if strategy_side == "Sell" else -1) * (exec_price - chain_price) * exec_qty) if chain_price is not None and strategy_side else None
-                records.append(ExecutionRecord(symbol=item.get("symbol", ""), side=item.get("side", ""), order_id=item.get("orderId", ""), order_link_id=order_link_id, exec_id=exec_id, exec_fee=float(item.get("execFee", 0) or 0), fee_currency=item.get("feeCurrency", ""), exec_price=exec_price, exec_qty=exec_qty, fee_rate=float(item.get("feeRate", 0) or 0) if item.get("feeRate") not in (None, "") else None, exec_time=datetime.fromtimestamp(int(item.get("execTime", 0)) / 1000, tz=timezone.utc), reduce_only=reduce_only, opening_group=group.get("opening_group"), execution_group=group_id, chain_price_at_create=chain_price, chain_price_diff=chain_diff))
+                records.append(ExecutionRecord(symbol=item.get("symbol", ""), side=item.get("side", ""), order_id=item.get("orderId", ""), order_link_id=order_link_id, exec_id=exec_id, exec_fee=float(item.get("execFee", 0) or 0), fee_currency=item.get("feeCurrency", ""), exec_price=exec_price, exec_qty=exec_qty, fee_rate=float(item.get("feeRate", 0) or 0) if item.get("feeRate") not in (None, "") else None, exec_time=datetime.fromtimestamp(int(item.get("execTime", 0)) / 1000, tz=timezone.utc), reduce_only=reduce_only, opening_group=group.get("opening_group"), execution_group=group_id, chain_price_at_create=chain_price, chain_price_diff=chain_diff, closed_size=float(item["closedSize"]) if item.get("closedSize") not in (None, "") else None, exec_type=item.get("execType") or "Trade"))
             if order_link_ids:
                 for link, group in zip(requested_links, raw_groups):
                     if isinstance(group, list):
@@ -496,6 +507,7 @@ class TradingEngine(RfqMixin, ReconciliationMixin):
             merged = {item.exec_id: item for item in self.last_executions}
             merged.update({item.exec_id: item for item in records})
             self.last_executions = sorted(merged.values(), key=lambda item: item.exec_time, reverse=True)[:100]
+            self._archive_performance(records)
         except Exception as exc:
             self.log("WARNING", f"Could not load execution fee records: {exc}")
         return self.last_executions

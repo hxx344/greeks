@@ -14,7 +14,7 @@
       <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><path d="M5 23 11 9h10l6 14M8 18h16M12 23l4-9 4 9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
       <span><strong>CONDOR<span class="brand-dot">.</span></strong><small>OPTIONS WORKSPACE</small></span>
     </a>
-    <nav class="top-nav" aria-label="页面导航"><a href="#overview">总览</a><a href="#account">账户</a><a href="#market">期权链</a><a href="#position-payoff">持仓</a><a href="#rfq">组合询价</a></nav>
+    <nav class="top-nav" aria-label="页面导航"><a href="#overview">总览</a><a href="#account">账户</a><a href="#market">期权链</a><a href="#position-payoff">持仓</a><a href="#performance">收益</a><a href="#rfq">组合询价</a></nav>
     <div class="top-meta"><span id="environment" class="status-chip">连接中</span><span id="clock" class="clock">--:--:-- UTC</span></div>
   </header>
   <main class="shell" id="overview">
@@ -81,6 +81,15 @@
       <div id="positionPayoffContent"><div class="empty">等待持仓同步…</div></div>
       <p class="pp-note">假设当前剩余持仓持有至到期，按开仓均价计算；不含交易与交割手续费、已平仓盈亏。不同到期日、结算币种分别展示。现价标记表示“若以此价格到期”的情景，实际交割以结算价为准。<a href="https://www.bybit.com/en/help-center/article/P-L-Calculations-Options" target="_blank" rel="noopener noreferrer">计算口径 ↗</a></p>
     </section>
+    <section class="panel performance-panel" id="performance" aria-labelledby="performanceTitle">
+      <div class="panel-head"><div><div class="kicker">PERFORMANCE / LIVE STRATEGY</div><h2 id="performanceTitle">策略实盘收益<span class="heading-detail">按每次组合开仓累计</span></h2></div><span id="performanceMode" class="source-tag">等待同步</span></div>
+      <div class="performance-toolbar"><p id="performanceStatus">正在同步收益台账…</p><select id="performanceCurrency" aria-label="收益结算币种"><option value="USDT">USDT</option></select><button id="reloadPerformance" class="link-button">刷新收益 ↗</button></div>
+      <div class="performance-summary"><div><span>已结束组合累计净收益</span><strong id="performanceTotal">--</strong></div><div><span>已结束组合</span><strong id="performanceClosed">0</strong></div><div><span>已结束组合胜率</span><strong id="performanceWinRate">--</strong></div><div><span>累计收益最大回撤</span><strong id="performanceDrawdown">--</strong></div></div>
+      <div id="performanceChart" class="pp-chart"><div class="empty">等待实盘收益记录</div></div>
+      <div class="performance-list-head"><h3>每次开仓收益详情</h3><span id="performanceCoverage">等待同步</span></div>
+      <div id="performanceGroups"><div class="empty">等待组合记录</div></div>
+      <p class="pp-note">曲线按每组完全平仓或交割时累计已核实净收益，包含开仓、平仓及交割手续费；未结束和待核对组合不计入曲线。按结算币种分别统计，不含账户充值、提现和无关交易。台账持续保存，历史覆盖范围以同步起点为准。<a href="https://bybit-exchange.github.io/docs/v5/position/close-position" target="_blank" rel="noopener noreferrer">交易所收益记录 ↗</a></p>
+    </section>
     <section class="panel rfq-panel" id="rfq" aria-labelledby="rfqTitle">
       <div class="panel-head"><div><div class="kicker">04 / BLOCK TRADING</div><h2 id="rfqTitle">组合询价<span class="heading-detail">RFQ</span></h2></div><span id="rfqStatus" class="source-tag">未创建</span></div>
       <div class="rfq-controls"><p>向可用做市商发送四腿组合询价<span>比较整组报价，再确认执行。</span></p><input id="rfqCounterparties" type="hidden" /><button id="rfqCreate" class="button ghost">创建 RFQ ↗</button><button id="rfqCancel" class="button close-button">取消询价</button></div>
@@ -91,6 +100,7 @@
   </main>
   <aside id="notice" class="notice" role="status" aria-live="polite" aria-atomic="true" hidden><div><strong id="noticeTitle">操作结果</strong><button id="dismissNotice" class="notice-dismiss" aria-label="关闭操作提示">×</button></div><p id="noticeText"></p></aside>
   <script src="/static/position-payoff.js?v=20260908-2"></script>
+  <script src="/static/performance.js?v=20260908-1"></script>
   <script src="/static/app.js?v=20260908-2"></script>
 </body>
 </html>

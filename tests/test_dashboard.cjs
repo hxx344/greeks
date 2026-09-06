@@ -23,6 +23,7 @@ function dashboard() {
     },
   });
   vm.runInContext(fs.readFileSync(`${__dirname}/../app/static/position-payoff.js`, 'utf8'), context);
+  vm.runInContext(fs.readFileSync(`${__dirname}/../app/static/performance.js`, 'utf8'), context);
   vm.runInContext(fs.readFileSync(`${__dirname}/../app/static/app.js`, 'utf8'), context);
   return {context, element, pending};
 }
@@ -119,6 +120,28 @@ test('position chart preserves payoff but removes stale spot, and clears closed 
   context.renderPositionPayoff();
   assert.match(element('positionPayoffContent').innerHTML, /暂无可计算/);
   assert.doesNotMatch(element('positionPayoffContent').innerHTML, /pp-line/);
+});
+
+test('performance view keeps currencies separate and explains pending and open groups', () => {
+  const {context, element} = dashboard();
+  const payload = {network:'testnet',credentials_available:true,groups:[
+    {id:'closed-a',currency:'USDT',status:'closed',opened_at:'2026-09-01T00:00:00Z',closed_at:'2026-09-02T00:00:00Z',leg_count:4,net_pnl:12,open_fee:1,close_fee:1,delivery_fee:0,issues:[],fills:[]},
+    {id:'pending-b',currency:'USDT',status:'pending',opened_at:null,leg_count:4,net_pnl:null,issues:['成交记录待补齐'],fills:[]},
+    {id:'open-c',currency:'USDC',status:'open',opened_at:null,leg_count:4,net_pnl:0,floating_pnl:20,issues:[],fills:[]}],
+    series:[{currency:'USDT',total_pnl:12,closed_count:1,wins:1,max_drawdown:0,points:[{group_id:'closed-a',time:'2026-09-02T00:00:00Z',pnl:12,cumulative:12}]}]};
+  context.renderPerformance(payload);
+  assert.match(element('performanceMode').textContent, /测试网/);
+  assert.equal(element('performanceTotal').textContent, '$12');
+  assert.match(element('performanceGroups').innerHTML, /pending-b/);
+  assert.doesNotMatch(element('performanceGroups').innerHTML, /open-c/);
+  assert.match(element('performanceGroups').innerHTML, /尚未计入累计收益曲线/);
+  assert.doesNotMatch(element('performanceChart').innerHTML, /NaN|Infinity/);
+  element('performanceCurrency').value = 'USDC';
+  context.renderPerformance(payload);
+  assert.equal(element('performanceTotal').textContent, '--');
+  assert.match(element('performanceGroups').innerHTML, /open-c/);
+  assert.doesNotMatch(element('performanceGroups').innerHTML, /closed-a/);
+  assert.match(element('performanceChart').innerHTML, /暂无已核实/);
 });
 
 test('testnet mode requires confirmation and reports exchange fills as testnet', async () => {

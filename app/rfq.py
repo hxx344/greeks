@@ -220,6 +220,11 @@ class RfqMixin:
         if started and self.active_strategy_group_id == group_id and group_id not in self.execution_groups:
             self.execution_groups[group_id] = {"type": "open", "created_at": started}
             self._save_state()
+        if group_id in self.execution_groups and "legs" not in self.execution_groups[group_id]:
+            legs = self.rfq_state.get("legs") or []
+            if len(legs) == 4 and all(leg.get("symbol") and leg.get("side") in {"Buy", "Sell"} and float(leg.get("qty", 0)) > 0 for leg in legs):
+                self.execution_groups[group_id]["legs"] = {leg["symbol"]: {"side": leg["side"], "qty": float(leg["qty"])} for leg in legs}
+                self._save_state()
         if self.rfq_state.get("tracking_applied"):
             return False
         # Migrate existing tracking without restoring the original quantity
@@ -252,6 +257,7 @@ class RfqMixin:
         self.active_strategy_sizes = sizes
         self.active_strategy_group_id = f"rfq:{self.rfq_state.get('rfq_id', '')}"
         self.execution_groups.setdefault(group_id, {"type": "open", "created_at": self.rfq_state.get("execution_started_at") or self.rfq_state.get("created_at")})
+        self.execution_groups[group_id].setdefault("legs", {leg["symbol"]: {"side": leg["side"], "qty": float(leg["qty"])} for leg in legs})
         self.rfq_state["tracking_applied"] = True
         self._save_state()
         return True

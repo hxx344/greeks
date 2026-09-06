@@ -17,7 +17,7 @@ from .cache import SnapshotCache
 from .lease import StateLease
 from .security import authorize_dashboard
 from .strategy import SundayExpiryUnavailable
-from .models import CloseRequest, OpenRequest, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest
+from .models import CloseRequest, OpenRequest, Position, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest
 
 # The dashboard polls several endpoints frequently; HTTP 200 access lines are
 # noise in production logs. Application warnings and errors remain visible.
@@ -36,7 +36,7 @@ async def lifespan(_: FastAPI):
         tasks = []
         try:
             await engine.refresh_chain(force=True)
-            tasks = [asyncio.create_task(engine.market_loop()), asyncio.create_task(engine.scheduler()), asyncio.create_task(engine.reconciliation_loop())]
+            tasks = [asyncio.create_task(engine.market_loop()), asyncio.create_task(engine.scheduler()), asyncio.create_task(engine.reconciliation_loop()), asyncio.create_task(engine.performance_loop())]
             yield
         finally:
             for task in tasks:
@@ -142,6 +142,19 @@ async def dashboard_market(quantity: float | None = Query(default=None, gt=0, al
 @app.get("/api/dashboard/account")
 async def dashboard_account():
     return await account_cache.get(_build_account_dashboard)
+
+
+performance_cache = SnapshotCache(15)
+
+
+@app.get("/api/dashboard/performance")
+async def dashboard_performance():
+    async def build():
+        await engine.sync_performance()
+        account = await account_cache.get(_build_account_dashboard)
+        return engine.performance_report(positions_available=account["positions"].get("available", False) and not engine.lock.locked(),
+                                         positions=[Position.model_validate(item) for item in account["positions"]["items"]])
+    return await performance_cache.get(build)
 
 
 async def _build_account_dashboard():

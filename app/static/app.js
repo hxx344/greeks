@@ -373,3 +373,7 @@ async function createRfq() { try { await getJson('/api/rfq/create', {method:'POS
 async function executeRfq(event) { const button = event.currentTarget; try { await getJson('/api/rfq/execute', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, rfq_id:button.dataset.rfq, quote_id:button.dataset.quote, quote_side:button.dataset.side})}); await loadRfq(); } catch (error) { showNotice(error.message, '操作未完成', 'error'); } }
 async function cancelRfq() { try { const state = await getJson('/api/rfq/status?refresh=false'); if (!state.rfq_id) throw new Error('没有活动 RFQ'); await getJson('/api/rfq/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, rfq_id:state.rfq_id})}); await loadRfq(); } catch (error) { showNotice(error.message, '操作未完成', 'error'); } }
 $('rfqCreate').addEventListener('click', createRfq); $('rfqCancel').addEventListener('click', cancelRfq); setInterval(loadRfq, 3000); loadRfq();
+$('reloadPerformance').addEventListener('click', loadPerformance);
+$('performanceCurrency').addEventListener('change', () => { if (window.__performance) renderPerformance(window.__performance); });
+window.addEventListener('resize', () => { if (window.__performance) renderPerformance(window.__performance); });
+loadPerformance(); setInterval(loadPerformance, 30000);

@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class OptionInstrument(BaseModel):
@@ -105,6 +105,7 @@ class OrderResult(BaseModel):
 
 
 class ExecutionRecord(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
     symbol: str
     side: str
     order_id: str
@@ -121,6 +122,8 @@ class ExecutionRecord(BaseModel):
     opening_group: str | None = None
     chain_price_at_create: float | None = None
     chain_price_diff: float | None = None
+    closed_size: float | None = None
+    exec_type: str = "Trade"
 
 
 class Position(BaseModel):
