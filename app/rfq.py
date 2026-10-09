@@ -24,8 +24,12 @@ class RfqMixin:
             raise ValueError("Unresolved RFQ remains; wait for exchange reconciliation before trading")
 
     async def create_rfq(self, request: RfqCreateRequest) -> dict:
-        async with self.lock:
-            return await self._create_rfq(request)
+        self._admit_trading_operation()
+        try:
+            async with self.lock:
+                return await self._create_rfq(request)
+        finally:
+            self._trade_admitting = False
 
     async def _create_rfq(self, request: RfqCreateRequest) -> dict:
         self._require_trading_state()
@@ -90,6 +94,8 @@ class RfqMixin:
         return self.rfq_state
 
     async def refresh_rfq(self) -> dict:
+        if self.lock.locked() or self._trade_admitting:
+            return self.rfq_state
         async with self.lock:
             return await self._refresh_rfq()
 
@@ -135,8 +141,12 @@ class RfqMixin:
         return self.rfq_state
 
     async def execute_rfq(self, request: RfqExecuteRequest) -> dict:
-        async with self.lock:
-            return await self._execute_rfq(request)
+        self._admit_trading_operation()
+        try:
+            async with self.lock:
+                return await self._execute_rfq(request)
+        finally:
+            self._trade_admitting = False
 
     async def _execute_rfq(self, request: RfqExecuteRequest) -> dict:
         self._require_trading_state()
@@ -274,6 +284,9 @@ class RfqMixin:
         return True
 
     async def cancel_rfq(self, request: RfqCancelRequest) -> dict:
+        if self.lock.locked() or self._trade_admitting:
+            from .trade_tasks import TradeConflict
+            raise TradeConflict("Another trading operation is active; retry cancellation after reconciliation")
         async with self.lock:
             return await self._cancel_rfq(request)
 

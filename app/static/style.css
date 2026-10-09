@@ -56,11 +56,11 @@ svg { display: block; }
 .status-chip[data-mode="testnet"] { color: #b0c9d5; border-color: #3c505c; background: #1b272d; }
 .clock { color: var(--quiet); font: 11px var(--mono); white-space: nowrap; }
 .shell { max-width: 1800px; margin: auto; padding: 38px clamp(22px, 3.2vw, 64px) 24px; }
-.intro { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 30px; }
+.intro { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 18px; }
 .kicker { color: var(--quiet); font-size: 10px; letter-spacing: .15em; font-weight: 550; margin-bottom: 9px; }
 .intro .kicker { display: flex; align-items: center; gap: 9px; color: var(--accent); }
 .eyebrow-line { display: inline-block; width: 20px; height: 1px; background: var(--accent); }
-.intro h1 { font-size: clamp(26px, 2.5vw, 39px); font-weight: 500; letter-spacing: -.04em; line-height: 1.3; margin: 0 0 12px; }
+.intro h1 { font-size: clamp(22px, 2vw, 29px); font-weight: 500; letter-spacing: -.04em; line-height: 1.3; margin: 0 0 7px; }
 .heading-dot { padding-left: 3px; }
 .intro p { font-size: 12px; color: var(--muted); margin: 0; }
 .intro-actions { display: flex; align-items: center; gap: 18px; padding-bottom: 2px; flex-shrink: 0; }
@@ -492,3 +492,68 @@ svg { display: block; }
 .performance-sample-title { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin: 22px 0 12px; font-size: 12px; }
 .performance-sample-title span { font-size: 10px; font-weight: 400; color: var(--quiet); }
 .performance-detail .performance-fills { margin-top: 20px; }
+/* Fixed plans and combination-level execution are the primary reading path. */
+.orders-panel { margin: 0 0 22px; }
+#heroExecution { color: var(--accent); }
+.execution-groups { display: grid; gap: 16px; }
+.execution-card { border: 1px solid var(--line); border-radius: 10px; padding: 18px; min-width: 0; }
+.execution-card[data-active="true"] { border-color: #54715f; background: #18221c; }
+.execution-card-head { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 24px; }
+.execution-card-head>div { margin-right: auto; }
+.execution-card-head h3 { font-size: 15px; margin: 0 0 5px; }
+.execution-status { color: var(--accent); font-size: 12px; }
+.execution-card-head>span { font: 11px var(--mono); color: var(--muted); }
+.stop-execution { color: var(--negative); background: #2b211f; border-color: #715047; min-height: 44px; }
+.stop-execution:hover { background: #3a2824; }
+.execution-progress { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin: 18px 0; font-size: 12px; font-variant-numeric: tabular-nums; }
+.execution-progress progress { width: 100%; height: 8px; accent-color: var(--accent); }
+.execution-amounts, .plan-amounts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.execution-amounts>div, .plan-amounts>div { display: grid; gap: 6px; min-width: 0; }
+.execution-amounts span, .plan-amounts span { font-size: 11px; color: var(--muted); }
+.execution-amounts strong, .plan-amounts strong { font: 14px var(--mono); overflow-wrap: anywhere; }
+.execution-caveat { color: var(--warning); font-size: 11px; line-height: 1.8; margin: 14px 0; }
+.execution-legs { margin-top: 18px; }
+.execution-leg { padding: 12px 0; border-top: 1px solid var(--line); }
+.execution-leg>div:first-child { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; }
+.execution-leg strong { font: 11px var(--mono); overflow-wrap: anywhere; }
+.execution-leg>div:first-child>span { font-size: 11px; color: var(--muted); }
+.execution-leg-quantity { display: flex; flex-wrap: wrap; gap: 10px 24px; margin: 9px 0; font-size: 11px; font-variant-numeric: tabular-nums; }
+.execution-leg-quantity b { font-weight: 550; }
+.execution-card summary, .execution-history>summary, .order-contract summary { cursor: pointer; color: var(--muted); font-size: 11px; min-height: 32px; padding: 7px 0; touch-action: manipulation; }
+.execution-history { border-top: 1px solid var(--line); margin-top: 15px; }
+.execution-history>summary { min-height: 44px; padding: 13px 0; }
+.execution-identifiers p { color: var(--quiet); font: 10px/1.8 var(--mono); overflow-wrap: anywhere; }
+.trade-dialog { color: var(--text); background: var(--surface); border: 1px solid #597161; border-radius: 14px; padding: 24px; width: min(700px, calc(100vw - 32px)); max-height: calc(100dvh - 40px); overscroll-behavior: contain; overflow-y: auto; }
+.trade-dialog::backdrop { background: #050907cb; }
+.dialog-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.dialog-head h2 { margin: 0; font-size: 21px; }
+.dialog-head button { min-height: 44px; min-width: 44px; }
+.plan-environment { color: var(--accent); font-size: 13px; }
+.plan-expiry { font-size: 12px; color: var(--warning); }
+.plan-legs { display: grid; gap: 10px; margin: 18px 0; }
+.plan-leg { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 14px; border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-size: 12px; }
+.plan-leg strong { font: 11px var(--mono); overflow-wrap: anywhere; }
+.plan-leg small { grid-column: 1 / -1; color: var(--muted); overflow-wrap: anywhere; }
+.plan-amounts { grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 20px 0; }
+#planNetLabel { display: block; font-size: 12px; margin-bottom: 8px; }
+#planNetLimit { color: var(--text); background: var(--bg); border: 1px solid #617567; border-radius: 6px; min-height: 44px; width: 100%; padding: 8px 12px; font-variant-numeric: tabular-nums; }
+.trade-dialog .confirm { min-height: 44px; }
+#rfqConfirmSummary { font-size: 12px; line-height: 1.8; }
+button, summary { touch-action: manipulation; }
+@media(max-width: 760px) {
+  .shell { padding-top: 20px; }
+  .intro { margin-bottom: 16px; }
+  .intro h1 { font-size: 23px; }
+  .intro .kicker { font-size: 9px; margin-bottom: 5px; }
+  .orders-panel { margin: 0 0 18px; }
+  .execution-card { padding: 14px; }
+  .execution-card-head { gap: 12px; }
+  .execution-card-head>div { width: 100%; }
+  .stop-execution { margin-left: auto; }
+  .execution-amounts { grid-template-columns: 1fr; gap: 10px; }
+  .execution-amounts>div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 5px 12px; }
+  .execution-leg-quantity { gap: 8px 16px; }
+  .execution-card summary { min-height: 44px; padding: 12px 0; }
+  .trade-dialog { padding: 18px; width: calc(100vw - 20px); max-height: calc(100dvh - 20px); }
+  .dialog-head h2 { font-size: 19px; }
+}

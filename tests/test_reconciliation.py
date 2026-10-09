@@ -205,6 +205,44 @@ class ReconciliationTests(unittest.IsolatedAsyncioTestCase):
                 await e.reconciliation_loop()
         self.assertEqual(e.reconcile_once.await_count, 2)
 
+    async def test_storage_failure_with_unreadable_state_has_no_order_identity_to_query(self):
+        Path(self.settings.state_file).write_text("{invalid state", encoding="utf-8")
+        restored = TradingEngine(self.settings)
+        self.assertIsNotNone(restored.state_error)
+        restored.client._request = AsyncMock(side_effect=AssertionError("Unexpected exchange request"))
+        original_error = restored.state_error
+        await restored.reconcile_once()
+        self.assertEqual(restored.state_error, original_error)
+        self.assertEqual(restored.reconciliation_error, original_error)
+        self.assertFalse(restored.order_journal)
+        restored.client._request.assert_not_awaited()
+
+    async def test_storage_failure_recovery_respects_disabled_trading_and_missing_credentials(self):
+        leg = self.preview.legs[0]
+        self.engine.order_journal["known"] = {"symbol": leg.symbol, "side": leg.side, "qty": .01,
+                                             "reduce_only": False, "terminal": False, "status": "unknown", "filledQty": 0.0}
+        self.engine.state_error = "Storage unavailable"
+        for updates in ({"trading_mode": "dry-run"}, {"bybit_api_key": ""}, {"bybit_api_secret": ""}):
+            with self.subTest(updates=updates):
+                self.engine.settings = self.settings.model_copy(update=updates)
+                self.assertFalse(self.engine.settings.can_send_orders)
+                await self.engine.reconcile_once()
+        self.engine.client._request.assert_not_awaited()
+        self.engine.client.positions.assert_not_awaited()
+        self.assertEqual(self.engine.state_error, "Storage unavailable")
+        self.assertFalse(self.engine.order_journal["known"]["terminal"])
+
+    async def test_new_storage_failure_stops_position_and_rfq_recovery_in_same_cycle(self):
+        self.rfq()
+        async def fail_storage():
+            self.engine.state_error = "Storage unavailable"
+            raise ValueError(self.engine.state_error)
+        self.engine._reconcile_pending_orders = AsyncMock(side_effect=fail_storage)
+        await self.engine.reconcile_once()
+        self.engine.client.positions.assert_not_awaited()
+        self.engine.client.rfq_realtime.assert_not_awaited()
+        self.assertIn("Storage unavailable", self.engine.reconciliation_error)
+
     async def test_position_refresh_does_not_mutate_during_order_execution(self):
         self.track()
         async with self.engine.lock:

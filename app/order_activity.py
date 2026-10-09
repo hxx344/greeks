@@ -54,7 +54,7 @@ def observe_order(activity: dict, link: str, event: dict) -> None:
 
 
 def order_dashboard(journal: dict, activity: dict, *, stale_seconds: float, groups: dict | None = None,
-                    group_links: dict | None = None, now: datetime | None = None) -> dict:
+                    group_links: dict | None = None, now: datetime | None = None, terminal_limit: int | None = 30) -> dict:
     """No awaits, exchange access, state writes, or engine transaction lock."""
     now = now or datetime.now(timezone.utc)
     active, completed = [], []
@@ -96,6 +96,7 @@ def order_dashboard(journal: dict, activity: dict, *, stale_seconds: float, grou
     newest = lambda item: (item["updated_at"] or item["created_at"] or "", item["order_link_id"])
     active.sort(key=newest, reverse=True)
     completed.sort(key=newest, reverse=True)
-    completed = completed[:30]
+    if terminal_limit is not None:
+        completed = completed[:terminal_limit]
     return {"generated_at": now.isoformat(), "execution_active": any(item["phase"] in ACTIVE_PHASES for item in active),
             "active_count": len(active), "terminal_count": len(completed), "items": active + completed}

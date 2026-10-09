@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#0d1110" />
   <title>CONDOR · BTC 期权策略台</title>
-  <link rel="stylesheet" href="/static/style.css?v=20261010-1" />
+  <link rel="stylesheet" href="/static/style.css?v=20261010-2" />
 </head>
 <body>
   <a class="skip-link" href="#overview">跳转到策略总览</a>
@@ -14,13 +14,31 @@
       <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><path d="M5 23 11 9h10l6 14M8 18h16M12 23l4-9 4 9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
       <span><strong>CONDOR<span class="brand-dot">.</span></strong><small>OPTIONS WORKSPACE</small></span>
     </a>
-    <nav class="top-nav" aria-label="页面导航"><a href="#overview">总览</a><a href="#account">账户</a><a href="#market">期权链</a><a href="#orders">挂单</a><a href="#position-payoff">持仓</a><a href="#performance">收益</a><a href="#rfq">组合询价</a></nav>
+    <nav class="top-nav" aria-label="页面导航"><a href="#overview">总览</a><a href="#account">账户</a><a href="#market">期权链</a><a href="#orders">组合执行</a><a href="#position-payoff">持仓</a><a href="#performance">收益</a><a href="#rfq">组合询价</a></nav>
     <div class="top-meta"><span id="environment" class="status-chip">连接中</span><span id="clock" class="clock">--:--:-- UTC</span></div>
   </header>
   <main class="shell" id="overview">
     <section class="intro" aria-labelledby="pageTitle">
-      <div><div class="kicker"><span class="eyebrow-line"></span>BTC / OPTIONS STRATEGIES</div><h1 id="pageTitle">看清组合，掌握风险<span class="heading-dot">.</span></h1><p>BTC 期权策略台<span class="text-divider">/</span>行情、组合与执行，一览有序。</p></div>
+      <div><div class="kicker"><span class="eyebrow-line"></span>BTC / OPTIONS STRATEGIES</div><h1 id="pageTitle">BTC 期权执行台<span class="heading-dot">.</span></h1><p><a href="#orders" id="heroExecution">正在恢复执行状态…</a></p></div>
       <div class="intro-actions"><span class="update-state"><i id="updateDot"></i><span id="updateText">行情同步中</span></span><button id="refresh" class="button ghost"><svg class="icon" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M16 8a6.2 6.2 0 1 0-.4 5M16 3v5h-5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>立即刷新</button></div>
+    </section>
+    <section class="panel orders-panel" id="orders" aria-labelledby="ordersTitle" data-state="loading">
+      <div class="panel-head"><div><div class="kicker">EXECUTION / LIVE ORDERS</div><h2 id="ordersTitle">组合执行<span class="heading-detail">当前进度与净额</span></h2></div><span id="ordersSyncState" class="source-tag">等待同步</span></div>
+      <div class="orders-toolbar"><span id="ordersSummary">正在读取委托记录…</span><span id="ordersSnapshotTime">服务器快照 --</span><span>前台每 1 秒 · 后台至少 30 秒</span></div>
+      <p id="ordersNotice" class="orders-notice" role="status" aria-live="polite" hidden></p>
+      <p id="executionPending" class="orders-notice" role="status" aria-live="polite" hidden></p>
+      <div id="activeExecutions" class="execution-groups"></div>
+      <div id="ordersEmpty" class="empty">等待执行任务同步…</div>
+      <details id="executionHistory" class="execution-history" hidden><summary id="executionHistorySummary">最近结束的组合</summary><div id="executionHistoryBody" class="execution-groups"></div></details>
+      <details id="legacyOrders" class="execution-history" hidden><summary>独立委托与历史明细</summary>
+      <div id="ordersTableWrap" class="orders-table-wrap" tabindex="0" role="region" aria-label="执行挂单记录，可滚动查看" hidden>
+        <table class="orders-table" role="table" aria-label="执行挂单，价格单位 USD，数量单位 BTC，时间为 UTC">
+          <thead role="rowgroup"><tr role="row"><th scope="col">合约 / 订单标识</th><th scope="col">执行</th><th scope="col">价格 <small>USD</small></th><th scope="col">数量 <small>BTC</small></th><th scope="col">状态阶段</th><th scope="col">时间 <small>UTC</small></th></tr></thead>
+          <tbody id="ordersBody" role="rowgroup"></tbody>
+        </table>
+      </div>
+      </details>
+      <p class="orders-note">每次开仓或平仓按一笔组合跟踪。各腿数量单位 BTC；成交净额与手续费按实际币种展示，缺失金额待核对。RFQ 见组合询价。停止只撤未成交委托，已成交部分保留。</p>
     </section>
     <section class="stats" aria-label="策略指标">
       <article class="metric-featured"><span>净权利金 <small>NET CREDIT</small></span><strong id="creditValue">--</strong><small>每组策略 · USD</small></article>
@@ -62,22 +80,9 @@
         </div>
         <label class="confirm"><input id="confirm" type="checkbox" /><span id="confirmText">我已核对四腿、报价和风险上限</span></label>
         <button id="openTrade" class="button primary" disabled>模拟开仓四腿</button><button id="closeTrade" class="button close-button">模拟平仓已跟踪持仓</button>
-        <p class="microcopy">发送交易所订单前需要明确确认。各腿分别执行，成交进度可能不同。</p>
+        <p class="microcopy">开仓与平仓先核对固定方案，再独立确认提交。上方风险勾选用于创建新 RFQ。</p>
         <div class="schedule"><span>计划开仓 <small id="automaticMode">自动任务模式待同步</small></span><strong id="nextOpen">周五 21:00 UTC</strong></div>
       </aside>
-    </section>
-    <section class="panel orders-panel" id="orders" aria-labelledby="ordersTitle" data-state="loading">
-      <div class="panel-head"><div><div class="kicker">EXECUTION / LIVE ORDERS</div><h2 id="ordersTitle">执行挂单<span class="heading-detail">逐腿成交进度</span></h2></div><span id="ordersSyncState" class="source-tag">等待同步</span></div>
-      <div class="orders-toolbar"><span id="ordersSummary">正在读取委托记录…</span><span id="ordersSnapshotTime">服务器快照 --</span><span>前台每 1 秒 · 后台至少 30 秒</span></div>
-      <p id="ordersNotice" class="orders-notice" role="status" aria-live="polite" hidden></p>
-      <div id="ordersEmpty" class="empty">等待挂单同步…</div>
-      <div id="ordersTableWrap" class="orders-table-wrap" tabindex="0" role="region" aria-label="执行挂单记录，可滚动查看" hidden>
-        <table class="orders-table" role="table" aria-label="执行挂单，价格单位 USD，数量单位 BTC，时间为 UTC">
-          <thead role="rowgroup"><tr role="row"><th scope="col">合约 / 订单标识</th><th scope="col">执行</th><th scope="col">价格 <small>USD</small></th><th scope="col">数量 <small>BTC</small></th><th scope="col">状态阶段</th><th scope="col">时间 <small>UTC</small></th></tr></thead>
-          <tbody id="ordersBody" role="rowgroup"></tbody>
-        </table>
-      </div>
-      <p class="orders-note">显示本系统跟踪的单腿委托与最近 30 条结束记录；RFQ 见组合询价。快照更新不代表交易所已确认，撤单或拒绝也可能已有部分成交。</p>
     </section>
     <section class="bottom-grid" aria-label="策略与活动">
       <div class="panel strategy-panel">
@@ -114,10 +119,26 @@
     </section>
     <footer class="page-footer"><span>CONDOR<span class="brand-dot">.</span><small>BTC OPTIONS WORKSPACE</small></span><span>周五开仓 <span class="text-divider">/</span> 周日到期 <span class="text-divider">/</span> UTC</span><a href="#overview">返回顶部 ↑</a></footer>
   </main>
+  <dialog id="tradePlanDialog" class="trade-dialog" aria-labelledby="planTitle" aria-describedby="planRisk">
+    <div class="dialog-head"><div><div class="kicker">确认固定交易方案</div><h2 id="planTitle">核对方案</h2></div><button id="planCancel" class="link-button" type="button">关闭</button></div>
+    <p id="planEnvironment" class="plan-environment"></p><p id="planExpiry" class="plan-expiry" role="timer" aria-live="off"></p>
+    <div id="planLegs" class="plan-legs"></div><div id="planAmounts" class="plan-amounts"></div>
+    <label id="planNetLabel" for="planNetLimit">净价限制 · USD</label><input id="planNetLimit" name="net_limit" type="number" step="any" inputmode="decimal" autocomplete="off" aria-describedby="planRisk planError" />
+    <p id="planRisk" class="execution-caveat"></p><p id="planError" class="loss" role="status"></p>
+    <label class="confirm"><input id="planConfirm" type="checkbox" /><span id="planConfirmText">我已核对以上固定方案。</span></label>
+    <button id="planSubmit" class="button primary" type="button" disabled>确认执行</button>
+  </dialog>
+  <dialog id="rfqConfirmDialog" class="trade-dialog" aria-labelledby="rfqConfirmTitle">
+    <div class="dialog-head"><h2 id="rfqConfirmTitle">核对本次 RFQ 报价</h2><button id="rfqConfirmCancel" class="link-button" type="button">关闭</button></div>
+    <div id="rfqConfirmSummary"></div><p id="rfqConfirmError" class="loss" role="status"></p>
+    <p class="execution-caveat">确认后提交本次报价。取消询价不能撤回已提交的执行。</p>
+    <label class="confirm"><input id="rfqConfirm" type="checkbox" /><span>我确认以上合约、方向、数量、整组报价和风险。</span></label>
+    <button id="rfqConfirmSubmit" class="button primary" type="button" disabled>确认并执行报价</button>
+  </dialog>
   <aside id="notice" class="notice" role="status" aria-live="polite" aria-atomic="true" hidden><div><strong id="noticeTitle">操作结果</strong><button id="dismissNotice" class="notice-dismiss" aria-label="关闭操作提示">×</button></div><p id="noticeText"></p></aside>
   <script src="/static/hub.js?v=20261009-1"></script>
   <script src="/static/position-payoff.js?v=20261009-2"></script>
   <script src="/static/performance.js?v=20261009-1"></script>
-  <script src="/static/app.js?v=20261010-1"></script>
+  <script src="/static/app.js?v=20261010-2"></script>
 </body>
 </html>

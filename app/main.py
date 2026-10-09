@@ -13,12 +13,14 @@ from fastapi.staticfiles import StaticFiles
 from .bybit import BybitError
 from .config import get_settings
 from .engine import TradingEngine
+from .execution_activity import ACTIVE_EXECUTIONS, execution_dashboard
+from .trade_tasks import TradeConflict
 from .cache import SnapshotCache
 from .lease import StateLease
 from .hub import build_summary
 from .security import authorize_dashboard
 from .strategy import SundayExpiryUnavailable
-from .models import CloseRequest, OpenRequest, Position, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest, StrategyMode
+from .models import CloseRequest, OpenRequest, Position, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest, StrategyMode, TradePlanRequest, TradeTaskRequest
 
 # The dashboard polls several endpoints frequently; HTTP 200 access lines are
 # noise in production logs. Application warnings and errors remain visible.
@@ -32,10 +34,11 @@ account_cache = SnapshotCache(settings.account_cache_seconds)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     with StateLease(settings.state_file):
-        engine._load_state()
-        account_cache.invalidate()
         tasks = []
         try:
+            engine._load_state()
+            engine._initialize_trade_tasks(persist=True)
+            account_cache.invalidate()
             await engine.refresh_chain(force=True)
             tasks = [asyncio.create_task(engine.market_loop()), asyncio.create_task(engine.scheduler()), asyncio.create_task(engine.reconciliation_loop()), asyncio.create_task(engine.performance_loop())]
             yield
@@ -43,7 +46,10 @@ async def lifespan(_: FastAPI):
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            await engine.client.close()
+            try:
+                await engine.shutdown_trade_tasks()
+            finally:
+                await engine.client.close()
 
 
 app = FastAPI(title="BTC Iron Condor", version="0.1.0", lifespan=lifespan)
@@ -152,7 +158,21 @@ async def dashboard_account():
 
 @app.get("/api/dashboard/orders")
 async def dashboard_orders():
-    return engine.order_snapshot()
+    snapshot = engine.order_snapshot()
+    groups = _execution_cards()
+    active = [group for group in groups if group["execution_status"] in ACTIVE_EXECUTIONS]
+    return {**snapshot, "groups": groups,
+            "execution_active": bool(active or snapshot["active_count"] or engine.trading_operation_active()),
+            "active_execution_id": active[0]["execution_id"] if active else None}
+
+
+def _execution_cards(*, history_limit=30):
+    records = [*engine.performance_executions.values(), *engine.last_executions,
+               *(record for rows in engine.execution_details.values() for record in rows)]
+    return execution_dashboard(engine.execution_groups, engine.execution_group_links, engine.order_journal,
+                               engine.order_activity, records, history_limit=history_limit,
+                               stale_seconds=max(15, engine.settings.reconciliation_seconds * 2,
+                                                 engine.settings.bbo_poll_seconds * 3))
 
 
 performance_cache = SnapshotCache(15)
@@ -206,34 +226,86 @@ async def preview(quantity: float | None = Query(default=None, gt=0, allow_inf_n
 
 @app.post("/api/trading/open")
 async def open_trade(request: OpenRequest):
-    try:
-        results = await engine.open_position(request)
-        return {"results": [item.model_dump(mode="json") for item in results], "executions": [item.model_dump(mode="json") for item in engine.last_executions], "live": settings.can_trade_live and request.confirm_live, "orders_submitted": settings.can_send_orders and request.confirm_live, "environment": settings.environment}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except BybitError as exc:
-        raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
-    except httpx.HTTPError as exc:
-        return await upstream_error(None, exc)
-    except Exception as exc:
-        logging.getLogger(__name__).exception("Open request failed")
-        raise HTTPException(status_code=500, detail="Open request failed; check server logs and order state") from exc
+    raise HTTPException(status_code=409, detail="请先通过 /api/trading/plans 生成具体开仓方案，再通过 /api/trading/tasks 确认执行")
 
 
 @app.post("/api/trading/close")
 async def close_trade(request: CloseRequest):
+    raise HTTPException(status_code=409, detail="请先通过 /api/trading/plans 生成具体平仓方案，再通过 /api/trading/tasks 确认执行")
+
+
+@app.post("/api/trading/plans")
+async def prepare_trade_plan(request: TradePlanRequest):
     try:
-        results, executions = await engine.close_position(request)
-        return {"results": [item.model_dump(mode="json") for item in results], "executions": [item.model_dump(mode="json") for item in executions], "live": settings.can_trade_live and request.confirm_live, "orders_submitted": settings.can_send_orders and request.confirm_live, "environment": settings.environment}
+        return await engine.prepare_trade_plan(request)
+    except TradeConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except BybitError as exc:
         raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
-    except httpx.HTTPError as exc:
-        return await upstream_error(None, exc)
+
+
+@app.post("/api/trading/tasks", status_code=202)
+async def start_trade_task(request: TradeTaskRequest):
+    try:
+        return await engine.start_trade_task(request)
+    except TradeConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except BybitError as exc:
+        raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
+    except httpx.HTTPError:
+        raise
     except Exception as exc:
-        logging.getLogger(__name__).exception("Close request failed")
-        raise HTTPException(status_code=500, detail="Close request failed; check server logs and order state") from exc
+        logging.getLogger(__name__).exception("Trade task admission failed")
+        raise HTTPException(status_code=500, detail="任务提交结果尚未确认，请按请求编号查询执行记录") from exc
+
+
+@app.get("/api/trading/tasks")
+async def trade_tasks(
+    request_id: str | None = Query(default=None, min_length=1, max_length=128),
+    plan_id: str | None = Query(default=None, min_length=1, max_length=128),
+):
+    # Keep this snapshot synchronous: task admission rechecks the plan's age
+    # after its last await, then persists the accepted task without yielding.
+    now = datetime.now(timezone.utc)
+    groups = _execution_cards(history_limit=None if request_id is not None else 30)
+    items = [group for group in groups if request_id is None or group["request_id"] == request_id]
+    admitting = engine._trade_admitting
+    saved = engine.trade_plans.get(plan_id) if plan_id else None
+    unavailable = saved is None or now >= datetime.fromisoformat(saved["plan"]["expires_at"])
+    # A missing plan cannot be accepted after a restart. A state read failure
+    # cannot prove the durable task inventory is complete, so remain uncertain.
+    closed = bool(request_id and plan_id and not items and not admitting and not engine.state_error and unavailable)
+    return {"items": items, "request_id": request_id, "plan_id": plan_id,
+            "server_time": now.isoformat(), "admission_active": admitting, "admission_closed": closed}
+
+
+def _trade_task(execution_id: str):
+    group = next((item for item in _execution_cards(history_limit=None) if item["execution_id"] == execution_id), None)
+    if group is None:
+        raise HTTPException(status_code=404, detail="执行任务不存在，请刷新执行记录")
+    return group
+
+
+@app.get("/api/trading/tasks/{execution_id}")
+async def trade_task(execution_id: str):
+    return _trade_task(execution_id)
+
+
+@app.post("/api/trading/tasks/{execution_id}/stop")
+async def stop_trade_task(execution_id: str):
+    if execution_id not in engine.execution_groups:
+        raise HTTPException(status_code=404, detail="执行任务不存在，请刷新执行记录")
+    try:
+        engine.stop_trade_task(execution_id)
+        return _trade_task(execution_id)
+    except TradeConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/rfq/config")
@@ -258,6 +330,8 @@ async def rfq_status(refresh: bool = Query(default=True)):
 async def rfq_create(request: RfqCreateRequest):
     try:
         return await engine.create_rfq(request)
+    except TradeConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except BybitError as exc:
@@ -268,6 +342,8 @@ async def rfq_create(request: RfqCreateRequest):
 async def rfq_execute(request: RfqExecuteRequest):
     try:
         return await engine.execute_rfq(request)
+    except TradeConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except BybitError as exc:
@@ -278,6 +354,8 @@ async def rfq_execute(request: RfqExecuteRequest):
 async def rfq_cancel(request: RfqCancelRequest):
     try:
         return await engine.cancel_rfq(request)
+    except TradeConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except BybitError as exc:

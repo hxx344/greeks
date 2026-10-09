@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const {test} = require('node:test');
 
-function dashboard({embedded = false, request} = {}) {
+function dashboard({embedded = false, request, storage = new Map()} = {}) {
   const elements = new Map();
   const pending = [];
   const requests = [], events = new Map(), messages = [];
@@ -23,7 +23,7 @@ function dashboard({embedded = false, request} = {}) {
   };
   const context = vm.createContext({
     document: {visibilityState: 'visible', addEventListener(name, callback) { events.set(name, callback); }, getElementById: element, querySelector() { return null; }, querySelectorAll() { return []; }},
-    window: {location: {hostname: embedded ? 'p-0123456789abcdef01234567.hub.localhost' : 'localhost', protocol: 'http:', port: '8000'}, parent, navigator: {onLine: true}, localStorage: {getItem() { return null; }, setItem() {}}, addEventListener(name, callback) { events.set(name, callback); }},
+    window: {location: {hostname: embedded ? 'p-0123456789abcdef01234567.hub.localhost' : 'localhost', protocol: 'http:', port: '8000'}, parent, navigator: {onLine: true}, crypto: {randomUUID: () => '22222222-2222-4222-8222-222222222222'}, localStorage: {getItem(key) { return storage.get(key) ?? null; }, setItem(key, value) { storage.set(key, value); }}, addEventListener(name, callback) { events.set(name, callback); }},
     setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, {callback, delay}); return id; },
     clearTimeout(id) { timers.delete(id); },
     setInterval() {},
@@ -56,15 +56,12 @@ test('partial and failed orders are not reported as successful', () => {
   assert.match(context.tradeResultMessage({live: true, results: [{status: 'filled'}]}, '平仓'), /订单已全部成交/);
 });
 
-test('polling preserves busy trade button text', () => {
+test('polling preserves the shared pending state across all trading controls', () => {
   const {context, element} = dashboard();
-  const button = element('openTrade');
-  button.dataset.busy = '1';
-  button.disabled = true;
-  button.textContent = '执行中…';
+  context.setTradeLock('openTrade');
   context.updateTradeControls();
-  assert.equal(button.textContent, '执行中…');
-  assert.equal(button.disabled, true);
+  assert.equal(element('openTrade').textContent, '准备方案…');
+  for (const id of ['openTrade', 'closeTrade', 'rfqCreate']) assert.equal(element(id).disabled, true);
 });
 
 test('state failure disables both trading buttons even with confirmation', () => {
@@ -218,7 +215,7 @@ test('sampled charts use real time, bounded smooth paths, and break at missing s
   assert.doesNotMatch(old, / C/);
 });
 
-test('testnet mode requires confirmation and reports exchange fills as testnet', async () => {
+test('testnet mode requires separate plan confirmation and reports exchange fills as testnet', async () => {
   const {context, element, pending} = dashboard();
   const payload = marketPayload(false);
   Object.assign(payload.config, {environment: 'testnet', live_enabled: false, trading_enabled: true, market_testnet: true});
@@ -227,10 +224,13 @@ test('testnet mode requires confirmation and reports exchange fills as testnet',
   assert.equal(element('modeTitle').textContent, '测试网模式已启用');
   assert.equal(element('environment').textContent, 'TESTNET');
   assert.match(element('statusSub').textContent, /测试网行情/);
-  assert.equal(element('openTrade').disabled, true);
+  assert.equal(element('openTrade').disabled, false, 'preparing a plan never submits an order');
+  assert.equal(element('planSubmit').disabled, true);
+  assert.equal(element('rfqCreate').disabled, true);
   element('confirm').checked = true;
   context.updateTradeControls();
-  assert.equal(element('openTrade').disabled, false);
+  assert.equal(element('rfqCreate').disabled, false);
+  assert.equal(element('planSubmit').disabled, true, 'opening preview consent is not plan consent');
   assert.match(context.tradeResultMessage({live: false, orders_submitted: true, environment: 'testnet', results: [{status: 'filled'}]}, '开仓'), /测试网开仓订单已全部成交/);
 });
 
@@ -496,7 +496,7 @@ test('configured default initializes the selector while manual changes leave aut
 });
 
 test('manual opening and new RFQ capture mode once and never replay on a later mode change', async () => {
-  for (const [action, endpoint] of [['openTrade', '/api/trading/open'], ['createRfq', '/api/rfq/create']]) {
+  for (const [action, endpoint] of [['openTrade', '/api/trading/plans'], ['createRfq', '/api/rfq/create']]) {
     const page = dashboard(); await readyStrategy(page, 'short_strangle');
     page.element('confirm').checked = true;
     const writes = [];
@@ -551,8 +551,9 @@ test('closing stays bound to tracked positions and does not send the opening sel
   };
   await page.context.closeTrade();
   assert.equal(writes.length, 1);
-  assert.equal(writes[0].url, '/api/trading/close');
-  assert.deepEqual(writes[0].body, {confirm_live:true});
+  assert.equal(writes[0].url, '/api/trading/plans');
+  assert.deepEqual(writes[0].body, {operation:'close'});
+  assert.equal(page.element('planSubmit').disabled, true);
 });
 
 test('legacy four-leg preview keeps finite loss and PM estimate labels', async () => {
@@ -588,40 +589,58 @@ function orderSnapshot(item = {}, snapshot = {}) {
 }
 const jsonResponse = payload => ({ok: true, text: async () => JSON.stringify(payload)});
 
-test('order polling updates fills and requested prices every second while the opening POST is pending', async () => {
+function tradePlan(operation = 'open', overrides = {}) {
+  return {plan_id: 'plan-one', operation, environment: 'testnet', strategy_mode: 'iron_condor',
+    created_at: new Date().toISOString(), expires_at: new Date(Date.now() + 30000).toISOString(),
+    legs: strategyMarket().preview.legs.map(leg => ({...leg, reference_price: leg.mark_price, expiry: '2099-09-13T08:00:00Z'})),
+    estimated_gross_usd: 10, estimated_fee_usd: .4, estimated_net_usd: 9.6, estimated_margin_usd: 55,
+    min_net_income_usd: 9.6, max_net_cost_usd: 10.4, ...overrides};
+}
+function executionGroup(overrides = {}) {
+  return {execution_id: 'execution-one', request_id: '22222222-2222-4222-8222-222222222222', plan_id: 'plan-one',
+    operation: 'open', strategy_mode: 'iron_condor', execution_status: 'running', can_stop: true,
+    created_at: '2026-10-10T04:00:00Z', elapsed_seconds: 25, completed_legs: 1, total_legs: 4, progress_ratio: .35,
+    amounts_complete: true, gross_amount: 8, fee_amount: .2, net_amount: 7.8, currency: 'USDT',
+    legs: [{symbol: 'BTC-13SEP99-105000-C-USDT', side: 'Sell', target_qty: .01, filled_qty: .004,
+      remaining_qty: .006, progress_ratio: .4, complete: false, unknown: false, orders: []}], ...overrides};
+}
+
+test('order polling updates fills every second while task submission is pending and every trading action stays locked', async () => {
   let resolveWrite, orderReads = 0;
   const page = dashboard({request(url, options) {
-    if (options?.method === 'POST') return new Promise(resolve => { resolveWrite = resolve; });
+    if (url === '/api/trading/plans') return Promise.resolve(jsonResponse(tradePlan()));
+    if (url === '/api/trading/tasks' && options?.method === 'POST') return new Promise(resolve => { resolveWrite = resolve; });
     if (url.startsWith('/api/dashboard/market')) return Promise.resolve(jsonResponse(strategyMarket()));
     if (url === '/api/dashboard/orders') {
       orderReads++;
-      return Promise.resolve(jsonResponse(orderSnapshot(orderReads === 1 ? {} : {
+      return Promise.resolve(jsonResponse(orderReads === 1 ? {items: [], groups: [], execution_active:false} : orderSnapshot({
         phase: 'amending', requested_price: 105, confirmed_price: 100, filled_qty: .002, remaining_qty: .008,
       })));
     }
     return Promise.reject(new Error('offline'));
   }});
   await new Promise(setImmediate);
-  page.element('confirm').checked = true;
-  const write = page.context.openTrade();
-  assert.equal(page.element('openTrade').dataset.busy, '1');
-  assert.equal(page.requests.filter(item => item.options?.method === 'POST').length, 1);
+  await page.context.openTrade();
+  page.element('planConfirm').checked = true;
+  const write = page.context.submitTradePlan();
+  await page.context.openTrade(); await page.context.closeTrade(); await page.context.createRfq();
+  assert.equal(page.requests.filter(item => item.url === '/api/trading/tasks').length, 1);
+  const readsBeforeTick = orderReads;
   const timer = [...page.timers].find(([, item]) => item.delay === 1000);
   assert.ok(timer, 'orders have an independent one-second timer');
   page.fireTimer(timer[0]);
   await new Promise(setImmediate);
-  assert.equal(orderReads, 2);
-  assert.equal(page.element('openTrade').dataset.busy, '1');
-  assert.equal(page.element('openTrade').textContent, '执行中…');
+  assert.equal(orderReads, readsBeforeTick + 1);
+  for (const id of ['openTrade', 'closeTrade', 'rfqCreate']) assert.equal(page.element(id).disabled, true);
   assert.match(page.element('ordersBody').innerHTML, /正在改价/);
   assert.match(page.element('ordersBody').innerHTML, /申请<\/small><b>105\.00/);
   assert.match(page.element('ordersBody').innerHTML, /已确认<\/small><b>100\.00/);
   assert.match(page.element('ordersBody').innerHTML, /累计成交<\/small><b>0\.002/);
   assert.match(page.element('ordersBody').innerHTML, /未成交<\/small><b>0\.008/);
   assert.equal(page.element('ordersSyncState').textContent, '执行中 · 持续同步');
-  resolveWrite(jsonResponse({live: true, results: [{status: 'filled'}]}));
+  resolveWrite(jsonResponse({execution_id: 'execution-one', execution_status:'accepted'}));
   await write;
-  assert.equal(page.requests.filter(item => item.options?.method === 'POST').length, 1);
+  assert.equal(page.requests.filter(item => item.url === '/api/trading/tasks').length, 1);
 });
 
 test('order failures and offline transitions preserve the last snapshot and recover with a fresh read', async () => {
@@ -739,4 +758,294 @@ test('order clock updates leave unchanged rows in place and invalid payloads ret
   assert.equal(replacements, 0);
   assert.equal(element('orders').dataset.state, 'stale');
   assert.equal(element('ordersSnapshotTime').textContent, '服务器快照 10-10 04:00:06 UTC');
+});
+
+async function planPage(plan = tradePlan(), handler = () => Promise.reject(new Error('offline'))) {
+  const page = dashboard({request(url, options) {
+    if (url.startsWith('/api/dashboard/market')) return Promise.resolve(jsonResponse(strategyMarket()));
+    if (url === '/api/trading/plans') return Promise.resolve(jsonResponse(plan));
+    return handler(url, options);
+  }});
+  await new Promise(setImmediate);
+  return page;
+}
+
+test('fixed open plan requires its own confirmation, binds contract and net price, and never submits twice', async () => {
+  let finish;
+  const page = await planPage(tradePlan(), (url, options) => url === '/api/trading/tasks'
+    ? new Promise(resolve => { finish = resolve; }) : Promise.reject(new Error('offline')));
+  page.element('confirm').checked = true;
+  await page.context.openTrade();
+  assert.equal(page.element('tradePlanDialog').open, true);
+  assert.equal(page.element('planSubmit').disabled, true);
+  assert.equal(page.element('planConfirm').checked, false);
+  assert.match(page.element('planLegs').innerHTML, /BTC-13SEP99-105000-C-USDT/);
+  assert.match(page.element('planLegs').innerHTML, /数量 0\.01 BTC/);
+  assert.equal(page.element('planNetLimit').value, '9.6');
+  await page.context.submitTradePlan();
+  assert.equal(page.requests.filter(item => item.url === '/api/trading/tasks').length, 0);
+  page.element('planNetLimit').value = '8.5'; page.element('planNetLimit').dispatch('input');
+  page.element('planConfirm').checked = true;
+  const submission = page.context.submitTradePlan();
+  await page.context.submitTradePlan(); await page.context.closeTrade(); await page.context.createRfq();
+  const tasks = page.requests.filter(item => item.url === '/api/trading/tasks');
+  assert.equal(tasks.length, 1);
+  assert.deepEqual(JSON.parse(tasks[0].options.body), {plan_id: 'plan-one', request_id: '22222222-2222-4222-8222-222222222222', confirm_live: true, min_net_income_usd: 8.5});
+  assert.equal(tasks[0].options.signal, undefined);
+  finish(jsonResponse({execution_id:'execution-one', execution_status:'accepted'}));
+  await submission;
+  for (const id of ['openTrade', 'closeTrade', 'rfqCreate']) assert.equal(page.element(id).disabled, true);
+});
+
+test('close confirmation uses tracked remainder, accepts negative net cost, and ignores opening quantity and checkbox', async () => {
+  const plan = tradePlan('close', {legs: [{symbol:'BTC-13SEP99-105000-C-USDT', side:'Buy', qty:.004,
+    expiry:'2099-09-13T08:00:00Z', strike:105000, option_type:'Call', reference_price:100}], max_net_cost_usd:-2});
+  const page = await planPage(plan, url => url === '/api/trading/tasks'
+    ? Promise.resolve(jsonResponse({execution_id:'execution-one', execution_status:'accepted'})) : Promise.reject(new Error('offline')));
+  page.element('quantity').value = '100'; page.element('confirm').checked = false;
+  await page.context.closeTrade();
+  assert.deepEqual(JSON.parse(page.requests.find(item => item.url === '/api/trading/plans').options.body), {operation:'close'});
+  assert.match(page.element('planLegs').innerHTML, /数量 0\.004 BTC/);
+  assert.equal(page.element('planNetLimit').value, '-2');
+  assert.equal(page.element('planSubmit').disabled, true);
+  page.element('planConfirm').checked = true;
+  await page.context.submitTradePlan();
+  const body = JSON.parse(page.requests.find(item => item.url === '/api/trading/tasks').options.body);
+  assert.equal(body.confirm_live, true); assert.equal(body.max_net_cost_usd, -2);
+  assert.equal(body.quantity, undefined); assert.equal(body.strategy_mode, undefined);
+});
+
+test('expired plans, nonfinite limits, and changing selection cannot reuse confirmation', async () => {
+  const page = await planPage();
+  await page.context.openTrade();
+  page.element('planConfirm').checked = true;
+  page.element('planNetLimit').value = 'Infinity'; page.context.updatePlanControls();
+  assert.equal(page.element('planSubmit').disabled, true);
+  page.element('planNetLimit').value = '9'; page.element('planNetLimit').dispatch('input');
+  assert.equal(page.element('planConfirm').checked, false);
+  page.element('quantity').value = '.02'; page.element('quantity').dispatch('input');
+  assert.equal(page.element('tradePlanDialog').open, false);
+  await page.context.submitTradePlan();
+  assert.equal(page.requests.filter(item => item.url === '/api/trading/tasks').length, 0);
+  const expired = await planPage(tradePlan('open', {expires_at:'2000-01-01T00:00:00Z'}));
+  await expired.context.openTrade(); expired.element('planConfirm').checked = true;
+  await expired.context.submitTradePlan();
+  assert.equal(expired.element('planConfirm').checked, false);
+  assert.match(expired.element('planExpiry').textContent, /已过期/);
+  assert.equal(expired.requests.filter(item => item.url === '/api/trading/tasks').length, 0);
+});
+
+test('lost submission response stays locked across empty recovery reads and recovers one task without another write', async () => {
+  let recovered = null;
+  const page = await planPage(tradePlan(), url => {
+    if (url === '/api/trading/tasks') return Promise.reject(new Error('connection lost'));
+    if (url.startsWith('/api/trading/tasks?')) return Promise.resolve(jsonResponse({items: recovered ? [recovered] : []}));
+    return Promise.reject(new Error('offline'));
+  });
+  await page.context.openTrade(); page.element('planConfirm').checked = true;
+  await page.context.submitTradePlan(); await new Promise(setImmediate);
+  await page.context.openTrade(); await page.context.closeTrade(); await page.context.createRfq();
+  assert.equal(page.requests.filter(item => item.url === '/api/trading/plans').length, 1);
+  assert.equal(page.requests.filter(item => item.url === '/api/trading/tasks').length, 1);
+  assert.equal(page.element('closeTrade').disabled, true);
+  assert.match(page.element('executionPending').textContent, /提交结果待核对/);
+  recovered = executionGroup();
+  await page.context.recoverPendingExecution();
+  assert.equal(page.element('closeTrade').disabled, true, 'accepted task remains exclusive');
+  const terminal = executionGroup({execution_status:'stopped', can_stop:false});
+  page.context.renderOrders({items:[], groups:[terminal], execution_active:false});
+  assert.equal(page.element('closeTrade').disabled, false);
+  assert.equal(page.requests.filter(item => item.url === '/api/trading/tasks').length, 1);
+});
+
+test('restored request hints recover after reload and do not turn an empty server response into permission to retry', async () => {
+  const storage = new Map([['ic-pending-execution', JSON.stringify({request_id:'request-restored', plan_id:'old-plan'})]]);
+  const page = dashboard({storage, request(url) {
+    if (url === '/api/dashboard/orders') return Promise.resolve(jsonResponse({items:[], groups:[], execution_active:false}));
+    if (url.startsWith('/api/trading/tasks?')) return Promise.resolve(jsonResponse({items:[]}));
+    return Promise.reject(new Error('offline'));
+  }});
+  await new Promise(setImmediate);
+  assert.equal(page.element('closeTrade').disabled, true);
+  assert.ok(page.requests.some(item => item.url === '/api/trading/tasks?request_id=request-restored&plan_id=old-plan'));
+  page.context.renderOrders({items:[], execution_active:true, groups:[executionGroup({request_id:'request-restored'})]});
+  assert.equal(JSON.parse(storage.get('ic-pending-execution')), null);
+  assert.match(page.element('activeExecutions').innerHTML, /停止执行/);
+});
+
+test('server closure proof unlocks unaccepted expired and missing plans, including old recovery hints', async (t) => {
+  for (const hint of [{request_id:'request-restored', plan_id:'missing-plan'},
+    {request_id:'request-restored', plan_id:'expired-plan', expires_at:'2000-01-01T00:00:00Z'}]) {
+    await t.test(hint.plan_id, async () => {
+      const storage = new Map([['ic-pending-execution', JSON.stringify(hint)]]);
+      const page = dashboard({embedded:true, storage, request(url) {
+        assert.equal(url, `/api/trading/tasks?request_id=${hint.request_id}&plan_id=${hint.plan_id}`);
+        return Promise.resolve(jsonResponse({items:[], request_id:hint.request_id, plan_id:hint.plan_id,
+          server_time:'2026-10-10T04:00:00Z', admission_active:false, admission_closed:true}));
+      }});
+      page.context.renderOrders({items:[], groups:[], execution_active:false});
+      assert.equal(page.element('closeTrade').disabled, true);
+      await page.context.recoverPendingExecution();
+      assert.equal(JSON.parse(storage.get('ic-pending-execution')), null);
+      assert.equal(page.element('closeTrade').disabled, false);
+      assert.equal(page.element('executionPending').hidden, true);
+      assert.equal(page.element('heroExecution').textContent, '当前无活动执行');
+      assert.match(page.element('noticeText').textContent, /原方案未被接纳且已失效/);
+      assert.equal(page.requests.filter(item => item.options?.method === 'POST').length, 0);
+    });
+  }
+});
+
+test('pending recovery requires matching identities and explicit complete server closure proof', async (t) => {
+  const hint = {request_id:'request-restored', plan_id:'old-plan'};
+  const proof = {items:[], ...hint, admission_active:false, admission_closed:true};
+  const cases = [
+    ['admission in progress', {admission_active:true}],
+    ['plan remains open', {admission_closed:false}],
+    ['missing closure proof', {admission_closed:undefined}],
+    ['wrong request', {request_id:'another-request'}],
+    ['wrong plan', {plan_id:'another-plan'}],
+    ['nonempty result', {items:[{request_id:'another-request'}]}],
+    ['missing result', {items:undefined}],
+    ['nonboolean admission status', {admission_active:'false'}],
+  ];
+  for (const [name, overrides] of cases) await t.test(name, async () => {
+    const storage = new Map([['ic-pending-execution', JSON.stringify(hint)]]);
+    const page = dashboard({embedded:true, storage, request() { return Promise.resolve(jsonResponse({...proof, ...overrides})); }});
+    page.context.renderOrders({items:[], groups:[], execution_active:false});
+    await page.context.recoverPendingExecution();
+    assert.deepEqual(JSON.parse(storage.get('ic-pending-execution')), hint);
+    assert.equal(page.element('closeTrade').disabled, true);
+    assert.equal(page.requests.filter(item => item.options?.method === 'POST').length, 0);
+  });
+});
+
+test('a late closure proof cannot clear a newer pending request or plan', async (t) => {
+  for (const replacement of [{request_id:'new-request', plan_id:'old-plan'}, {request_id:'request-restored', plan_id:'new-plan'}]) {
+    await t.test(`${replacement.request_id}/${replacement.plan_id}`, async () => {
+      let finish;
+      const hint = {request_id:'request-restored', plan_id:'old-plan'};
+      const storage = new Map([['ic-pending-execution', JSON.stringify(hint)]]);
+      const page = dashboard({embedded:true, storage, request() { return new Promise(resolve => { finish = resolve; }); }});
+      const recovery = page.context.recoverPendingExecution();
+      page.context.persistPending(replacement);
+      page.context.updateTradeControls();
+      finish(jsonResponse({items:[], ...hint, admission_active:false, admission_closed:true}));
+      await recovery;
+      assert.deepEqual(JSON.parse(storage.get('ic-pending-execution')), replacement);
+      assert.equal(page.element('closeTrade').disabled, true);
+    });
+  }
+});
+
+test('combination progress keeps real currency, signed net, missing amounts, historical details, and simulation distinct', () => {
+  const {context, element} = dashboard({embedded:true});
+  const active = executionGroup({net_amount:-1.2, currency:'USDC'});
+  const terminal = executionGroup({execution_id:'completed-one', execution_status:'completed', can_stop:false,
+    completed_legs:4, progress_ratio:1, amounts_complete:false, currency:null, simulated:true});
+  context.renderOrders({items:[], execution_active:true, groups:[active, terminal]});
+  assert.equal(element('ordersSummary').textContent, '执行中 1 组 · 最近结束 1 组');
+  assert.match(element('activeExecutions').innerHTML, /完成 1 \/ 4 腿/);
+  assert.match(element('activeExecutions').innerHTML, /-1\.2 USDC/);
+  assert.match(element('activeExecutions').innerHTML, /目标 <b>0\.01/);
+  assert.match(element('activeExecutions').innerHTML, /剩余 <b>0\.006/);
+  assert.doesNotMatch(element('activeExecutions').innerHTML, /completed-one/);
+  assert.match(element('executionHistoryBody').innerHTML, /模拟 · 无真实成交/);
+  assert.doesNotMatch(element('executionHistoryBody').innerHTML, /金额与费用待核对/);
+  const unknown = executionGroup({amounts_complete:false, gross_amount:null, fee_amount:null, net_amount:null,
+    has_unknown:true, status_message:'<script>test</script>'});
+  context.renderOrders({items:[], groups:[unknown], execution_active:true});
+  assert.match(element('activeExecutions').innerHTML, /金额与费用待核对/);
+  assert.match(element('activeExecutions').innerHTML, /&lt;script&gt;/);
+  assert.doesNotMatch(element('activeExecutions').innerHTML, /\+0 USD|<script>/);
+});
+
+test('stop remains available during execution and requests only one stop without reversing partial fills', async () => {
+  let finishStop;
+  const page = dashboard({embedded:true, request(url) {
+    if (url.endsWith('/stop')) return new Promise(resolve => { finishStop = resolve; });
+    return Promise.reject(new Error('offline'));
+  }});
+  page.context.renderOrders({items:[], groups:[executionGroup()], execution_active:true});
+  assert.equal(page.element('closeTrade').disabled, true);
+  const stopping = page.context.stopExecution('execution-one');
+  await page.context.stopExecution('execution-one');
+  assert.equal(page.requests.filter(item => item.options?.method === 'POST').length, 1);
+  assert.equal(page.requests[0].url, '/api/trading/tasks/execution-one/stop');
+  assert.equal(page.requests[0].options.body, undefined);
+  assert.match(page.element('activeExecutions').innerHTML, /停止请求待核对/);
+  finishStop(jsonResponse({execution_status:'stopping'})); await stopping;
+  page.context.renderOrders({items:[], groups:[executionGroup({execution_status:'partial', can_stop:false})], execution_active:false});
+  assert.match(page.element('executionHistoryBody').innerHTML, /部分成交 · 已结束/);
+  assert.match(page.element('executionHistoryBody').innerHTML, /已成 <b>0\.004/);
+  assert.equal(page.element('closeTrade').disabled, false);
+});
+
+test('ambiguous stop failures wait for a fresh running snapshot before an idempotent retry', async (t) => {
+  for (const failure of ['network', '503']) await t.test(failure, async () => {
+    let attempts = 0, finish;
+    const page = dashboard({embedded:true, request(url) {
+      assert.equal(url, '/api/trading/tasks/execution-one/stop');
+      if (++attempts === 1) return failure === 'network' ? Promise.reject(new Error('connection lost'))
+        : Promise.resolve({ok:false, status:503, text:async () => JSON.stringify({detail:'unavailable'})});
+      return new Promise(resolve => { finish = resolve; });
+    }});
+    const running = () => ({items:[], groups:[executionGroup()], execution_active:true});
+    page.context.renderOrders(running());
+    await page.context.stopExecution('execution-one');
+    assert.match(page.element('activeExecutions').innerHTML, /data-stop="execution-one" disabled>停止请求待核对/);
+    await page.context.stopExecution('execution-one');
+    assert.equal(attempts, 1, 'failed write alone does not authorize a retry');
+    page.context.renderOrders(running());
+    assert.match(page.element('activeExecutions').innerHTML, /data-stop="execution-one" >重试停止/);
+    assert.match(page.element('activeExecutions').innerHTML, /已成 <b>0\.004/);
+    const retry = page.context.stopExecution('execution-one');
+    page.context.renderOrders(running());
+    await page.context.stopExecution('execution-one');
+    assert.equal(attempts, 2, 'the retry also blocks concurrent clicks');
+    finish(jsonResponse(executionGroup({execution_status:'stopping', can_stop:false})));
+    await retry;
+    page.context.renderOrders(running());
+    assert.match(page.element('activeExecutions').innerHTML, /data-stop="execution-one" disabled>已请求停止/);
+    await page.context.stopExecution('execution-one');
+    assert.equal(attempts, 2, 'an acknowledged stop stays locked while awaiting the terminal snapshot');
+    assert.equal(page.element('closeTrade').disabled, true);
+    page.context.renderOrders({items:[], groups:[executionGroup({execution_status:'partial', can_stop:false})], execution_active:false});
+    assert.match(page.element('executionHistoryBody').innerHTML, /部分成交 · 已结束/);
+    assert.match(page.element('executionHistoryBody').innerHTML, /已成 <b>0\.004/);
+  });
+});
+
+test('a stop failure followed by a server stop marker never offers another stop', async () => {
+  const page = dashboard({embedded:true, request() { return Promise.reject(new Error('connection lost')); }});
+  page.context.renderOrders({items:[], groups:[executionGroup()], execution_active:true});
+  await page.context.stopExecution('execution-one');
+  page.context.renderOrders({items:[], groups:[executionGroup({stop_requested_at:'2026-10-10T04:00:01Z'})], execution_active:true});
+  assert.match(page.element('activeExecutions').innerHTML, /data-stop="execution-one" disabled>已请求停止/);
+  await page.context.stopExecution('execution-one');
+  assert.equal(page.requests.length, 1);
+});
+
+test('RFQ uses independent quote consent and preserves all button locks through polling', async () => {
+  let finish;
+  const page = await planPage(tradePlan(), url => url === '/api/rfq/execute'
+    ? new Promise(resolve => { finish = resolve; }) : Promise.reject(new Error('offline')));
+  const legs = strategyMarket('short_strangle').preview.legs;
+  const state = {rfq_id:'rfq-one', status:'Active', strategy_mode:'short_strangle', legs,
+    quotes:[{quoteId:'quote-one', quoteSellList:legs.map(leg => ({symbol:leg.symbol, qty:.01, price:600}))}]};
+  page.context.renderRfq(state); page.element('confirm').checked = true;
+  const event = {currentTarget:{dataset:{rfq:'rfq-one', quote:'quote-one', side:'Sell'}}};
+  await page.context.executeRfq(event);
+  assert.equal(page.element('rfqConfirmSubmit').disabled, true);
+  assert.match(page.element('rfqConfirmSummary').innerHTML, /亏损无上限/);
+  await page.context.submitRfqConfirmation();
+  assert.equal(page.requests.filter(item => item.url === '/api/rfq/execute').length, 0);
+  page.element('rfqConfirm').checked = true;
+  const submitting = page.context.submitRfqConfirmation();
+  page.context.renderRfq(state);
+  assert.match(page.element('rfqQuotes').innerHTML, /data-executable="true" disabled/);
+  for (const id of ['openTrade','closeTrade','rfqCreate','rfqCancel']) assert.equal(page.element(id).disabled, true);
+  await page.context.executeRfq(event); await page.context.openTrade(); await page.context.closeTrade();
+  assert.equal(page.requests.filter(item => item.url === '/api/rfq/execute').length, 1);
+  finish(jsonResponse({status:'Filled'})); await submitting;
 });

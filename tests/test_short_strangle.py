@@ -159,13 +159,17 @@ class ShortStrangleEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.engine.make_preview(.1)).strategy_mode, "iron_condor")
         self.settings.auto_open = True
         self.engine.is_open_window = Mock(return_value=True)
-        self.engine.open_position = AsyncMock()
+        self.engine.prepare_trade_plan = AsyncMock(return_value={"plan_id": "scheduled-plan"})
+        self.engine.start_trade_task = AsyncMock()
         with patch("app.engine.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
             with self.assertRaises(asyncio.CancelledError):
                 await self.engine.scheduler()
-        request = self.engine.open_position.await_args.args[0]
+        request = self.engine.prepare_trade_plan.await_args.args[0]
         self.assertEqual(request.strategy_mode, "iron_condor")
-        self.assertTrue(self.engine.open_position.await_args.kwargs["scheduled"])
+        submitted = self.engine.start_trade_task.await_args.args[0]
+        self.assertEqual(submitted.plan_id, "scheduled-plan")
+        self.assertTrue(submitted.confirm_live)
+        self.assertTrue(self.engine.start_trade_task.await_args.kwargs["scheduled"])
 
     async def test_real_mocked_two_leg_open_close_preserves_mode_and_original_structure(self):
         results = await self.engine.open_position(OpenRequest(confirm_live=True, quantity=.1, strategy_mode="short_strangle"))

@@ -76,6 +76,20 @@ class CloseRequest(BaseModel):
     confirm_live: bool = False
 
 
+class TradePlanRequest(BaseModel):
+    operation: Literal["open", "close"]
+    quantity: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    strategy_mode: StrategyMode | None = None
+
+
+class TradeTaskRequest(BaseModel):
+    plan_id: str = Field(min_length=1, max_length=128)
+    request_id: str = Field(min_length=1, max_length=128)
+    confirm_live: bool = False
+    min_net_income_usd: float | None = Field(default=None, allow_inf_nan=False)
+    max_net_cost_usd: float | None = Field(default=None, allow_inf_nan=False)
+
+
 class RfqCreateRequest(BaseModel):
     confirm_live: bool = False
     counterparties: list[str] = Field(default_factory=list)

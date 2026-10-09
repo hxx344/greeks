@@ -112,8 +112,10 @@ class SafetyTests(unittest.TestCase):
             asyncio.run(self.engine.execute_rfq(self.rfq_request))
         restored = TradingEngine(self.engine.settings)
         self.assertEqual(restored.rfq_state["status"], "ExecutionUnknown")
-        with self.assertRaisesRegex(ValueError, "no longer available"):
+        restored.client.execute_quote = AsyncMock()
+        with self.assertRaisesRegex(ValueError, "Unresolved RFQ"):
             asyncio.run(restored.execute_rfq(self.rfq_request))
+        restored.client.execute_quote.assert_not_awaited()
         self.engine.client.execute_quote.assert_awaited_once()
 
     def test_active_rfq_cannot_be_overwritten(self):

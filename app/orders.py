@@ -79,7 +79,12 @@ class OrderExecutor:
             else:
                 self._observe_snapshot(observer, order, outcome)
                 if order is not None and record is not None:
-                    record(outcome)
+                    try:
+                        record(outcome)
+                    except Exception as exc:
+                        # Storage errors block further trading in the engine,
+                        # but must not interrupt exchange cancellation checks.
+                        self.log("ERROR", f"Could not persist reconciled order {link}: {exc}")
                 if outcome["terminal"]:
                     return outcome
             if attempt + 1 < self.settings.failed_leg_position_checks:
@@ -89,14 +94,30 @@ class OrderExecutor:
         self.log("ERROR", f"Order {link} remains unresolved; automatic retry is blocked")
         return outcome
 
-    async def execute(self, instrument, side: str, qty: float, link: str, record, reduce_only: bool = False, market: bool = False, check_price=None, observer=None) -> dict:
+    async def execute(self, instrument, side: str, qty: float, link: str, record, reduce_only: bool = False, market: bool = False, check_price=None, observer=None, stop_event=None) -> dict:
         outcome = {"orderId": "", "orderLinkId": link, "status": "unknown", "terminal": False, "filledQty": 0.0}
         attempted = False
         last_price = None
         deadline = asyncio.get_running_loop().time() + self.settings.bbo_order_timeout_seconds
+        def check_stop():
+            if stop_event is not None and stop_event.is_set():
+                raise ValueError("Execution stop requested")
+
+        async def pause():
+            if stop_event is None:
+                await asyncio.sleep(self.settings.bbo_poll_seconds)
+                return
+            check_stop()
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=self.settings.bbo_poll_seconds)
+            except asyncio.TimeoutError:
+                pass
+            check_stop()
         try:
+            check_stop()
             if market:
                 latest = (await self.client.tickers(symbol=instrument.symbol) or [{}])[0]
+                check_stop()
                 price = float(latest.get("ask1Price" if side == "Buy" else "bid1Price", 0) or 0)
                 tick = Decimal(str(instrument.price_tick))
                 if not isfinite(price) or price <= 0 or not tick.is_finite() or tick <= 0:
@@ -107,16 +128,19 @@ class OrderExecutor:
                     raise ValueError("IOC price is below the minimum tick")
                 if check_price:
                     check_price(price)
+                check_stop()
                 attempted = True
                 self._observe(observer, "submitting", requested_price=price)
                 response = await self.client.place_ioc_order(instrument.symbol, side, qty, price, link, reduce_only)
                 outcome["orderId"] = response.get("orderId", "")
+                check_stop()
                 self._observe(observer, "reconciling", order_id=outcome["orderId"])
                 outcome = await self.reconcile(instrument.symbol, side, qty, link, outcome, cancel=False, observer=observer, record=record)
                 if not outcome["terminal"]:
                     outcome = await self.reconcile(instrument.symbol, side, qty, link, outcome, observer=observer, record=record)
             else:
                 while asyncio.get_running_loop().time() < deadline:
+                    check_stop()
                     if check_price:
                         check_price(None)
                     if attempted:
@@ -127,7 +151,9 @@ class OrderExecutor:
                         record(outcome)
                         if outcome["terminal"]:
                             break
+                        check_stop()
                     latest = (await self.client.tickers(symbol=instrument.symbol) or [{}])[0]
+                    check_stop()
                     price = float(latest.get("bid1Price" if side == "Buy" else "ask1Price", 0) or 0)
                     if isfinite(price) and price > 0:
                         tick = Decimal(str(instrument.price_tick))
@@ -138,6 +164,7 @@ class OrderExecutor:
                             raise ValueError("BBO price is below the minimum tick")
                         if check_price:
                             check_price(price)
+                        check_stop()
                         if not attempted:
                             # Set before awaiting: a lost response can hide an accepted order.
                             attempted = True
@@ -146,12 +173,14 @@ class OrderExecutor:
                             outcome["orderId"] = response.get("orderId", "")
                             self._observe(observer, "reconciling", order_id=outcome["orderId"])
                             last_price = price
+                            check_stop()
                         elif price != last_price:
                             self._observe(observer, "amending", requested_price=price)
                             await self.client.amend_order(instrument.symbol, link, price)
                             self._observe(observer, "reconciling")
                             last_price = price
-                    await asyncio.sleep(self.settings.bbo_poll_seconds)
+                            check_stop()
+                    await pause()
                 if attempted and not outcome["terminal"]:
                     outcome = await self.reconcile(instrument.symbol, side, qty, link, outcome, observer=observer, record=record)
                 elif not attempted:

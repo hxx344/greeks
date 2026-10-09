@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from .bybit import BybitClient
 from .config import Settings
-from .models import AccountHealth, CloseRequest, ExecutionRecord, LogEntry, OpenRequest, OrderResult, PerformanceSample, Position, StrategyMode, StrategyPreview
+from .models import AccountHealth, CloseRequest, ExecutionRecord, LogEntry, OpenRequest, OrderResult, PerformanceSample, Position, StrategyMode, StrategyPreview, TradePlanRequest, TradeTaskRequest
 from .strategy import build_strategy
 from .orders import OrderExecutor
 from .order_activity import observe_order, order_dashboard
@@ -18,9 +18,10 @@ from .risk import leg_count, maximum_loss, reserve_short_margin, strategy_mode a
 from .rfq import RfqMixin
 from .reconciliation import ReconciliationMixin
 from .performance import PerformanceMixin
+from .trade_tasks import TradeTaskMixin, TradeConflict
 
 
-class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
+class TradingEngine(TradeTaskMixin, RfqMixin, ReconciliationMixin, PerformanceMixin):
     def __init__(self, settings: Settings):
         self.settings = settings
         self.client = BybitClient(settings.bybit_api_key, settings.bybit_api_secret, settings.private_testnet, settings.recv_window_ms, market_testnet=settings.environment == "testnet")
@@ -62,6 +63,7 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
         self.last_executions: list[ExecutionRecord] = []
         self.execution_details: dict[str, list[ExecutionRecord]] = {}
         self.lock = asyncio.Lock()
+        self._initialize_trade_tasks()
         self.log("INFO", f"Engine started in {settings.environment} mode")
 
     def _load_state(self) -> None:
@@ -233,16 +235,20 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
                 self.chain_source = "unavailable"
                 return []
 
-    async def make_preview(self, quantity: float | None = None, strategy_mode: StrategyMode | None = None) -> StrategyPreview:
-        await self.refresh_chain()
+    def _build_preview_from_chain(self, quantity: float | None = None, strategy_mode: StrategyMode | None = None) -> StrategyPreview:
         multiplier = 1.0 if self.chain_source == "bybit" else 0.01
         now = datetime.now(timezone.utc)
         qty = self.settings.leg_qty if quantity is None else quantity
         mode = validate_mode(strategy_mode or self.settings.strategy_mode)
-        self.preview = build_strategy(self.chain, now, self.settings.target_dte_days, qty, multiplier, self.settings.estimated_taker_fee_rate, self.settings.portfolio_margin_buffer_pct, self.btc_price or 0.0, self.settings.margin_mode, self.settings.option_mm_factor, self.settings.option_max_im_factor, self.settings.option_min_im_factor, self.settings.option_liquidation_fee_rate, self.settings.option_fee_cap_pct, strategy_mode=mode)
-        self.preview.source = self.chain_source
-        self.preview.market_timestamp = self.chain_updated_at
-        self.preview.btc_price = self.btc_price
+        preview = build_strategy(self.chain, now, self.settings.target_dte_days, qty, multiplier, self.settings.estimated_taker_fee_rate, self.settings.portfolio_margin_buffer_pct, self.btc_price or 0.0, self.settings.margin_mode, self.settings.option_mm_factor, self.settings.option_max_im_factor, self.settings.option_min_im_factor, self.settings.option_liquidation_fee_rate, self.settings.option_fee_cap_pct, strategy_mode=mode)
+        preview.source = self.chain_source
+        preview.market_timestamp = self.chain_updated_at
+        preview.btc_price = self.btc_price
+        return preview
+
+    async def make_preview(self, quantity: float | None = None, strategy_mode: StrategyMode | None = None) -> StrategyPreview:
+        await self.refresh_chain()
+        self.preview = self._build_preview_from_chain(quantity, strategy_mode)
         if self.preview.unbounded_loss:
             level = "WARNING" if self.preview.estimated_margin_usd > self.settings.max_margin_usd else "INFO"
             self.log(level, f"Short strangle preview: unbounded loss, margin budget ${self.preview.estimated_margin_usd:.2f} / ${self.settings.max_margin_usd:.2f}")
@@ -398,6 +404,10 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
         self._save_state()
 
     async def _execute_order(self, leg, qty: float, link: str, reduce_only: bool = False, market: bool = False) -> dict:
+        group_id = self.execution_group_links.get(link)
+        group = self.execution_groups.get(group_id, {})
+        if group.get("task_version") == 1:
+            self._check_trade_stop(group_id)
         instrument = next((item for item in self.chain if item.symbol == leg.symbol), None)
         if instrument is None:
             raise ValueError(f"Instrument disappeared from fresh market data: {leg.symbol}")
@@ -408,15 +418,27 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
                                     "execution_type": "IOC" if market else "BBO", "created_at": datetime.now(timezone.utc).isoformat()}
         self._save_state()
         executor = OrderExecutor(self.client, self.settings, self.log)
-        guard = None if reduce_only else lambda price: self._reserve_execution_price(link, leg.symbol, price)
+        guard = (lambda price: self._reserve_execution_price(link, leg.symbol, price)) if not reduce_only or group.get("task_version") == 1 else None
         return await executor.execute(instrument, leg.side, qty, link, lambda outcome: self._record_order(link, outcome), reduce_only, market, guard,
-                                      observer=lambda event: self._observe_order(link, event))
+                                      observer=lambda event: self._observe_order(link, event),
+                                      stop_event=self.trade_stop_events.get(group_id))
 
     def _reserve_execution_price(self, link: str, symbol: str, price: float | None) -> None:
         self._require_trading_state()
         group = self.execution_groups.get(self.execution_group_links.get(link), {})
         if not group:
             return  # Direct executor use has no strategy context.
+        if group.get("task_version") == 1:
+            self._check_trade_stop(self.execution_group_links.get(link))
+            self._validate_market_snapshot()
+            entry = self.order_journal.get(link)
+            bound = group["legs"].get(symbol)
+            if entry and (not bound or entry["symbol"] != symbol or entry["side"] != bound["side"]
+                          or not isfinite(entry["qty"]) or not 0 < entry["qty"] <= bound["qty"]):
+                raise ValueError("Order does not match its confirmed plan")
+            self._reserve_task_price(group, symbol, price)
+            if group["type"] == "close":
+                return
         if group.get("risk_blocked"):
             raise ValueError("Combination risk was exceeded; remaining opening orders must stop")
         entry = self.order_journal.get(link)
@@ -455,6 +477,7 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
             raise ValueError(f"Quantity {qty} does not match Bybit step {instrument.qty_step} for {instrument.symbol}")
 
     async def open_position(self, request: OpenRequest, scheduled: bool = False) -> list[OrderResult]:
+        self._require_idle_trading_operation()
         async with self.lock:
             self._require_trading_state()
             if self.settings.can_send_orders and not request.confirm_live:
@@ -542,8 +565,9 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
 
     async def _market_fallback(self, legs, qty, links, results, group_id, all_links) -> None:
         executor = OrderExecutor(self.client, self.settings, self.log)
-        await asyncio.sleep(self.settings.failed_leg_retry_delay_seconds)
+        await self._trade_delay(group_id, self.settings.failed_leg_retry_delay_seconds)
         for leg, link, result in zip(legs, links, results):
+            self._check_trade_stop(group_id)
             original = self.order_journal.get(link)
             if not original or not original.get("terminal") or original.get("status") not in {"partial", "timeout_cancelled"}:
                 continue
@@ -553,6 +577,7 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
                                                  observer=lambda event: self._observe_order(link, event),
                                                  record=lambda outcome: self._record_order(link, outcome))
             self._record_order(link, confirmed)
+            self._check_trade_stop(group_id)
             result.qty = confirmed["filledQty"]
             result.status = confirmed["status"]
             if not confirmed["terminal"]:
@@ -645,6 +670,7 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
         return self.last_executions
 
     async def close_position(self, request: CloseRequest) -> tuple[list[OrderResult], list[ExecutionRecord]]:
+        self._require_idle_trading_operation()
         async with self.lock:
             self._require_trading_state()
             if self.settings.can_send_orders and not request.confirm_live:
@@ -717,7 +743,9 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
             week = now.strftime("%G-W%V")
             if self.settings.auto_open and self.is_open_window(now) and self.last_open_week != week:
                 try:
-                    await self.open_position(OpenRequest(confirm_live=self.settings.can_send_orders, strategy_mode=self.settings.strategy_mode), scheduled=True)
+                    plan = await self.prepare_trade_plan(TradePlanRequest(operation="open", strategy_mode=self.settings.strategy_mode))
+                    await self.start_trade_task(TradeTaskRequest(plan_id=plan["plan_id"], request_id=f"scheduled-{week}",
+                                                               confirm_live=self.settings.can_send_orders), scheduled=True)
                 except Exception as exc:
                     self.log("ERROR", f"Scheduled open failed: {exc}")
             await asyncio.sleep(5)

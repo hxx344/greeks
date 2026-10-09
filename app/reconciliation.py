@@ -176,8 +176,13 @@ class ReconciliationMixin:
 
     async def reconcile_once(self) -> None:
         if not self.settings.can_send_orders:
+            if not self.state_error:
+                self._finish_recovered_trade_tasks()
             return
         async with self.lock:
+            if self.state_error:
+                await self._reconcile_orders_without_storage()
+                return
             self._require_trading_state()
             self.reconciliation_error = None
             errors = []
@@ -186,12 +191,18 @@ class ReconciliationMixin:
                 await self._reconcile_pending_orders()
             except Exception as exc:
                 errors.append(str(exc))
+            if self.state_error:
+                self.reconciliation_error = "; ".join([self.state_error, *errors])
+                return
             if self._rfq_unresolved():
                 try:
                     await self._refresh_rfq(include_quotes=False)
                     self._require_resolved_rfq()
                 except Exception as exc:
                     errors.append(str(exc))
+            if self.state_error:
+                self.reconciliation_error = "; ".join([self.state_error, *errors])
+                return
             try:
                 await self._sync_positions()
             except Exception as exc:
@@ -201,6 +212,34 @@ class ReconciliationMixin:
             self.reconciliation_error = "; ".join(errors) or None
             if not errors:
                 self.reconciliation_last_success = datetime.now(timezone.utc)
+
+    async def _reconcile_orders_without_storage(self) -> None:
+        """Cancel known intents without trusting storage for any new trading."""
+        executor = OrderExecutor(self.client, self.settings, self.log)
+
+        def record(link, outcome):
+            try:
+                self._record_order(link, outcome)
+            except Exception as exc:
+                # Keep verified fills/terminal observations in memory even when
+                # they cannot be saved. Other orders must still be cancelled.
+                self.log("ERROR", f"Could not persist recovery for {link}: {exc}")
+
+        async def reconcile(link, entry):
+            outcome = await executor.reconcile(entry["symbol"], entry["side"], entry["qty"], link, entry,
+                                               observer=lambda event: self._observe_order(link, event),
+                                               record=lambda outcome: record(link, outcome))
+            record(link, outcome)
+
+        outcomes = await asyncio.gather(*(reconcile(link, dict(entry)) for link, entry in list(self.order_journal.items())
+                                         if not entry.get("terminal")), return_exceptions=True)
+        self._finish_recovered_trade_tasks(persist=False)
+        errors = [str(outcome) for outcome in outcomes if isinstance(outcome, Exception)]
+        if any(not entry.get("terminal") for entry in self.order_journal.values()):
+            errors.append("Unresolved orders remain; cancellation will be retried")
+        # Exchange confirmation does not repair the state file or authorize new
+        # orders. Do not run position/RFQ recovery or publish a successful cycle.
+        self.reconciliation_error = "; ".join([self.state_error, *errors])
 
     async def reconciliation_loop(self) -> None:
         while True:
@@ -238,6 +277,7 @@ class ReconciliationMixin:
                                                record=lambda outcome: self._record_order(link, outcome))
             self._record_order(link, outcome)
         await asyncio.gather(*(reconcile(link, dict(entry)) for link, entry in list(self.order_journal.items()) if not entry.get("terminal")))
+        self._finish_recovered_trade_tasks()
         if any(not entry.get("terminal") for entry in self.order_journal.values()):
             raise ValueError("Unresolved orders remain; verify exchange orders before trading again")
 
