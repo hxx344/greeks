@@ -4,10 +4,50 @@ from math import isfinite
 
 from .models import Position
 from .orders import OrderExecutor
+from .performance import option_expiry
+from .risk import leg_count, strategy_mode as validate_mode, validate_structure
 
 
 class ReconciliationMixin:
     """Order recovery and evidence-based retirement of tracked positions."""
+
+    def _tracking_needs_recovery(self) -> bool:
+        original = self.execution_groups.get(self.active_strategy_group_id, {})
+        return len(self.active_strategy_symbols) < leg_count(original.get("strategy_mode", "iron_condor"))
+
+    def _stored_strategy_legs(self, original: dict) -> tuple[str, dict[str, dict]]:
+        """Read the full recorded opening, never infer mode from residual legs."""
+        mode = validate_mode(original.get("strategy_mode", "iron_condor"))
+        raw = original.get("legs") or {}
+        legs = [{"symbol": symbol, **leg} for symbol, leg in raw.items()] if isinstance(raw, dict) else raw
+        if len(legs) != leg_count(mode) or len({leg.get("symbol") for leg in legs}) != len(legs):
+            raise ValueError("Stored strategy does not contain the complete original legs")
+        instruments = {item.symbol: item for item in self.chain}
+        bounds = original.get("risk_legs") or {}
+        normalized = {}
+        for leg in legs:
+            symbol = leg.get("symbol")
+            if not isinstance(symbol, str) or not symbol:
+                raise ValueError("Stored strategy has an invalid instrument")
+            evidence = [leg, bounds.get(symbol, {})]
+            if symbol in instruments:
+                item = instruments[symbol]
+                evidence.append({"option_type": item.option_type, "strike": item.strike, "expiry": item.expiry})
+            expiry = option_expiry(symbol)
+            if expiry:
+                parts = symbol.upper().split("-")
+                evidence.append({"option_type": "Call" if parts[3] == "C" else "Put", "strike": float(parts[2]), "expiry": expiry})
+            fields = {}
+            for key in ("option_type", "strike", "expiry"):
+                values = [item[key] for item in evidence if key in item]
+                if key == "expiry":
+                    values = [value if isinstance(value, datetime) else datetime.fromisoformat(value) for value in values]
+                if not values or any(value != values[0] for value in values):
+                    raise ValueError("Stored strategy contract metadata is missing or inconsistent")
+                fields[key] = values[0].isoformat() if key == "expiry" else values[0]
+            normalized[symbol] = {**fields, "side": leg.get("side"), "qty": float(leg.get("qty", 0))}
+        validate_structure(normalized, mode, require_expiry=True)
+        return mode, normalized
 
     @staticmethod
     def _parse_positions(raw: list[dict]) -> list[Position]:
@@ -114,7 +154,7 @@ class ReconciliationMixin:
         self.positions = positions
         if not self.state_error:
             self.reconciliation_error = None
-            if len(self.active_strategy_symbols) < 4:
+            if self._tracking_needs_recovery():
                 self._track_filled_rfq(positions) or self._recover_tracked_open_positions(positions)
             try:
                 await self._retire_closed_positions(positions)
@@ -203,12 +243,11 @@ class ReconciliationMixin:
         if self.execution_groups.get(self.active_strategy_group_id, {}).get("order_tracking"):
             return False
         position_map = {(position.symbol, position.side): position for position in positions if position.size > 0}
-        candidates: list[tuple[str, str, list[dict]]] = []
+        candidates: list[tuple[str, str, dict]] = []
         for group_id, group in self.execution_groups.items():
             if group.get("type") != "open" or group.get("status") == "closed" or group.get("order_tracking"):
                 continue
-            legs = [{"symbol": symbol, **details} for symbol, details in (group.get("legs") or {}).items()]
-            candidates.append((str(group.get("created_at", "")), group_id, legs))
+            candidates.append((str(group.get("created_at", "")), group_id, group))
         execution_groups: dict[str, dict[tuple[str, str], float]] = {}
         execution_times: dict[str, str] = {}
         for execution in self.last_executions:
@@ -223,24 +262,36 @@ class ReconciliationMixin:
             bucket[key] = bucket.get(key, 0.0) + execution.exec_qty
             execution_times[group_id] = max(execution_times.get(group_id, ""), execution.exec_time.isoformat())
         for group_id, legs in execution_groups.items():
-            candidates.append((execution_times.get(group_id, ""), group_id, [{"symbol": symbol, "side": side, "qty": qty} for (symbol, side), qty in legs.items()]))
-        for _, group_id, legs in sorted(candidates, reverse=True):
-            if len(legs) != 4 or len({leg.get("symbol") for leg in legs}) != 4:
+            # Existing original metadata wins over an incomplete fill history.
+            if self.execution_groups.get(group_id, {}).get("legs"):
                 continue
-            if any((leg.get("symbol"), leg.get("side")) not in position_map for leg in legs):
+            candidates.append((execution_times.get(group_id, ""), group_id,
+                               {"strategy_mode": self.execution_groups.get(group_id, {}).get("strategy_mode", "iron_condor"),
+                                "legs": [{"symbol": symbol, "side": side, "qty": qty} for (symbol, side), qty in legs.items()]}))
+        for _, group_id, original in sorted(candidates, key=lambda item: (item[0], item[1]), reverse=True):
+            if self.active_strategy_group_id and self.active_strategy_symbols and self.active_strategy_group_id != group_id:
+                continue
+            try:
+                mode, legs = self._stored_strategy_legs(original)
+            except (ValueError, TypeError, KeyError):
+                continue
+            if any((symbol, leg["side"]) not in position_map for symbol, leg in legs.items()):
                 continue
             sizes = {}
-            for leg in legs:
-                symbol, side = str(leg["symbol"]), str(leg["side"])
+            for symbol, leg in legs.items():
+                side = leg["side"]
                 requested_qty = float(leg.get("qty", 0) or 0)
                 if requested_qty <= 0:
                     break
                 sizes[f"{symbol}|{side}"] = min(requested_qty, position_map[(symbol, side)].size)
-            if len(sizes) != 4:
+            if len(sizes) != leg_count(mode):
                 continue
-            self.active_strategy_symbols = {str(leg["symbol"]) for leg in legs}
+            self.active_strategy_symbols = set(legs)
             self.active_strategy_sizes = sizes
             self.active_strategy_group_id = group_id
+            group = self.execution_groups.setdefault(group_id, {"type": "open", "created_at": original.get("created_at") or execution_times.get(group_id)})
+            group.setdefault("strategy_mode", mode)
+            group.setdefault("legs", legs)
             self._save_state()
             return True
         return False

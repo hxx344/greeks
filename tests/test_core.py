@@ -119,17 +119,14 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             settings = Settings(_env_file=None, state_file=f"{directory}/state.json")
             engine = TradingEngine(settings)
-            legs = [
-                {"symbol": "CALL-SHORT", "side": "Sell", "qty": "0.01"},
-                {"symbol": "PUT-SHORT", "side": "Sell", "qty": "0.01"},
-                {"symbol": "CALL-LONG", "side": "Buy", "qty": "0.01"},
-                {"symbol": "PUT-LONG", "side": "Buy", "qty": "0.01"},
-            ]
+            now = datetime.now(timezone.utc)
+            preview = build_iron_condor(demo_chain(now), now, qty=0.01)
+            legs = [{"symbol": leg.symbol, "side": leg.side, "qty": "0.01"} for leg in preview.legs]
             engine.rfq_state = {"status": "Filled", "selected_quote_id": "quote-1", "legs": legs}
             positions = [Position(symbol=leg["symbol"], side=leg["side"], size=0.01, avg_price=1, mark_price=1, unrealised_pnl=0) for leg in legs]
             self.assertTrue(engine._track_filled_rfq(positions))
             self.assertEqual(engine.active_strategy_symbols, {leg["symbol"] for leg in legs})
-            self.assertEqual(engine.active_strategy_sizes["CALL-SHORT|Sell"], 0.01)
+            self.assertEqual(engine.active_strategy_sizes[f"{preview.legs[0].symbol}|Sell"], 0.01)
 
     def test_rfq_tracking_rejects_incomplete_position_set(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -150,12 +147,9 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             settings = Settings(_env_file=None, state_file=f"{directory}/state.json")
             engine = TradingEngine(settings)
-            legs = {
-                "CALL-SHORT": {"side": "Sell", "qty": 0.01},
-                "PUT-SHORT": {"side": "Sell", "qty": 0.01},
-                "CALL-LONG": {"side": "Buy", "qty": 0.01},
-                "PUT-LONG": {"side": "Buy", "qty": 0.01},
-            }
+            now = datetime.now(timezone.utc)
+            preview = build_iron_condor(demo_chain(now), now, qty=0.01)
+            legs = {leg.symbol: {"side": leg.side, "qty": 0.01} for leg in preview.legs}
             engine.execution_groups = {"group1": {"type": "open", "created_at": "2026-01-01T00:00:00Z", "legs": legs}}
             positions = [Position(symbol=symbol, side=leg["side"], size=0.01, avg_price=1, mark_price=1, unrealised_pnl=0) for symbol, leg in legs.items()]
             self.assertTrue(engine._recover_tracked_open_positions(positions))
@@ -166,8 +160,9 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             settings = Settings(_env_file=None, state_file=f"{directory}/state.json")
             engine = TradingEngine(settings)
-            legs = [("CALL-SHORT", "Sell"), ("PUT-SHORT", "Sell"), ("CALL-LONG", "Buy"), ("PUT-LONG", "Buy")]
             now = datetime.now(timezone.utc)
+            preview = build_iron_condor(demo_chain(now), now, qty=0.01)
+            legs = [(leg.symbol, leg.side) for leg in preview.legs]
             engine.last_executions = [ExecutionRecord(symbol=symbol, side=side, order_id=str(index), order_link_id=f"ic-legacy-{index}", exec_id=str(index), exec_fee=0, fee_currency="USDT", exec_price=1, exec_qty=0.01, exec_time=now) for index, (symbol, side) in enumerate(legs)]
             positions = [Position(symbol=symbol, side=side, size=0.01, avg_price=1, mark_price=1, unrealised_pnl=0) for symbol, side in legs]
             self.assertTrue(engine._recover_tracked_open_positions(positions))

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#0d1110" />
   <title>CONDOR · BTC 期权策略台</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260908-2" />
+  <link rel="stylesheet" href="/static/style.css?v=20261009-2" />
 </head>
 <body>
   <a class="skip-link" href="#overview">跳转到策略总览</a>
@@ -19,12 +19,12 @@
   </header>
   <main class="shell" id="overview">
     <section class="intro" aria-labelledby="pageTitle">
-      <div><div class="kicker"><span class="eyebrow-line"></span>BTC / IRON CONDOR</div><h1 id="pageTitle">以结构，定义风险边界<span class="heading-dot">.</span></h1><p>BTC 铁鹰策略台<span class="text-divider">/</span>行情、组合与执行，一览有序。</p></div>
+      <div><div class="kicker"><span class="eyebrow-line"></span>BTC / OPTIONS STRATEGIES</div><h1 id="pageTitle">看清组合，掌握风险<span class="heading-dot">.</span></h1><p>BTC 期权策略台<span class="text-divider">/</span>行情、组合与执行，一览有序。</p></div>
       <div class="intro-actions"><span class="update-state"><i id="updateDot"></i><span id="updateText">行情同步中</span></span><button id="refresh" class="button ghost"><svg class="icon" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M16 8a6.2 6.2 0 1 0-.4 5M16 3v5h-5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>立即刷新</button></div>
     </section>
     <section class="stats" aria-label="策略指标">
       <article class="metric-featured"><span>净权利金 <small>NET CREDIT</small></span><strong id="creditValue">--</strong><small>每组策略 · USD</small></article>
-      <article><span>最大风险 <small>MAX LOSS</small></span><strong id="lossValue">--</strong><small id="riskSub">风险上限 --</small></article>
+      <article><span>最大亏损 <small>MAX LOSS</small></span><strong id="lossValue">--</strong><small id="riskSub">风险上限 --</small></article>
       <article><span>保证金需求 <small>INITIAL MARGIN</small></span><strong id="marginValue">--</strong><small id="marginSub">官方公式估算</small></article>
       <article><span>维护保证金 <small>MAINTENANCE</small></span><strong id="maintenanceValue">--</strong><small>短期权 MM</small></article>
       <article><span>交易成本 <small>EST. FEES</small></span><strong id="costValue">--</strong><small id="feeSub">手续费率 --</small></article>
@@ -56,18 +56,21 @@
       <aside class="panel execution" aria-labelledby="executionTitle">
         <div class="panel-head"><div><div class="kicker">EXECUTION</div><h2 id="executionTitle">执行控制</h2></div><span class="lock-badge">LIMIT / BBO</span></div>
         <div class="mode-box" id="modeBox"><span class="mode-icon" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none"><path d="m10 2 6 2.5v5c0 4-6 7-6 7s-6-3-6-7v-5L10 2Z" stroke="currentColor" stroke-width="1.3"/><path d="m7 9 2 2 4-4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></span><div><strong id="modeTitle">模拟模式</strong><p id="modeText">不会向交易所发送订单。</p></div></div>
-        <div class="field"><label for="quantityPreset">每腿数量 <span>BTC</span></label><div class="quantity-row"><select id="quantityPreset" aria-label="每腿数量预设"><option value="0.01">0.01</option><option value="0.05">0.05</option><option value="0.1">0.10</option><option value="0.25">0.25</option><option value="0.5">0.50</option><option value="1" selected>1.00</option><option value="custom">自定义</option></select><input id="quantity" aria-label="自定义每腿数量" type="number" min="0.01" step="0.01" value="1" /></div><small class="field-hint">调整数量后，自动重算保证金与交易成本。</small></div>
-        <label class="confirm"><input id="confirm" type="checkbox" /><span>我已核对四腿、报价和风险上限</span></label>
-        <button id="openTrade" class="button primary">模拟开仓四腿</button><button id="closeTrade" class="button close-button">模拟平仓四腿</button>
-        <p class="microcopy">发送交易所订单前需要明确确认。四腿分别执行，成交进度可能不同。</p>
-        <div class="schedule"><span>计划开仓 <small>FRIDAY ENTRY</small></span><strong id="nextOpen">周五 21:00 UTC</strong></div>
+        <div class="execution-inputs">
+          <div class="field"><label for="strategyMode">开仓结构 <span>STRATEGY</span></label><select id="strategyMode" aria-describedby="strategyScope strategyRisk"><option value="iron_condor">四腿铁鹰 · 带保护腿</option><option value="short_strangle">双腿卖出 · 无保护腿</option></select><small id="strategyScope" class="field-hint">仅影响本页预览、手动开仓和新 RFQ；已有询价保留原结构。</small><small id="strategyRisk" class="field-hint strategy-risk" role="status">买入远端保护腿，按最大亏损控制风险。</small></div>
+          <div class="field"><label for="quantityPreset">每腿数量 <span>BTC</span></label><div class="quantity-row"><select id="quantityPreset" aria-label="每腿数量预设"><option value="0.01">0.01</option><option value="0.05">0.05</option><option value="0.1">0.10</option><option value="0.25">0.25</option><option value="0.5">0.50</option><option value="1" selected>1.00</option><option value="custom">自定义</option></select><input id="quantity" aria-label="自定义每腿数量" type="number" min="0.01" step="0.01" value="1" /></div><small class="field-hint">调整数量后，自动重算保证金与交易成本。</small></div>
+        </div>
+        <label class="confirm"><input id="confirm" type="checkbox" /><span id="confirmText">我已核对四腿、报价和风险上限</span></label>
+        <button id="openTrade" class="button primary" disabled>模拟开仓四腿</button><button id="closeTrade" class="button close-button">模拟平仓已跟踪持仓</button>
+        <p class="microcopy">发送交易所订单前需要明确确认。各腿分别执行，成交进度可能不同。</p>
+        <div class="schedule"><span>计划开仓 <small id="automaticMode">自动任务模式待同步</small></span><strong id="nextOpen">周五 21:00 UTC</strong></div>
       </aside>
     </section>
     <section class="bottom-grid" aria-label="策略与活动">
       <div class="panel strategy-panel">
-        <div class="panel-head"><div><div class="kicker">03 / STRATEGY</div><h2>组合结构</h2></div><span class="muted">双侧卖出 · 远端保护</span></div>
+        <div class="panel-head"><div><div class="kicker">03 / STRATEGY</div><h2>组合结构</h2></div><span id="strategyDescription" class="muted">双侧卖出 · 远端保护</span></div>
         <div id="legs" class="legs"></div>
-        <div class="payoff"><div class="payoff-title"><span>到期盈亏曲线 <small>USD</small></span><span class="muted">按当前报价估算</span></div><div class="payoff-chart-wrap"><canvas id="payoffChart" aria-label="到期盈亏曲线，非当前持仓浮动盈亏"></canvas></div><div id="payoffStats" class="payoff-stats"></div></div>
+        <div class="payoff"><div class="payoff-title"><span>到期盈亏曲线 <small>USD</small></span><span class="muted">按当前报价估算</span></div><div class="payoff-chart-wrap"><canvas id="payoffChart" aria-label="到期盈亏曲线，非当前持仓浮动盈亏" aria-describedby="payoffRisk"></canvas><p id="payoffRisk" class="payoff-risk" hidden></p></div><div id="payoffStats" class="payoff-stats"></div></div>
       </div>
       <div class="panel activity-panel">
         <div class="panel-head"><div><div class="kicker">ACTIVITY</div><h2>仓位与事件</h2></div><button id="reloadPositions" class="link-button">刷新 ↗</button></div>
@@ -92,7 +95,7 @@
     </section>
     <section class="panel rfq-panel" id="rfq" aria-labelledby="rfqTitle">
       <div class="panel-head"><div><div class="kicker">04 / BLOCK TRADING</div><h2 id="rfqTitle">组合询价<span class="heading-detail">RFQ</span></h2></div><span id="rfqStatus" class="source-tag">未创建</span></div>
-      <div class="rfq-controls"><p>向可用做市商发送四腿组合询价<span>比较整组报价，再确认执行。</span></p><input id="rfqCounterparties" type="hidden" /><button id="rfqCreate" class="button ghost">创建 RFQ ↗</button><button id="rfqCancel" class="button close-button">取消询价</button></div>
+      <div class="rfq-controls"><p>按所选开仓结构发送组合询价<span>比较本次询价的整组报价，再确认执行。</span></p><input id="rfqCounterparties" type="hidden" /><button id="rfqCreate" class="button ghost" disabled>创建 RFQ ↗</button><button id="rfqCancel" class="button close-button">取消询价</button></div>
       <div class="rfq-meta"><span>询价 ID <b id="rfqId">--</b></span><span>类型 <b id="rfqType">--</b></span><span>有效期 <b id="rfqExpires">--</b></span><span>报价数 <b id="rfqQuoteCount">0</b></span></div>
       <div id="rfqQuotes" class="rfq-quotes empty">暂无报价</div>
     </section>
@@ -100,8 +103,8 @@
   </main>
   <aside id="notice" class="notice" role="status" aria-live="polite" aria-atomic="true" hidden><div><strong id="noticeTitle">操作结果</strong><button id="dismissNotice" class="notice-dismiss" aria-label="关闭操作提示">×</button></div><p id="noticeText"></p></aside>
   <script src="/static/hub.js?v=20261009-1"></script>
-  <script src="/static/position-payoff.js?v=20260908-2"></script>
+  <script src="/static/position-payoff.js?v=20261009-2"></script>
   <script src="/static/performance.js?v=20261009-1"></script>
-  <script src="/static/app.js?v=20261009-1"></script>
+  <script src="/static/app.js?v=20261009-2"></script>
 </body>
 </html>

@@ -87,6 +87,13 @@ systemctl is-active --quiet greeks
 grep -qx 'TRADING_MODE=dry-run' /etc/greeks/greeks.env
 grep -qx 'AUTO_OPEN=false' /etc/greeks/greeks.env
 grep -qx 'LIVE_TRADING=false' /etc/greeks/greeks.env
+grep -qx 'BYBIT_TESTNET=false' /etc/greeks/greeks.env
+grep -qx 'STRATEGY_MODE=iron_condor' /etc/greeks/greeks.env
+grep -qx 'MAX_MARGIN_USD=2500' /etc/greeks/greeks.env
+grep -qx 'OPEN_WINDOW_SECONDS=300' /etc/greeks/greeks.env
+grep -qx 'MARGIN_MODE=PORTFOLIO_MARGIN' /etc/greeks/greeks.env
+grep -qx 'BBO_ORDER_TIMEOUT_SECONDS=280' /etc/greeks/greeks.env
+grep -qx 'ALLOW_MARKET_FALLBACK=true' /etc/greeks/greeks.env
 dependencies=$(readlink /opt/greeks/current/.venv)
 dependency_stamp=$(stat -c %Y "$dependencies/.complete")
 first_pid=$(pid)
@@ -117,7 +124,7 @@ if grep -Fq "$panel_password" "$fixture/noop-install.log"; then echo 'Update rep
 [[ $(stat -c %Y "$dependencies/.complete") == "$dependency_stamp" ]]
 
 # Existing settings, keys and state survive both configuration and code updates.
-sed -i 's/TRADING_MODE=dry-run/TRADING_MODE=testnet/; s/AUTO_OPEN=false/AUTO_OPEN=true/' /etc/greeks/greeks.env
+sed -i 's/TRADING_MODE=dry-run/TRADING_MODE=testnet/; s/AUTO_OPEN=false/AUTO_OPEN=true/; s/STRATEGY_MODE=iron_condor/STRATEGY_MODE=short_strangle/; s/MAX_MARGIN_USD=2500/MAX_MARGIN_USD=1750/; s/OPEN_WINDOW_SECONDS=300/OPEN_WINDOW_SECONDS=125/' /etc/greeks/greeks.env
 printf "BYBIT_API_SECRET='literal\044{PATH}\044(touch forbidden)'\n" >> /etc/greeks/greeks.env
 printf 'state-must-survive' > /var/lib/greeks/engine_state.json
 chown greeks:greeks /var/lib/greeks/engine_state.json
@@ -132,6 +139,19 @@ assert_preserved
 configured_pid=$(pid)
 [[ "$configured_pid" != "$first_pid" ]]
 [[ ! -e /opt/greeks/current/forbidden ]]
+
+# Upgrading a partial configuration fills missing fields without replacing custom values.
+sed -i '/^MAX_SPREAD_BPS=/d' /etc/greeks/greeks.env
+run_install
+grep -qx 'MAX_SPREAD_BPS=0' /etc/greeks/greeks.env
+"/opt/greeks/current/.venv/bin/python" - "$fixture/expected.env" /etc/greeks/greeks.env <<'PY'
+import sys
+from dotenv import dotenv_values
+assert dotenv_values(sys.argv[1], interpolate=False) == dotenv_values(sys.argv[2], interpolate=False)
+PY
+cp /etc/greeks/greeks.env "$fixture/expected.env"
+configured_pid=$(pid)
+assert_preserved
 
 # Documentation-only changes should not create a release or restart the service.
 printf '\nCI documentation change\n' >> "$fixture/README.md"

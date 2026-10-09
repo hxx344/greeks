@@ -4,6 +4,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .models import StrategyMode
+
 
 class Settings(BaseSettings):
     dashboard_username: str = Field(default="admin", min_length=1)
@@ -18,6 +20,8 @@ class Settings(BaseSettings):
     performance_sample_seconds: int = Field(default=60, ge=15, le=3600)
     live_confirmation: str = ""
     max_risk_usd: float = Field(default=2500.0, gt=0)
+    max_margin_usd: float = Field(default=2500.0, gt=0)
+    strategy_mode: StrategyMode = "iron_condor"
     leg_qty: float = Field(default=1.0, gt=0)
     open_day: int = Field(default=4, ge=4, le=4)
     open_hour_utc: int = Field(default=21, ge=0, le=23)

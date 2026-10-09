@@ -95,6 +95,8 @@ def build_summary(engine, now=None):
         "updatedAt": updated_at.isoformat() if updated_at else None,
         "health": {"state": state, "message": message, "staleAfterSeconds": ttl},
         "metrics": [
+            {"key": "strategy_mode", "label": "默认策略", "value": settings.strategy_mode,
+             "detail": "双卖无保护腿，亏损无上限" if settings.strategy_mode == "short_strangle" else "四腿铁鹰，带保护腿"},
             {"key": "trading_mode", "label": "交易模式", "value": settings.environment,
              "detail": "实盘启用" if settings.can_trade_live else "测试网交易启用" if settings.can_send_orders else "不发送交易所订单"},
             {"key": "btc_price", "label": "BTC 价格", "value": price, "unit": "USDT",

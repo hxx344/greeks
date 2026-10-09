@@ -5,6 +5,40 @@ const utcTime = (value) => new Date(value).toLocaleTimeString('en-GB', {hour12: 
 const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;'}[char]));
 const optionalMoney = (value) => value === null || value === undefined ? '--' : money(value);
 const marginLabel = (value) => ({REGULAR_MARGIN: '常规保证金', PORTFOLIO_MARGIN: '组合保证金', ISOLATED_MARGIN: '逐仓保证金'}[value] || value || 'UTA');
+const selectedStrategyMode = () => $('strategyMode').value === 'short_strangle' ? 'short_strangle' : 'iron_condor';
+const strategyName = (mode) => mode === 'short_strangle' ? '双腿卖出' : '四腿铁鹰';
+const previewStrategyMode = (preview) => preview?.strategy_mode ?? 'iron_condor';
+const unboundedPreview = (preview) => preview?.unbounded_loss === true || previewStrategyMode(preview) === 'short_strangle';
+let strategySelectionInitialized = false;
+
+function renderStrategySelection() {
+  const mode = selectedStrategyMode(), naked = mode === 'short_strangle', config = window.__strategyConfig;
+  $('confirmText').textContent = naked ? '我已核对双腿与报价，并了解无保护腿、亏损无上限' : '我已核对四腿、报价和风险上限';
+  $('strategyDescription').textContent = naked ? '卖出 Call + Put · 无保护腿' : '双侧卖出 · 远端保护';
+  $('strategyRisk').dataset.unbounded = String(naked);
+  $('strategyRisk').textContent = naked ? `亏损无上限；独立保证金预算 ${config ? money(config.max_margin_usd ?? 2500) : '--'}，不代表最大亏损。` : '买入远端保护腿，按最大亏损控制风险。';
+  $('riskSub').textContent = naked ? '无保护腿 · 最大亏损无上限' : `风险上限 ${config ? money(config.max_risk_usd) : '--'}`;
+  if (config) $('automaticMode').textContent = `自动任务：${strategyName(config.strategy_mode)} · ${config.auto_open ? '已启用' : '未启用'}`;
+}
+function hasCurrentStrategyPreview() {
+  const selection = window.__previewSelection;
+  return Boolean(window.__latestPreview && selection && selection.mode === selectedStrategyMode()
+    && selection.quantity === Number($('quantity').value)
+    && previewStrategyMode(window.__latestPreview) === selection.mode);
+}
+function openingSelection() {
+  if (!hasCurrentStrategyPreview() || window.__strategyUnavailable || window.__marketReadOnly) throw new Error('请等待当前结构和数量的预览完成，再开仓或创建询价。');
+  if (window.__tradingBlocked || window.__openingBlocked) throw new Error('当前禁止新开仓，请检查交易或询价状态。');
+  if (window.__liveEnabled && !$('confirm').checked) throw new Error('请核对当前结构、报价与风险后勾选确认。');
+  return {strategy_mode: selectedStrategyMode(), quantity: Number($('quantity').value), confirm_live: $('confirm').checked === true};
+}
+function invalidateStrategySelection(message) {
+  $('confirm').checked = false;
+  window.__strategyUnavailable = true;
+  clearStrategyDisplay(message);
+  renderStrategySelection();
+  updateTradeControls();
+}
 
 function showNotice(message, title = '操作结果', tone = 'info') {
   const notice = $('notice');
@@ -33,7 +67,6 @@ async function getJson(url, options) {
   try { data = raw ? JSON.parse(raw) : {}; } catch (_) { data = {detail: raw || `HTTP ${response.status}`}; }
   if (!response.ok) throw new Error(data.detail || 'Request failed');
   if (options?.method?.toUpperCase() === 'POST') window.ProjectHub.changed();
-  if (url.includes('/api/strategy/preview')) window.__latestPreview = data;
   if (url.includes('/api/trading/executions')) window.__latestExecutions = data.items || [];
   return data;
 }
@@ -85,6 +118,10 @@ function payoffAt(price, preview) {
 function renderPayoff(preview) {
   const canvas = $('payoffChart');
   if (!canvas) return;
+  const unbounded = Boolean(preview && unboundedPreview(preview));
+  $('payoffRisk').hidden = !unbounded;
+  $('payoffRisk').textContent = unbounded ? '亏损无上限 · 图中仅展示有限价格范围，曲线边缘不是亏损上限。' : '';
+  canvas.setAttribute('aria-label', `到期盈亏曲线，非当前持仓浮动盈亏${unbounded ? '。无保护腿，亏损无上限；绘图区仅展示有限价格范围' : ''}`);
   if (!preview?.legs?.length) { canvas.width = canvas.width; $('payoffStats').textContent = '等待可用策略'; return; }
   const rect = canvas.getBoundingClientRect();
   const ratio = window.devicePixelRatio || 1;
@@ -92,9 +129,9 @@ function renderPayoff(preview) {
   const ctx = canvas.getContext('2d'); ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   const width = rect.width; const height = rect.height;
   const strikes = preview.legs.map((leg) => Number(leg.strike));
-  const lowStrike = Math.min(...strikes); const highStrike = Math.max(...strikes); const span = Math.max(1000, highStrike - lowStrike); const low = lowStrike - span * 0.32; const high = highStrike + span * 0.32;
+  const lowStrike = Math.min(...strikes); const highStrike = Math.max(...strikes); const span = Math.max(1000, highStrike - lowStrike); const low = Math.max(0, lowStrike - span * 0.32); const high = highStrike + span * 0.32;
   const samples = Array.from({length: 121}, (_, index) => { const price = low + (high - low) * index / 120; return {price, pnl: payoffAt(price, preview)}; });
-  const values = samples.map((point) => point.pnl); const min = Math.min(...values, 0); const max = Math.max(...values, 0); const pad = Math.max(50, (max - min) * 0.12); const yMin = min - pad; const yMax = max + pad; const left = 48; const right = 15; const top = 18; const bottom = 28;
+  const values = samples.map((point) => point.pnl); const min = Math.min(...values, 0); const max = Math.max(...values, 0); const pad = Math.max(50, (max - min) * 0.12); const yMin = min - pad; const yMax = max + pad; const left = 48; const right = 15; const top = unbounded ? 66 : 18; const bottom = 28;
   const x = (price) => left + (price - low) / (high - low) * (width - left - right); const y = (pnl) => top + (yMax - pnl) / (yMax - yMin) * (height - top - bottom);
   ctx.clearRect(0, 0, width, height); ctx.font = '10px Segoe UI, system-ui, sans-serif';
   for (let index = 0; index <= 4; index += 1) { const pnl = yMin + (yMax - yMin) * index / 4; const yp = y(pnl); ctx.strokeStyle = '#26352a'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(left, yp); ctx.lineTo(width - right, yp); ctx.stroke(); ctx.fillStyle = '#8d9e91'; ctx.fillText(`${pnl >= 0 ? '+' : ''}${Math.round(pnl).toLocaleString()}`, 5, yp + 3); }
@@ -108,8 +145,8 @@ function renderPayoff(preview) {
   for (const strike of strikes) { const xp = x(strike); ctx.strokeStyle = '#405e49'; ctx.setLineDash([2, 4]); ctx.beginPath(); ctx.moveTo(xp, top); ctx.lineTo(xp, height - bottom); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = '#a9bbaf'; ctx.textAlign = 'center'; ctx.fillText(`${Math.round(strike).toLocaleString()}`, xp, height - 9); }
   const spot = Number(preview.btc_price || 0); if (spot >= low && spot <= high) { const xp = x(spot); ctx.strokeStyle = '#d6bc86'; ctx.setLineDash([5, 3]); ctx.beginPath(); ctx.moveTo(xp, top); ctx.lineTo(xp, height - bottom); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = '#d6bc86'; ctx.textAlign = 'center'; ctx.fillText(`BTC ${Math.round(spot).toLocaleString()}`, xp, 11); }
   const breaks = []; for (let index = 1; index < samples.length; index += 1) { if ((samples[index - 1].pnl < 0) !== (samples[index].pnl < 0)) { const a = samples[index - 1]; const b = samples[index]; breaks.push(a.price + (0 - a.pnl) * (b.price - a.price) / (b.pnl - a.pnl)); } }
-  const maxProfit = Math.max(...values); const maxLoss = Math.min(...values); const current = spot ? payoffAt(spot, preview) : 0;
-  $('payoffStats').innerHTML = `<div class="payoff-stat"><span>现价对应到期盈亏</span><strong class="${current >= 0 ? 'profit' : 'loss'}">${money(current)}</strong></div><div class="payoff-stat"><span>最大收益</span><strong class="profit">${money(maxProfit)}</strong></div><div class="payoff-stat"><span>最大风险</span><strong class="loss">${money(maxLoss)}</strong></div><div class="payoff-stat"><span>盈亏平衡</span><strong>${breaks.length ? breaks.map((point) => Math.round(point).toLocaleString()).join(' / ') : '--'}</strong></div>`;
+  const maxProfit = Number(preview.net_credit_usd); const current = spot ? payoffAt(spot, preview) : 0;
+  $('payoffStats').innerHTML = `<div class="payoff-stat"><span>现价对应到期盈亏</span><strong class="${current >= 0 ? 'profit' : 'loss'}">${money(current)}</strong></div><div class="payoff-stat"><span>最大收益</span><strong class="profit">${Number.isFinite(maxProfit) ? money(maxProfit) : '--'}</strong></div><div class="payoff-stat"><span>最大亏损</span><strong class="loss">${unbounded ? '无上限' : optionalMoney(preview.max_loss_usd)}</strong></div><div class="payoff-stat"><span>盈亏平衡</span><strong>${breaks.length ? breaks.map((point) => Math.round(point).toLocaleString()).join(' / ') : '--'}</strong></div>`;
 }
 function renderLegs(legs) { $('legs').className = 'legs'; $('legs').innerHTML = (legs || []).map((leg) => `<div class="leg"><span class="leg-mark ${leg.side.toLowerCase()}">${leg.side === 'Sell' ? 'S' : 'B'} ${leg.option_type[0]}</span><div><div class="leg-title">${leg.side === 'Sell' ? '卖出' : '买入'} ${leg.option_type} · Δ ${Number(leg.delta).toFixed(3)}</div><div class="leg-symbol">${esc(leg.symbol)}</div></div><div class="leg-price"><strong>${money(leg.mark_price)}</strong><small>目标 ${Number(leg.target_delta).toFixed(2)}</small><small>预估费 ${money(leg.estimated_fee_usd)} / 封顶 ${money(leg.fee_cap_usd)}</small></div></div>`).join(''); }
 function renderPositions(items) { $('positions').className = items.length ? 'positions' : 'positions empty'; $('positions').innerHTML = items.length ? items.map((p) => `<div class="position-row"><strong>${esc(p.symbol)}</strong><span>${esc(p.side)} · ${p.size}</span><span class="${p.unrealised_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}">${money(p.unrealised_pnl)}</span></div>`).join('') : '暂无持仓'; }
@@ -228,17 +265,20 @@ function tradeResultMessage(payload, action) {
 function updateTradeControls() {
   const live = Boolean(window.__liveEnabled);
   const confirmed = $('confirm').checked;
-  if (!$('openTrade').dataset.busy) $('openTrade').textContent = window.__marketReadOnly ? '仅供查看 · 禁止开仓' : (live ? '确认并开仓四腿' : '模拟开仓四腿');
-  if (!$('closeTrade').dataset.busy) $('closeTrade').textContent = live ? '确认并平仓四腿' : '模拟平仓四腿';
-  if (!$('openTrade').dataset.busy) $('openTrade').disabled = Boolean(window.__tradingBlocked || window.__openingBlocked || window.__strategyUnavailable) || (live && !confirmed);
+  const legs = selectedStrategyMode() === 'short_strangle' ? '双腿' : '四腿';
+  const openingDisabled = Boolean(window.__tradingBlocked || window.__openingBlocked || window.__strategyUnavailable) || !hasCurrentStrategyPreview() || (live && !confirmed);
+  if (!$('openTrade').dataset.busy) $('openTrade').textContent = window.__marketReadOnly ? '仅供查看 · 禁止开仓' : `${live ? '确认并' : '模拟'}开仓${legs}`;
+  if (!$('closeTrade').dataset.busy) $('closeTrade').textContent = `${live ? '确认并' : '模拟'}平仓已跟踪持仓`;
+  if (!$('openTrade').dataset.busy) $('openTrade').disabled = openingDisabled;
   if (!$('closeTrade').dataset.busy) $('closeTrade').disabled = Boolean(window.__tradingBlocked) || (live && !confirmed);
-  $('rfqCreate').disabled = Boolean(window.__tradingBlocked || window.__openingBlocked || window.__strategyUnavailable);
+  if (!$('rfqCreate').dataset.busy) $('rfqCreate').disabled = openingDisabled;
 }
 function clearStrategyDisplay(message) {
   $('marketNotice').hidden = true;
   if ($('chainPanel')) $('chainPanel').dataset.availability = 'unavailable';
   $('legs').className = 'legs strategy-empty';
   window.__latestPreview = null;
+  window.__previewSelection = null;
   window.__latestChain = [];
   for (const id of ['creditValue', 'lossValue', 'marginValue', 'maintenanceValue', 'costValue', 'rrValue']) {
     if ($(id)) $(id).textContent = '--';
@@ -255,12 +295,27 @@ function clearStrategyDisplay(message) {
 async function loadMarket() {
   const read = window.ProjectHub.begin('market');
   if (!read) return;
+  const requestedQty = Number($('quantity')?.value);
+  const requestedMode = selectedStrategyMode();
+  const current = () => read.current() && requestedMode === selectedStrategyMode() && requestedQty === Number($('quantity').value);
   try {
-    const requestedQty = Number($('quantity')?.value || 1);
-    const marketUrl = Number.isFinite(requestedQty) && requestedQty > 0 ? `/api/dashboard/market?quantity=${encodeURIComponent(requestedQty)}` : '/api/dashboard/market';
+    if (!Number.isFinite(requestedQty) || requestedQty <= 0) throw new Error('请输入有效的每腿数量。');
+    const marketUrl = `/api/dashboard/market?quantity=${encodeURIComponent(requestedQty)}&strategy_mode=${encodeURIComponent(requestedMode)}`;
     const payload = await getJson(marketUrl);
-    if (!read.current()) return;
+    if (!current()) return;
     const {config, preview, chain} = payload;
+    window.__strategyConfig = config;
+    if (!strategySelectionInitialized) {
+      strategySelectionInitialized = true;
+      if (config.strategy_mode === 'short_strangle' && requestedMode !== config.strategy_mode) {
+        $('strategyMode').value = config.strategy_mode;
+        invalidateStrategySelection('正在读取默认开仓结构');
+        void loadMarket();
+        return;
+      }
+    }
+    renderStrategySelection();
+    if (preview && previewStrategyMode(preview) !== requestedMode) throw new Error('返回的预览与所选开仓结构不一致，请重新刷新。');
     window.__positionMarket = {price: Number(chain.btc_price || preview?.btc_price || 0), timestamp: Date.parse(chain.updated_at || preview?.market_timestamp || ''), staleSeconds: Number(config.quote_stale_seconds || 30)};
     renderPositionPayoff();
     window.__liveEnabled = config.trading_enabled ?? config.live_enabled;
@@ -277,7 +332,6 @@ async function loadMarket() {
     $('chainSource').textContent = chain.source.toUpperCase();
     $('refreshRate').textContent = config.market_refresh_seconds;
     $('nextOpen').textContent = config.open_time;
-    $('riskSub').textContent = `风险上限 ${money(config.max_risk_usd)}`;
     $('modeTitle').textContent = enabled ? (config.environment === 'testnet' ? '测试网模式已启用' : '实盘模式已启用') : '模拟模式';
     $('modeText').textContent = enabled ? (config.environment === 'testnet' ? '确认后将向 Bybit 测试网发送订单。' : '确认后将向 Bybit 主网发送 BBO 限价订单。') : '不会向交易所发送订单。';
     updateTradeControls();
@@ -305,14 +359,18 @@ async function loadMarket() {
     }
     if ($('chainPanel')) $('chainPanel').dataset.availability = 'ready';
     window.__latestPreview = preview;
+    window.__previewSelection = {mode: requestedMode, quantity: requestedQty};
     window.__latestChain = chain.items || []; $('btcPrice').textContent = preview.btc_price ? money(preview.btc_price) : '--';
     $('environment').textContent = chain.source === 'bybit' ? (modeLabel) : 'UNAVAILABLE';
-    $('creditValue').textContent = money(preview.net_credit_usd); $('lossValue').textContent = money(preview.max_loss_usd); $('marginValue').textContent = money(preview.estimated_margin_usd); $('marginSub').textContent = preview.margin_mode === 'PORTFOLIO_MARGIN' ? 'PM 压力测试估算' : 'Bybit Order IM'; $('maintenanceValue').textContent = money(preview.estimated_maintenance_margin_usd); $('costValue').textContent = money(preview.estimated_trading_cost_usd); $('feeSub').textContent = `Taker ${(Number(preview.estimated_fee_rate) * 100).toFixed(3)}% · 单腿上限 ${(Number(preview.fee_cap_pct) * 100).toFixed(0)}%`; if ($('rrValue')) $('rrValue').textContent = `${preview.risk_reward}x`; $('riskSub').textContent = `风险上限 ${money(config.max_risk_usd)}`;
+    const unbounded = unboundedPreview(preview);
+    const portfolioEstimate = !unbounded && (preview.margin_basis === 'portfolio_loss_estimate' || (!preview.margin_basis && preview.margin_mode === 'PORTFOLIO_MARGIN'));
+    $('creditValue').textContent = optionalMoney(preview.net_credit_usd); $('lossValue').textContent = unbounded ? '无上限' : optionalMoney(preview.max_loss_usd); $('marginValue').textContent = optionalMoney(preview.estimated_margin_usd); $('marginSub').textContent = portfolioEstimate ? 'PM 压力测试估算' : unbounded ? '常规保证金估算（含缓冲）' : 'Bybit Order IM'; $('maintenanceValue').textContent = optionalMoney(preview.estimated_maintenance_margin_usd); $('costValue').textContent = optionalMoney(preview.estimated_trading_cost_usd); $('feeSub').textContent = `Taker ${(Number(preview.estimated_fee_rate) * 100).toFixed(3)}% · 单腿上限 ${(Number(preview.fee_cap_pct) * 100).toFixed(0)}%`; if ($('rrValue')) $('rrValue').textContent = preview.risk_reward == null ? '--' : `${preview.risk_reward}x`;
+    updateTradeControls();
     const quoteTime = preview.market_timestamp ? new Date(preview.market_timestamp) : new Date(); const age = Math.max(0, Math.round((Date.now() - quoteTime.getTime()) / 1000));
     $('statusValue').dataset.state = age > config.quote_stale_seconds ? 'waiting' : 'ready';
     $('statusValue').textContent = age > config.quote_stale_seconds ? '行情过期' : '策略就绪'; $('statusSub').textContent = `${chain.source === 'bybit' ? (config.market_testnet ? 'Bybit 测试网行情' : 'Bybit 主网行情') : '行情不可用'} · ${age}s 前`; $('expiry').textContent = `到期 ${new Date(preview.expiry).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit',timeZone:'UTC'})}`; renderChain(chain.items, preview); renderLegs(preview.legs); renderPayoff(preview); $('updateText').textContent = `行情 ${age}s · 每 ${config.market_refresh_seconds}s 更新`; $('updateDot').style.background = age > config.quote_stale_seconds ? '#df9f99' : '#bedcc6';
     if (config.trading_blocked_reason || config.opening_blocked_reason) { $('statusValue').dataset.state = 'error'; $('statusValue').textContent = '交易已阻止'; $('statusSub').textContent = config.trading_blocked_reason || 'RFQ 状态待确认，后台正在对账'; }
-  } catch (error) { if (!read.current()) return; window.__positionMarket = null; renderPositionPayoff(); window.__strategyUnavailable = true; clearStrategyDisplay('策略暂不可用'); updateTradeControls(); $('statusValue').dataset.state = 'error'; $('statusValue').textContent = '行情异常'; $('statusSub').textContent = error.message; $('updateText').textContent = '等待重试'; $('updateDot').style.background = '#df9f99'; }
+  } catch (error) { if (!current()) return; window.__positionMarket = null; renderPositionPayoff(); window.__strategyUnavailable = true; clearStrategyDisplay('策略暂不可用'); updateTradeControls(); $('statusValue').dataset.state = 'error'; $('statusValue').textContent = '行情异常'; $('statusSub').textContent = error.message; $('updateText').textContent = '等待重试'; $('updateDot').style.background = '#df9f99'; }
   finally { read.finish(); }
 }
 async function loadAccount() {
@@ -332,7 +390,18 @@ async function loadAccount() {
   finally { read.finish(); }
 }
 async function load() { await Promise.allSettled([loadMarket(), loadAccount()]); }
-async function openTrade() { const button = $('openTrade'); button.dataset.busy = '1'; button.disabled = true; button.textContent = '执行中…'; try { const result = await getJson('/api/trading/open', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, quantity:Number($('quantity').value)})}); showTradeResult(result, '开仓'); await load(); } catch (error) { showNotice(error.message, '操作未完成', 'error'); } finally { delete button.dataset.busy; updateTradeControls(); } }
+async function openTrade() {
+  const button = $('openTrade');
+  if (button.dataset.busy) return;
+  try {
+    const selection = openingSelection();
+    button.dataset.busy = '1'; button.disabled = true; button.textContent = '执行中…';
+    const result = await getJson('/api/trading/open', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(selection)});
+    showTradeResult(result, `${strategyName(selection.strategy_mode)}开仓`);
+    await load();
+  } catch (error) { showNotice(error.message, '操作未完成', 'error'); }
+  finally { delete button.dataset.busy; updateTradeControls(); }
+}
 function tick() { $('clock').textContent = `${new Date().toLocaleTimeString('en-GB',{hour12:false,timeZone:'UTC'})} UTC`; }
 setInterval(renderPositionPayoff, 10000);
 $('refresh').addEventListener('click', async () => { try { await getJson('/api/market/refresh',{method:'POST'}); await loadMarket(); } catch (error) { $('statusSub').textContent = error.message; } }); $('reloadPositions').addEventListener('click', loadAccount); $('openTrade').addEventListener('click', openTrade); $('confirm').addEventListener('change', updateTradeControls); tick(); setInterval(tick,1000);
@@ -347,10 +416,18 @@ quantityField.addEventListener('input', () => {
   window.__desiredQty = quantityField.value;
   window.localStorage.setItem('ic-quantity', quantityField.value);
   syncQuantityPreset();
+  invalidateStrategySelection('数量已变更，等待重新预览');
 });
-const refreshEstimate = () => { const value = Number(quantityField.value); if (value > 0) { window.__desiredQty = String(value); window.localStorage.setItem('ic-quantity', String(value)); loadMarket().finally(() => { quantityField.value = window.__desiredQty; syncQuantityPreset(); }); } };
+const refreshEstimate = () => { const value = Number(quantityField.value); if (value > 0) { window.__desiredQty = String(value); window.localStorage.setItem('ic-quantity', String(value)); invalidateStrategySelection('正在重算当前数量'); void loadMarket(); } };
 quantityPreset.addEventListener('change', () => { if (quantityPreset.value !== 'custom') { quantityField.value = quantityPreset.value; refreshEstimate(); } });
 quantityField.addEventListener('change', refreshEstimate);
+function changeStrategyMode() {
+  strategySelectionInitialized = true;
+  invalidateStrategySelection('正在读取所选开仓结构');
+  void loadMarket();
+}
+$('strategyMode').addEventListener('change', changeStrategyMode);
+renderStrategySelection();
 async function closeTrade() { const button = $('closeTrade'); button.dataset.busy = '1'; button.disabled = true; button.textContent = '执行中…'; try { const result = await getJson('/api/trading/close', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked})}); showTradeResult(result, '平仓'); await load(); } catch (error) { showNotice(error.message, '操作未完成', 'error'); } finally { delete button.dataset.busy; updateTradeControls(); } }
 $('closeTrade').addEventListener('click', closeTrade);
 function quoteNet(quote, side, state) { const requested = new Map((state.legs || []).map((leg) => [leg.symbol, leg.side])); return (quote[side === 'Buy' ? 'quoteBuyList' : 'quoteSellList'] || []).reduce((sum, item) => { const requestedSide = requested.get(item.symbol) || 'Buy'; const takerSide = side === 'Sell' ? requestedSide : (requestedSide === 'Buy' ? 'Sell' : 'Buy'); return sum + (takerSide === 'Sell' ? 1 : -1) * Number(item.price || 0) * Number(item.qty || 0); }, 0); }
@@ -361,14 +438,29 @@ function quoteChainNet(quote, state) { const requested = new Map((state.legs || 
 function quoteNetDiff(quote, state) { return quoteNet(quote, 'Sell', state) - quoteChainNet(quote, state); }
 function rfqFeeEstimate(quote) { const index = Number(window.__latestPreview?.btc_price || 0); const effectiveRate = Math.max(0.0003 * 0.5, 0.0003); return (quote.quoteSellList || []).reduce((sum, item) => { const price = Number(item.price || 0); const qty = Number(item.qty || 0); return sum + Math.min(effectiveRate * index, 0.07 * price) * qty; }, 0); }
 function quoteSpread(quote, state) { const requested = new Map((state.legs || []).map((leg) => [leg.symbol, leg])); const chain = new Map((window.__latestChain || []).map((item) => [item.symbol, item])); return (quote.quoteSellList || []).reduce((sum, item) => { const leg = requested.get(item.symbol) || {}; const market = chain.get(item.symbol) || {}; const reference = Number((leg.side || 'Buy') === 'Sell' ? market.bid : market.ask) || Number(market.mark_price) || 0; return sum + Math.abs(Number(item.price || 0) - reference); }, 0); }
+function rfqStrategyLabel(state) {
+  if (state.strategy_mode === 'short_strangle') return '双腿卖出 · 无保护腿，亏损无上限';
+  if (state.strategy_mode === 'iron_condor') return '四腿铁鹰';
+  return `${(state.legs || []).length} 腿组合`;
+}
 function renderRfq(state) {
   if (!state || !state.rfq_id || ['Canceled', 'Expired', 'Filled', 'Failed'].includes(state.status)) { $('rfqStatus').textContent = state?.status || '未创建'; $('rfqId').textContent = '--'; $('rfqType').textContent = '--'; $('rfqExpires').textContent = '--'; $('rfqQuoteCount').textContent = '0'; $('rfqQuotes').className = 'rfq-quotes empty'; $('rfqQuotes').textContent = '暂无活动 RFQ'; return; }
-  $('rfqStatus').textContent = state.status || '--'; $('rfqId').textContent = state.rfq_id; $('rfqType').textContent = state.strategy_type === 'custom' ? '自定义' : (state.strategy_type || 'custom'); $('rfqExpires').textContent = state.expires_at ? new Date(Number(state.expires_at)).toLocaleTimeString('zh-CN') : '--'; const quotes = (state.quotes || []).slice().sort((a, b) => { const aCount = quoteLegCount(a); const bCount = quoteLegCount(b); const total = (state.legs || []).length; if ((aCount >= total) !== (bCount >= total)) return aCount >= total ? -1 : 1; if ((aCount > 0) !== (bCount > 0)) return aCount > 0 ? -1 : 1; return quoteNet(b, 'Sell', state) - quoteNet(a, 'Sell', state); }); $('rfqQuoteCount').textContent = String(quotes.length);
-  $('rfqQuotes').className = quotes.length ? 'rfq-quotes' : 'rfq-quotes empty'; $('rfqQuotes').innerHTML = quotes.length ? quotes.map((quote) => { const legCount = quoteLegCount(quote); const complete = legCount >= (state.legs || []).length; const executable = complete && state.status === 'Active' && !state.selected_quote_id; const disabled = executable ? '' : ' disabled title="报价不完整或询价已经提交/结束"'; const netDiff = quoteNetDiff(quote, state); return `<div class="rfq-quote"><div><strong>${esc(quote.deskCode || '做市商')} · ${legCount}/${(state.legs || []).length} 腿</strong><span>${esc(quote.status || '--')} · 到期 ${quote.expiresAt ? new Date(Number(quote.expiresAt)).toLocaleTimeString('zh-CN') : '--'}</span></div><div class="rfq-quote-values"><span>Sell 净额 ${quoteNet(quote, 'Sell', state).toFixed(4)}</span><span class="${netDiff >= 0 ? 'rfq-diff-positive' : 'rfq-diff-negative'}">链净额差 ${netDiff >= 0 ? '+' : ''}${netDiff.toFixed(4)}</span><span class="rfq-fee">预估手续费 ${rfqFeeEstimate(quote).toFixed(6)} USDT <small>VIP0 · 50%折扣后最低0.03% · 单腿上限7%</small></span><button class="button ghost rfq-execute" data-rfq="${esc(quote.rfqId || state.rfq_id)}" data-quote="${esc(quote.quoteId || '')}" data-side="Sell"${disabled}>执行 Sell</button></div><div class="rfq-compare-title">Sell 报价方向 · 你的四腿成交方向（Sell 用 Bid1，Buy 用 Ask1）</div><div class="rfq-leg-compare">${quoteLegComparison(quote, 'Sell', state) || '<span>无 Sell 方向报价</span>'}</div></div>`; }).join('') : '等待做市商报价';
+  $('rfqStatus').textContent = state.status || '--'; $('rfqId').textContent = state.rfq_id; $('rfqType').textContent = rfqStrategyLabel(state); $('rfqExpires').textContent = state.expires_at ? new Date(Number(state.expires_at)).toLocaleTimeString('zh-CN') : '--'; const quotes = (state.quotes || []).slice().sort((a, b) => { const aCount = quoteLegCount(a); const bCount = quoteLegCount(b); const total = (state.legs || []).length; if ((aCount >= total) !== (bCount >= total)) return aCount >= total ? -1 : 1; if ((aCount > 0) !== (bCount > 0)) return aCount > 0 ? -1 : 1; return quoteNet(b, 'Sell', state) - quoteNet(a, 'Sell', state); }); $('rfqQuoteCount').textContent = String(quotes.length);
+  $('rfqQuotes').className = quotes.length ? 'rfq-quotes' : 'rfq-quotes empty'; $('rfqQuotes').innerHTML = quotes.length ? quotes.map((quote) => { const legCount = quoteLegCount(quote); const complete = legCount >= (state.legs || []).length; const executable = complete && state.status === 'Active' && !state.selected_quote_id; const disabled = executable ? '' : ' disabled title="报价不完整或询价已经提交/结束"'; const netDiff = quoteNetDiff(quote, state); return `<div class="rfq-quote"><div><strong>${esc(quote.deskCode || '做市商')} · ${legCount}/${(state.legs || []).length} 腿</strong><span>${esc(quote.status || '--')} · 到期 ${quote.expiresAt ? new Date(Number(quote.expiresAt)).toLocaleTimeString('zh-CN') : '--'}</span></div><div class="rfq-quote-values"><span>Sell 净额 ${quoteNet(quote, 'Sell', state).toFixed(4)}</span><span class="${netDiff >= 0 ? 'rfq-diff-positive' : 'rfq-diff-negative'}">链净额差 ${netDiff >= 0 ? '+' : ''}${netDiff.toFixed(4)}</span><span class="rfq-fee">预估手续费 ${rfqFeeEstimate(quote).toFixed(6)} USDT <small>预估费率0.03% · 单腿上限7%</small></span><button class="button ghost rfq-execute" data-rfq="${esc(quote.rfqId || state.rfq_id)}" data-quote="${esc(quote.quoteId || '')}" data-side="Sell"${disabled}>执行 Sell</button></div><div class="rfq-compare-title">Sell 报价方向 · 本次询价 ${(state.legs || []).length} 腿成交方向（Sell 用 Bid1，Buy 用 Ask1）</div><div class="rfq-leg-compare">${quoteLegComparison(quote, 'Sell', state) || '<span>无 Sell 方向报价</span>'}</div></div>`; }).join('') : '等待做市商报价';
   document.querySelectorAll('.rfq-execute').forEach((button) => button.addEventListener('click', executeRfq));
 }
 async function loadRfq() { const read = window.ProjectHub.begin('rfq'); if (!read) return; try { const payload = await getJson('/api/rfq/status'); if (read.current()) renderRfq(payload); } catch (error) { if (read.current()) $('rfqStatus').textContent = error.message; } finally { read.finish(); } }
-async function createRfq() { try { await getJson('/api/rfq/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, counterparties:[], quantity:Number($('quantity').value)})}); await loadRfq(); } catch (error) { showNotice(error.message, '操作未完成', 'error'); } }
+async function createRfq() {
+  const button = $('rfqCreate');
+  if (button.dataset.busy) return;
+  try {
+    const selection = openingSelection();
+    button.dataset.busy = '1'; button.disabled = true;
+    await getJson('/api/rfq/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({...selection, counterparties:[]})});
+    await loadRfq();
+  } catch (error) { showNotice(error.message, '操作未完成', 'error'); }
+  finally { delete button.dataset.busy; updateTradeControls(); }
+}
 async function executeRfq(event) { const button = event.currentTarget; try { await getJson('/api/rfq/execute', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, rfq_id:button.dataset.rfq, quote_id:button.dataset.quote, quote_side:button.dataset.side})}); await loadRfq(); } catch (error) { showNotice(error.message, '操作未完成', 'error'); } }
 async function cancelRfq() { try { const state = await getJson('/api/rfq/status?refresh=false'); if (!state.rfq_id) throw new Error('没有活动 RFQ'); await getJson('/api/rfq/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm_live:$('confirm').checked, rfq_id:state.rfq_id})}); await loadRfq(); } catch (error) { showNotice(error.message, '操作未完成', 'error'); } }
 $('rfqCreate').addEventListener('click', createRfq); $('rfqCancel').addEventListener('click', cancelRfq);

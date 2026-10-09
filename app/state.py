@@ -53,6 +53,13 @@ class EngineState(BaseModel):
                 raise ValueError("Invalid execution group type")
             if "legs" in group and (not isinstance(group["legs"], dict) or any(not isinstance(leg, dict) for leg in group["legs"].values())):
                 raise ValueError("Invalid execution group legs")
+        for original in [*self.execution_groups.values(), self.rfq_state]:
+            if original.get("strategy_mode", "iron_condor") not in {"iron_condor", "short_strangle"}:
+                raise ValueError("Invalid stored strategy mode")
+            if "risk_budget_usd" in original:
+                budget = original["risk_budget_usd"]
+                if not isinstance(budget, (int, float)) or isinstance(budget, bool) or not isfinite(budget) or budget <= 0:
+                    raise ValueError("Invalid stored strategy risk budget")
         if "legs" in self.rfq_state:
             legs = self.rfq_state["legs"]
             if not isinstance(legs, list):

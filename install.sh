@@ -124,7 +124,7 @@ with open(path, "x", encoding="utf-8") as file:
     os.chmod(path, 0o640)
     file.write("HOST=127.0.0.1\nPORT=8000\nDASHBOARD_USERNAME=admin\n")
     file.write(f"DASHBOARD_PASSWORD={secrets.token_urlsafe(32)}\n")
-    file.write("TRADING_MODE=dry-run\nLIVE_TRADING=false\nAUTO_OPEN=false\nBYBIT_TESTNET=true\n")
+    file.write("TRADING_MODE=dry-run\nLIVE_TRADING=false\nAUTO_OPEN=false\nBYBIT_TESTNET=false\n")
     file.write(f"STATE_FILE={data}/engine_state.json\nBYBIT_API_KEY=\nBYBIT_API_SECRET=\n")
 PY
   chown "root:$SERVICE_USER" "$ENV_FILE"
@@ -151,7 +151,7 @@ input_keys() {
   local dependency_tree application_tree check_tree
   dependency_tree=$(tree_hash pyproject.toml uv.lock)
   application_tree=$(tree_hash app deploy)
-  check_tree=$(tree_hash app deploy tests/test_installer.py)
+  check_tree=$(tree_hash app deploy tests/test_installer.py .env.example)
   dependency_key=$(printf 'dependencies-v1\n%s\n%s' "$dependency_tree" "$runtime_key" | hash)
   application_key=$(printf 'application-v1\n%s\n%s' "$application_tree" "$dependency_key" | hash)
   validation_key=$(printf 'validation-v1\n%s\n%s' "$check_tree" "$dependency_key" | hash)
@@ -257,6 +257,12 @@ remember_environment() {
   install -m 0600 "$ENV_FILE" "$APP_DIR/.last-successful.env.new.$$"
   mv -f -- "$APP_DIR/.last-successful.env.new.$$" "$APP_DIR/.last-successful.env"
 }
+publish_environment() {
+  if ! cmp -s "$1" "$ENV_FILE"; then
+    install -m 0640 -o root -g "$SERVICE_USER" "$1" "$ENV_FILE.new.$$"
+    mv -f -- "$ENV_FILE.new.$$" "$ENV_FILE"
+  fi
+}
 rollback() {
   local code=${1:-$?}
   trap - ERR INT TERM
@@ -360,10 +366,20 @@ main() {
   else log '源码已缓存，跳过下载。'; fi
   input_keys
   prepare_application
+  local added_settings candidate_environment="$work_dir/candidate.env"
+  added_settings=$("$dependencies/bin/python" "$release/deploy/configure.py" "$ENV_FILE" "$candidate_environment")
+  chown "root:$SERVICE_USER" "$work_dir"
+  chmod 0750 "$work_dir"
+  chown "root:$SERVICE_USER" "$candidate_environment"
+  chmod 0640 "$candidate_environment"
+  if [[ "$added_settings" == none ]]; then log '策略参数齐全，保留已有配置。'
+  else log "补齐缺少的策略参数：$added_settings；已有参数、运行模式与凭据保持不变。"; fi
   # Validate as the service user without starting the app or loading trading state.
-  run_as_service "$dependencies/bin/python" "$release/deploy/runtime.py" validate --env "$ENV_FILE" >/dev/null
+  run_as_service "$dependencies/bin/python" "$release/deploy/runtime.py" validate --env "$candidate_environment" >/dev/null
+  deployment_key=$({ cat "$candidate_environment" "$work_dir/service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION"; } | hash)
   if [[ "$release" == "$old_release" && "${deployed_state#* }" == "$deployment_key" ]] &&
       cmp -s "$work_dir/service" "$UNIT_FILE" && healthy; then
+    publish_environment "$candidate_environment"
     atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
     log '运行代码未变化，复用当前版本，跳过服务重启。'
     cleanup
@@ -376,6 +392,7 @@ main() {
     install -m 0600 "$APP_DIR/.last-successful.env" "$old_environment"
   fi
   activation_started=1
+  publish_environment "$candidate_environment"
   atomic_link "$release" "$APP_DIR/current"
   if [[ ! -f "$UNIT_FILE" ]] || ! cmp -s "$work_dir/service" "$UNIT_FILE"; then
     install -m 0644 "$work_dir/service" "$UNIT_FILE"

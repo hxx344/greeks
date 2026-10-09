@@ -8,16 +8,20 @@ function dashboard({embedded = false, request} = {}) {
   const pending = [];
   const requests = [], events = new Map(), messages = [];
   const parent = {postMessage(message, origin) { messages.push({message, origin}); }};
+  const drawing = new Proxy({}, {get(target, name) { return target[name] ?? (() => {}); }});
   const element = (id) => {
     if (!elements.has(id)) elements.set(id, {
-      value: id === 'quantity' ? '0.01' : '', dataset: {}, style: {},
-      options: [], addEventListener() {}, closest() { return null; },
+      value: id === 'quantity' ? '0.01' : id === 'strategyMode' ? 'iron_condor' : '', dataset: {}, style: {}, attributes: {}, listeners: new Map(),
+      options: [], addEventListener(name, callback) { this.listeners.set(name, callback); }, closest() { return null; },
+      dispatch(name) { return this.listeners.get(name)?.({currentTarget: this}); },
+      setAttribute(name, value) { this.attributes[name] = value; },
+      getBoundingClientRect() { return {width: 640, height: 260}; }, getContext() { return drawing; },
     });
     return elements.get(id);
   };
   const context = vm.createContext({
-    document: {visibilityState: 'visible', addEventListener(name, callback) { events.set(name, callback); }, getElementById: element, querySelector() { return null; }},
-    window: {location: {hostname: embedded ? 'p-0123456789abcdef01234567.hub.localhost' : 'localhost', protocol: 'http:', port: '8000'}, parent, navigator: {onLine: true}, localStorage: {getItem() { return null; }}, addEventListener(name, callback) { events.set(name, callback); }},
+    document: {visibilityState: 'visible', addEventListener(name, callback) { events.set(name, callback); }, getElementById: element, querySelector() { return null; }, querySelectorAll() { return []; }},
+    window: {location: {hostname: embedded ? 'p-0123456789abcdef01234567.hub.localhost' : 'localhost', protocol: 'http:', port: '8000'}, parent, navigator: {onLine: true}, localStorage: {getItem() { return null; }, setItem() {}}, addEventListener(name, callback) { events.set(name, callback); }},
     setTimeout() { return 1; }, clearTimeout() {},
     setInterval() {},
     fetch(url, options) {
@@ -390,4 +394,182 @@ test('short closes account for direction and maker rebates', () => {
   const open = execution('o', 1, 'Sell', 2, 100, -2);
   const close = execution('c', 2, 'Buy', 2, 90, 1, true);
   assert.equal(context.matchClosingExecutions([close, open]).get(close), 21);
+});
+
+function strategyMarket(mode = 'iron_condor') {
+  const payload = marketPayload(false);
+  const leg = (type, side, strike, mark) => ({symbol: `BTC-13SEP99-${strike}-${type[0]}-USDT`, option_type: type,
+    side, strike, mark_price: mark, qty: .01, delta: type === 'Call' ? .15 : -.15, target_delta: .15,
+    estimated_fee_usd: .1, fee_cap_usd: .2});
+  const shorts = [leg('Put', 'Sell', 95000, 600), leg('Call', 'Sell', 105000, 600)];
+  Object.assign(payload.config, {strategy_mode: 'iron_condor', max_margin_usd: 2500, auto_open: false});
+  Object.assign(payload.preview, {strategy_mode: mode, unbounded_loss: mode === 'short_strangle',
+    margin_mode: 'PORTFOLIO_MARGIN', margin_basis: mode === 'short_strangle' ? 'regular_order_im' : 'portfolio_loss_estimate',
+    legs: mode === 'short_strangle' ? shorts : [leg('Put', 'Buy', 90000, 100), ...shorts, leg('Call', 'Buy', 110000, 100)],
+    net_credit_usd: mode === 'short_strangle' ? 12 : 10, max_loss_usd: mode === 'short_strangle' ? null : 40,
+    risk_reward: mode === 'short_strangle' ? null : .25, estimated_margin_usd: 550, estimated_initial_margin_usd: 500,
+    estimated_maintenance_margin_usd: 250, estimated_trading_cost_usd: .4, estimated_fee_rate: .0003, fee_cap_pct: .07});
+  return payload;
+}
+async function deliverMarket(page, payload) {
+  page.pending.at(-1).resolve({ok: true, text: async () => JSON.stringify(payload)});
+  await new Promise(setImmediate);
+}
+async function readyStrategy(page, mode) {
+  if (mode === 'short_strangle') {
+    page.element('strategyMode').value = mode;
+    page.element('strategyMode').dispatch('change');
+    await deliverMarket(page, strategyMarket());
+  }
+  await deliverMarket(page, strategyMarket(mode));
+}
+
+test('mode changes clear confirmation and discard the old preview before showing an unbounded strategy', async () => {
+  const page = dashboard(), {context, element, pending} = page;
+  element('confirm').checked = true;
+  element('strategyMode').value = 'short_strangle';
+  element('strategyMode').dispatch('change');
+  assert.equal(element('confirm').checked, false);
+  assert.equal(element('openTrade').disabled, true);
+  assert.equal(element('rfqCreate').disabled, true);
+  assert.equal(context.window.__latestPreview, null);
+  await context.openTrade(); await context.createRfq();
+  assert.equal(page.requests.filter(item => item.options?.method === 'POST').length, 0);
+  await deliverMarket(page, strategyMarket());
+  assert.equal(context.window.__latestPreview, null);
+  assert.equal(pending.length, 2);
+  assert.match(pending[1].url, /quantity=0.01&strategy_mode=short_strangle/);
+  const payload = strategyMarket('short_strangle');
+  payload.config.max_margin_usd = 100; // Preview remains available even above the separate budget.
+  await deliverMarket(page, payload);
+  assert.equal(element('lossValue').textContent, '无上限');
+  assert.equal(element('marginSub').textContent, '常规保证金估算（含缓冲）');
+  assert.equal(element('marginValue').textContent, '$550');
+  assert.equal(element('rrValue').textContent, '--');
+  assert.equal(element('legSummary').textContent, 'BUY 0 · SELL 2');
+  assert.match(element('strategyRisk').textContent, /保证金预算 \$100/);
+  assert.match(element('confirmText').textContent, /亏损无上限/);
+  assert.equal(element('payoffRisk').hidden, false);
+  assert.match(element('payoffRisk').textContent, /亏损无上限.*有限价格范围/);
+  assert.match(element('payoffChart').attributes['aria-label'], /亏损无上限/);
+  assert.match(element('payoffStats').innerHTML, /最大亏损<\/span><strong class="loss">无上限/);
+  assert.doesNotMatch(element('payoffStats').innerHTML, /NaN|Infinity|最大风险/);
+  assert.equal(element('quantity').value, '0.01');
+  element('confirm').checked = true; context.updateTradeControls();
+  assert.equal(element('openTrade').disabled, false);
+});
+
+test('a four-leg or legacy response cannot authorize a selected two-leg order', async () => {
+  const page = dashboard();
+  page.element('strategyMode').value = 'short_strangle'; page.element('strategyMode').dispatch('change');
+  await deliverMarket(page, strategyMarket());
+  const wrong = strategyMarket(); delete wrong.preview.strategy_mode;
+  await deliverMarket(page, wrong);
+  page.element('confirm').checked = true; page.context.updateTradeControls();
+  assert.equal(page.context.window.__latestPreview, null);
+  assert.equal(page.element('openTrade').disabled, true);
+  assert.match(page.element('statusSub').textContent, /预览与所选开仓结构不一致/);
+  await page.context.openTrade();
+  assert.equal(page.requests.filter(item => item.options?.method === 'POST').length, 0);
+});
+
+test('configured default initializes the selector while manual changes leave automatic strategy unchanged', async () => {
+  const page = dashboard();
+  const first = strategyMarket();
+  Object.assign(first.config, {strategy_mode: 'short_strangle', auto_open: true});
+  await deliverMarket(page, first);
+  assert.equal(page.element('strategyMode').value, 'short_strangle');
+  assert.equal(page.context.window.__latestPreview, null);
+  assert.match(page.pending.at(-1).url, /strategy_mode=short_strangle/);
+  const second = strategyMarket('short_strangle'); second.config = first.config;
+  await deliverMarket(page, second);
+  page.element('strategyMode').value = 'iron_condor'; page.element('strategyMode').dispatch('change');
+  await deliverMarket(page, first);
+  assert.equal(page.element('strategyMode').value, 'iron_condor');
+  assert.equal(page.context.window.__latestPreview.strategy_mode, 'iron_condor');
+  assert.equal(page.element('automaticMode').textContent, '自动任务：双腿卖出 · 已启用');
+  assert.equal(page.element('payoffRisk').hidden, true);
+});
+
+test('manual opening and new RFQ capture mode once and never replay on a later mode change', async () => {
+  for (const [action, endpoint] of [['openTrade', '/api/trading/open'], ['createRfq', '/api/rfq/create']]) {
+    const page = dashboard(); await readyStrategy(page, 'short_strangle');
+    page.element('confirm').checked = true;
+    const writes = [];
+    page.context.fetch = (url, options) => options?.method === 'POST'
+      ? new Promise(resolve => writes.push({url, options, resolve})) : Promise.reject(new Error('offline'));
+    const operation = page.context[action]();
+    await page.context[action]();
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].url, endpoint);
+    assert.equal(writes[0].options.signal, undefined);
+    assert.equal(JSON.parse(writes[0].options.body).strategy_mode, 'short_strangle');
+    assert.equal(JSON.parse(writes[0].options.body).quantity, .01);
+    page.element('strategyMode').value = 'iron_condor'; page.element('strategyMode').dispatch('change');
+    assert.equal(page.element('confirm').checked, false);
+    writes[0].resolve({ok: true, text: async () => '{"results":[{"status":"simulated"}]}'});
+    await operation;
+    assert.equal(writes.length, 1);
+    assert.equal(JSON.parse(writes[0].options.body).strategy_mode, 'short_strangle');
+  }
+});
+
+test('existing RFQ keeps its own two-leg directions and risk after changing the opening selector', () => {
+  const {context, element} = dashboard();
+  element('strategyMode').value = 'iron_condor';
+  const legs = strategyMarket('short_strangle').preview.legs;
+  const state = {rfq_id:'saved-two-leg', status:'Active', strategy_mode:'short_strangle', strategy_type:'custom', legs,
+    quotes:[{quoteId:'quote-one', quoteSellList:legs.map(leg => ({symbol:leg.symbol, qty:leg.qty, price:600}))}]};
+  context.renderRfq(state);
+  assert.match(element('rfqType').textContent, /双腿卖出.*亏损无上限/);
+  assert.match(element('rfqQuotes').innerHTML, /2\/2 腿/);
+  assert.match(element('rfqQuotes').innerHTML, /本次询价 2 腿成交方向/);
+  assert.equal((element('rfqQuotes').innerHTML.match(/<span>Sell 600/g) || []).length, 2);
+  assert.doesNotMatch(element('rfqQuotes').innerHTML, /四腿|折扣/);
+  assert.match(element('rfqQuotes').innerHTML, /预估费率0.03% · 单腿上限7%/);
+  element('strategyMode').value = 'short_strangle';
+  state.strategy_mode = 'iron_condor'; state.legs = strategyMarket().preview.legs;
+  context.renderRfq(state);
+  assert.equal(element('rfqType').textContent, '四腿铁鹰');
+  assert.match(element('rfqQuotes').innerHTML, /本次询价 4 腿成交方向/);
+});
+
+test('closing stays bound to tracked positions and does not send the opening selector', async () => {
+  const page = dashboard(); await readyStrategy(page, 'short_strangle');
+  page.element('confirm').checked = true; page.context.updateTradeControls();
+  assert.match(page.element('closeTrade').textContent, /平仓已跟踪持仓/);
+  assert.doesNotMatch(page.element('closeTrade').textContent, /双腿|四腿/);
+  const writes = [];
+  page.context.fetch = (url, options) => {
+    if (options?.method !== 'POST') return Promise.reject(new Error('offline'));
+    writes.push({url, body:JSON.parse(options.body)});
+    return Promise.resolve({ok:true, text:async () => '{"results":[{"status":"simulated"}]}'});
+  };
+  await page.context.closeTrade();
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].url, '/api/trading/close');
+  assert.deepEqual(writes[0].body, {confirm_live:true});
+});
+
+test('legacy four-leg preview keeps finite loss and PM estimate labels', async () => {
+  const page = dashboard(), payload = strategyMarket();
+  delete payload.preview.strategy_mode; delete payload.preview.margin_basis; delete payload.preview.unbounded_loss;
+  await deliverMarket(page, payload);
+  assert.equal(page.element('lossValue').textContent, '$40');
+  assert.equal(page.element('marginSub').textContent, 'PM 压力测试估算');
+  assert.equal(page.element('payoffRisk').hidden, true);
+  assert.match(page.element('payoffStats').innerHTML, /最大亏损<\/span><strong class="loss">\$40/);
+});
+
+test('two-leg tracked positions retain unbounded-loss annotation inside a narrow SVG chart', () => {
+  const {context, element} = dashboard();
+  context.window.__positionSnapshot = [
+    {symbol:'BTC-13Sep99-95000-P-USDT', side:'Sell', size:.01, avg_price:600, unrealised_pnl:2},
+    {symbol:'BTC-13Sep99-105000-C-USDT', side:'Sell', size:.01, avg_price:600, unrealised_pnl:2},
+  ];
+  element('positionPayoffContent').clientWidth = 300;
+  context.renderPositionPayoff();
+  assert.match(element('positionPayoffContent').innerHTML, /<text class="pp-risk-note"[^>]*>亏损无上限 · 图示价格范围有限<\/text>/);
+  assert.match(element('positionPayoffContent').innerHTML, /最大到期亏损<\/span><strong class="">无上限/);
+  assert.doesNotMatch(element('positionPayoffContent').innerHTML, /NaN|Infinity/);
 });

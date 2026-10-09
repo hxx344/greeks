@@ -245,6 +245,7 @@ def build_performance(groups, executions, links, journal, positions=(), position
         remaining_fees = sum((lot["fee"] * lot["remaining"] / lot["qty"] for lot in lots), ZERO)
         sampled_pnl = amount(bucket["realized"] + number(floating) - remaining_fees) if floating is not None and not issues else None
         rows.append(dict(id=key, opened_at=(bucket["opened"].isoformat() if bucket["opened"] else meta.get("created_at")),
+                         strategy_mode=meta.get("strategy_mode", "iron_condor"),
                          closed_at=bucket["closed"].isoformat() if closed and bucket["closed"] else None,
                          currency=currency, status="pending" if issues else "closed" if closed else "open", issues=issues,
                          leg_count=len(actual or targets), open_premium=amount(bucket["premium"]) if lots or source != "executions" else None,

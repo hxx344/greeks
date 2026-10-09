@@ -1,9 +1,11 @@
 import asyncio
+from copy import deepcopy
 from datetime import datetime, timezone
 from math import isclose, isfinite
 from uuid import uuid4
 
 from .models import Position, RfqCreateRequest, RfqExecuteRequest, RfqCancelRequest
+from .risk import leg_count, maximum_loss, strategy_mode as validate_mode, validate_structure
 
 
 class RfqMixin:
@@ -40,13 +42,15 @@ class RfqMixin:
             if not counterparties:
                 raise
             self.log("WARNING", f"Could not load RFQ config; using specified counterparties: {exc}")
+        mode = validate_mode(request.strategy_mode or self.settings.strategy_mode)
         strategy_type = "custom"
-        for item in rfq_config.get("strategyTypes") or []:
-            name = str(item.get("strategyName", "") if isinstance(item, dict) else item)
-            normalized = name.replace(" ", "").replace("_", "").lower()
-            if "ironcondor" in normalized:
-                strategy_type = name
-                break
+        if mode == "iron_condor":
+            for item in rfq_config.get("strategyTypes") or []:
+                name = str(item.get("strategyName", "") if isinstance(item, dict) else item)
+                normalized = name.replace(" ", "").replace("_", "").lower()
+                if "ironcondor" in normalized:
+                    strategy_type = name
+                    break
         if not counterparties:
             available = rfq_config.get("counterparties") or []
             counterparties = [item.get("deskCode") if isinstance(item, dict) else str(item) for item in available]
@@ -55,14 +59,22 @@ class RfqMixin:
             counterparties = counterparties[:max_lp] if max_lp else counterparties
         if not counterparties:
             raise ValueError("Bybit returned no available RFQ counterparties")
-        preview = await self.make_preview(request.quantity or self.settings.leg_qty)
+        preview = await self.make_preview(request.quantity or self.settings.leg_qty, strategy_mode=mode)
+        if preview.strategy_mode != mode:
+            raise ValueError("Preview strategy mode does not match the RFQ request")
         self._validate_market_snapshot()
         self._validate_risk(preview)
         qty = request.quantity or self.settings.leg_qty
+        if any(not isclose(leg.qty, qty, rel_tol=0, abs_tol=1e-9) for leg in preview.legs):
+            raise ValueError("Preview quantity does not match the RFQ request")
         legs = [{"category": "option", "symbol": leg.symbol, "side": leg.side, "qty": str(qty)} for leg in preview.legs]
+        risk = self._initial_execution_risk(preview)
+        instruments = {item.symbol: item for item in self.chain}
+        for leg in preview.legs:
+            self._validate_leg_quantity(instruments[leg.symbol], qty)
         # Bybit RFQ link IDs allow letters and numbers only.
         rfq_link_id = f"icrfq{uuid4().hex[:16]}"
-        self.rfq_state = {"rfq_id": "", "rfq_link_id": rfq_link_id, "strategy_type": strategy_type,
+        self.rfq_state = {"rfq_id": "", "rfq_link_id": rfq_link_id, "strategy_type": strategy_type, **risk,
                           "status": "CreationUnknown", "counterparties": counterparties, "legs": legs,
                           "quotes": [], "created_at": datetime.now(timezone.utc).isoformat()}
         self._save_state()
@@ -133,7 +145,7 @@ class RfqMixin:
         if not request.confirm_live:
             raise ValueError("RFQ execution requires explicit confirmation")
         if request.quote_side != "Sell":
-            raise ValueError("This Iron Condor workflow only accepts the Sell quote direction")
+            raise ValueError("This strategy workflow only accepts the Sell quote direction")
         if request.rfq_id != self.rfq_state.get("rfq_id"):
             raise ValueError("RFQ is not the active inquiry")
         if self.rfq_state.get("selected_quote_id") or self.rfq_state.get("status") in {"Filled", "PendingFill", "Canceled", "Expired", "Failed", "ExecutionUnknown"}:
@@ -180,8 +192,10 @@ class RfqMixin:
         quoted_legs = quote.get("quoteSellList") or []
         requested = {leg.get("symbol"): leg for leg in legs}
         quoted = {leg.get("symbol"): leg for leg in quoted_legs}
-        if len(legs) != 4 or len(requested) != 4 or len(quoted_legs) != 4 or set(requested) != set(quoted):
-            raise ValueError("Quote must cover exactly the four requested legs")
+        mode = validate_mode(self.rfq_state.get("strategy_mode", "iron_condor"))
+        count = leg_count(mode)
+        if len(legs) != count or len(requested) != count or len(quoted_legs) != count or set(requested) != set(quoted):
+            raise ValueError(f"Quote must cover exactly the {'four' if count == 4 else 'two'} requested legs")
         for symbol, leg in requested.items():
             quantity = float(quoted[symbol].get("qty", 0) or 0)
             price = float(quoted[symbol].get("price", 0) or 0)
@@ -190,45 +204,51 @@ class RfqMixin:
         instruments = {item.symbol: item for item in self.chain if item.symbol in requested}
         if set(instruments) != set(requested):
             raise ValueError("RFQ instruments are missing from market data")
-        roles = {(instruments[symbol].option_type, leg.get("side")): instruments[symbol].strike for symbol, leg in requested.items()}
-        if set(roles) != {("Call", "Buy"), ("Call", "Sell"), ("Put", "Buy"), ("Put", "Sell")} or len({float(leg["qty"]) for leg in legs}) != 1:
-            raise ValueError("RFQ must contain four balanced Iron Condor legs")
-        if not roles[("Put", "Buy")] < roles[("Put", "Sell")] < roles[("Call", "Sell")] < roles[("Call", "Buy")]:
-            raise ValueError("RFQ Iron Condor strikes are not ordered correctly")
+        bounds = {symbol: {"side": leg.get("side"), "option_type": instruments[symbol].option_type,
+                           "strike": instruments[symbol].strike, "qty": float(leg["qty"]),
+                           "expiry": instruments[symbol].expiry.isoformat(), "mark_price": instruments[symbol].mark_price,
+                           "price_bound": float(quoted[symbol]["price"])} for symbol, leg in requested.items()}
+        validate_structure(bounds, mode, require_expiry=True)
+        for symbol, leg in bounds.items():
+            self._validate_leg_quantity(instruments[symbol], leg["qty"])
         expiries = {item.expiry for item in instruments.values()}
         if len(expiries) != 1:
             raise ValueError("RFQ legs must resolve to one common expiry")
         self._validate_open_calendar(expiries.pop())
-        # A piecewise-linear expiry payoff reaches its minimum at a strike
-        # or an outer boundary. Evaluate the actual quoted legs and prices.
-        credit = sum((1 if leg["side"] == "Sell" else -1) * float(quoted[symbol]["price"]) * float(leg["qty"]) for symbol, leg in requested.items())
-        payoffs = []
-        for spot in [0.0, *(item.strike for item in instruments.values())]:
-            payoff = credit
-            for symbol, leg in requested.items():
-                item = instruments[symbol]
-                intrinsic = max(spot - item.strike, 0) if item.option_type == "Call" else max(item.strike - spot, 0)
-                payoff += (1 if leg["side"] == "Buy" else -1) * intrinsic * float(leg["qty"])
-            payoffs.append(payoff)
-        if max(0.0, -min(payoffs)) > self.settings.max_risk_usd:
-            raise ValueError("RFQ quote exceeds the maximum loss limit")
+        if mode == "short_strangle":
+            saved = self.rfq_state.get("risk_legs") or {}
+            if set(saved) != set(bounds) or any(saved[symbol].get(key) != leg[key]
+                                               for symbol, leg in bounds.items() for key in ("side", "option_type", "strike", "qty", "expiry")):
+                raise ValueError("RFQ structure does not match its saved short-strangle risk bounds")
+            self.rfq_state.update(self._proposed_execution_risk(self.rfq_state, {symbol: leg["price_bound"] for symbol, leg in bounds.items()}))
+        else:
+            risk = maximum_loss(bounds)
+            if risk > self.settings.max_risk_usd:
+                raise ValueError("RFQ quote exceeds the maximum loss limit")
+            self.rfq_state.update(risk_legs=bounds, risk_reserved_usd=risk)
 
     def _track_filled_rfq(self, positions: list[Position] | None = None) -> bool:
         self._require_trading_state()
         group_id = f"rfq:{self.rfq_state.get('rfq_id', '')}"
+        mode = validate_mode(self.rfq_state.get("strategy_mode", "iron_condor"))
         started = self.rfq_state.get("execution_started_at") or self.rfq_state.get("created_at")
+        try:
+            _, legs = self._stored_strategy_legs(self.rfq_state)
+        except (ValueError, TypeError, KeyError):
+            legs = None
+        metadata = {"strategy_mode": mode}
+        for key in ("risk_legs", "risk_context", "risk_budget_usd", "risk_reserved_usd"):
+            if key in self.rfq_state:
+                metadata[key] = deepcopy(self.rfq_state[key])
         if started and self.active_strategy_group_id == group_id and group_id not in self.execution_groups:
-            self.execution_groups[group_id] = {"type": "open", "created_at": started}
+            self.execution_groups[group_id] = {"type": "open", "created_at": started, **metadata}
             self._save_state()
-        if group_id in self.execution_groups and "legs" not in self.execution_groups[group_id]:
-            legs = self.rfq_state.get("legs") or []
-            if len(legs) == 4 and all(leg.get("symbol") and leg.get("side") in {"Buy", "Sell"} and float(leg.get("qty", 0)) > 0 for leg in legs):
-                self.execution_groups[group_id]["legs"] = {leg["symbol"]: {"side": leg["side"], "qty": float(leg["qty"])} for leg in legs}
-                self._save_state()
+        if group_id in self.execution_groups and "legs" not in self.execution_groups[group_id] and legs:
+            self.execution_groups[group_id].update(legs=legs, **metadata)
+            self._save_state()
         if self.rfq_state.get("tracking_applied"):
             return False
-        # Migrate existing tracking without restoring the original quantity
-        # after a partial or complete close, including older state files.
+        # Preserve any partial/complete close already reflected by the journal.
         already_tracked = self.active_strategy_group_id == group_id or any(
             group.get("type") == "close" and group.get("opening_group") == group_id
             for group in self.execution_groups.values()
@@ -239,25 +259,16 @@ class RfqMixin:
             return False
         if self.active_strategy_symbols and self.active_strategy_group_id != group_id:
             return False
-        legs = self.rfq_state.get("legs") or []
-        execution_submitted = self.rfq_state.get("status") == "Filled"
-        if not execution_submitted or len(legs) != 4 or len({leg.get("symbol") for leg in legs}) != 4:
+        if self.rfq_state.get("status") != "Filled" or not legs:
             return False
-        sizes: dict[str, float] = {}
-        for leg in legs:
-            symbol = str(leg.get("symbol", ""))
-            side = str(leg.get("side", ""))
-            requested_qty = float(leg.get("qty", 0) or 0)
-            if not symbol or side not in {"Buy", "Sell"} or requested_qty <= 0:
-                return False
-            # Filled RFQ is the evidence. Account positions can lag or already
-            # reflect an external close and must not replace the confirmed size.
-            sizes[f"{symbol}|{side}"] = requested_qty
-        self.active_strategy_symbols = {str(leg["symbol"]) for leg in legs}
-        self.active_strategy_sizes = sizes
-        self.active_strategy_group_id = f"rfq:{self.rfq_state.get('rfq_id', '')}"
-        self.execution_groups.setdefault(group_id, {"type": "open", "created_at": self.rfq_state.get("execution_started_at") or self.rfq_state.get("created_at")})
-        self.execution_groups[group_id].setdefault("legs", {leg["symbol"]: {"side": leg["side"], "qty": float(leg["qty"])} for leg in legs})
+        # Filled RFQ plus the complete saved structure is the evidence. Account
+        # positions can lag and residual legs cannot identify a strategy mode.
+        self.active_strategy_symbols = set(legs)
+        self.active_strategy_sizes = {f"{symbol}|{leg['side']}": leg["qty"] for symbol, leg in legs.items()}
+        self.active_strategy_group_id = group_id
+        group = self.execution_groups.setdefault(group_id, {"type": "open", "created_at": started, **metadata})
+        group.setdefault("strategy_mode", mode)
+        group.setdefault("legs", legs)
         self.rfq_state["tracking_applied"] = True
         self._save_state()
         return True

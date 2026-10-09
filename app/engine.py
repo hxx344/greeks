@@ -9,11 +9,11 @@ from uuid import uuid4
 
 from .bybit import BybitClient
 from .config import Settings
-from .models import AccountHealth, CloseRequest, ExecutionRecord, LogEntry, OpenRequest, OrderResult, PerformanceSample, Position, StrategyPreview
-from .strategy import build_iron_condor
+from .models import AccountHealth, CloseRequest, ExecutionRecord, LogEntry, OpenRequest, OrderResult, PerformanceSample, Position, StrategyMode, StrategyPreview
+from .strategy import build_strategy
 from .orders import OrderExecutor
 from .state import EngineState
-from .risk import maximum_loss
+from .risk import leg_count, maximum_loss, reserve_short_margin, strategy_mode as validate_mode, validate_structure
 from .rfq import RfqMixin
 from .reconciliation import ReconciliationMixin
 from .performance import PerformanceMixin
@@ -211,7 +211,7 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
                     price_filter = item.get("priceFilter") or {}
                     parsed.append(OptionInstrument(symbol=symbol, expiry=expiry, strike=float(strike_value), option_type=kind, delta=float(ticker.get("delta", 0) or 0), mark_price=float(ticker.get("markPrice", 0) or 0), bid=float(ticker.get("bid1Price", 0) or 0), ask=float(ticker.get("ask1Price", 0) or 0), iv=float(ticker.get("markIv", 0) or 0), volume=float(ticker.get("volume24h", 0) or 0), open_interest=float(ticker.get("openInterest", 0) or 0), bid_size=float(ticker.get("bid1Size", 0) or 0), ask_size=float(ticker.get("ask1Size", 0) or 0), min_qty=float(lot.get("minOrderQty", 0.01) or 0.01), qty_step=float(lot.get("qtyStep", 0.01) or 0.01), max_qty=float(lot.get("maxOrderQty", 500) or 500), price_tick=float(price_filter.get("tickSize", 0.01) or 0.01)))
                 valid_deltas = [item for item in parsed if abs(item.delta) > 0 and item.mark_price > 0]
-                if len(valid_deltas) >= 8 and {item.option_type for item in valid_deltas} == {"Call", "Put"}:
+                if len(valid_deltas) >= 2 and {item.option_type for item in valid_deltas} == {"Call", "Put"}:
                     # Replace the visible snapshot only after both endpoints and all rows validate.
                     self.chain = parsed
                     self.chain_source = "bybit"
@@ -230,16 +230,20 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
                 self.chain_source = "unavailable"
                 return []
 
-    async def make_preview(self, quantity: float | None = None) -> StrategyPreview:
+    async def make_preview(self, quantity: float | None = None, strategy_mode: StrategyMode | None = None) -> StrategyPreview:
         await self.refresh_chain()
         multiplier = 1.0 if self.chain_source == "bybit" else 0.01
         now = datetime.now(timezone.utc)
         qty = self.settings.leg_qty if quantity is None else quantity
-        self.preview = build_iron_condor(self.chain, now, self.settings.target_dte_days, qty, multiplier, self.settings.estimated_taker_fee_rate, self.settings.portfolio_margin_buffer_pct, self.btc_price or 0.0, self.settings.margin_mode, self.settings.option_mm_factor, self.settings.option_max_im_factor, self.settings.option_min_im_factor, self.settings.option_liquidation_fee_rate, self.settings.option_fee_cap_pct)
+        mode = validate_mode(strategy_mode or self.settings.strategy_mode)
+        self.preview = build_strategy(self.chain, now, self.settings.target_dte_days, qty, multiplier, self.settings.estimated_taker_fee_rate, self.settings.portfolio_margin_buffer_pct, self.btc_price or 0.0, self.settings.margin_mode, self.settings.option_mm_factor, self.settings.option_max_im_factor, self.settings.option_min_im_factor, self.settings.option_liquidation_fee_rate, self.settings.option_fee_cap_pct, strategy_mode=mode)
         self.preview.source = self.chain_source
         self.preview.market_timestamp = self.chain_updated_at
         self.preview.btc_price = self.btc_price
-        if self.preview.max_loss_usd > self.settings.max_risk_usd:
+        if self.preview.unbounded_loss:
+            level = "WARNING" if self.preview.estimated_margin_usd > self.settings.max_margin_usd else "INFO"
+            self.log(level, f"Short strangle preview: unbounded loss, margin budget ${self.preview.estimated_margin_usd:.2f} / ${self.settings.max_margin_usd:.2f}")
+        elif self.preview.max_loss_usd > self.settings.max_risk_usd:
             self.log("WARNING", f"Preview risk ${self.preview.max_loss_usd:.2f} exceeds limit ${self.settings.max_risk_usd:.2f}")
         else:
             self.log("INFO", f"Preview ready: credit ${self.preview.net_credit_usd:.2f}, max loss ${self.preview.max_loss_usd:.2f}")
@@ -253,9 +257,105 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
             raise ValueError("Bybit market snapshot is stale; refresh market data before trading")
 
     def _validate_risk(self, preview: StrategyPreview) -> None:
+        mode = validate_mode(preview.strategy_mode)
+        if len({leg.symbol for leg in preview.legs}) != len(preview.legs):
+            raise ValueError("Strategy contains duplicate instruments")
+        validate_structure({leg.symbol: {**leg.model_dump(), "expiry": preview.expiry} for leg in preview.legs}, mode, require_expiry=True)
+        if mode == "short_strangle":
+            if not preview.unbounded_loss or preview.max_loss_usd is not None or preview.risk_reward is not None:
+                raise ValueError("Short-strangle loss must be explicitly unbounded")
+            if not isfinite(preview.estimated_margin_usd) or preview.estimated_margin_usd < 0 or preview.estimated_margin_usd > self.settings.max_margin_usd:
+                raise ValueError("Margin budget exceeded; reduce quantity or raise MAX_MARGIN_USD")
+            self._initial_execution_risk(preview)
+            return
         metrics = (preview.max_loss_usd, preview.estimated_margin_usd)
-        if any(not isfinite(value) or value > self.settings.max_risk_usd for value in metrics):
+        if preview.unbounded_loss or any(value is None or not isfinite(value) or value < 0 or value > self.settings.max_risk_usd for value in metrics):
             raise ValueError("Risk limit exceeded; reduce quantity or raise MAX_RISK_USD")
+
+    def _margin_context(self) -> dict:
+        return {"index_price": self.btc_price, "market_timestamp": self.chain_updated_at.isoformat() if self.chain_updated_at else None,
+                "fee_rate": self.settings.estimated_taker_fee_rate, "fee_cap_pct": self.settings.option_fee_cap_pct,
+                "mm_factor": self.settings.option_mm_factor, "max_im_factor": self.settings.option_max_im_factor,
+                "min_im_factor": self.settings.option_min_im_factor, "liquidation_fee_rate": self.settings.option_liquidation_fee_rate,
+                "margin_buffer_pct": self.settings.portfolio_margin_buffer_pct}
+
+    def _initial_execution_risk(self, preview: StrategyPreview) -> dict:
+        mode = validate_mode(preview.strategy_mode)
+        instruments = {item.symbol: item for item in self.chain}
+        bounds = {}
+        for leg in preview.legs:
+            instrument = instruments.get(leg.symbol)
+            if (instrument is None or instrument.expiry != preview.expiry or instrument.strike != leg.strike
+                    or instrument.option_type != leg.option_type):
+                raise ValueError("Strategy legs no longer match the market instruments")
+            bounds[leg.symbol] = {"side": leg.side, "option_type": leg.option_type, "strike": leg.strike,
+                                  "qty": leg.qty, "expiry": instrument.expiry.isoformat(), "mark_price": instrument.mark_price,
+                                  "price_bound": (instrument.bid if leg.side == "Buy" else instrument.ask) or instrument.mark_price}
+        if len(bounds) != len(preview.legs):
+            raise ValueError("Strategy contains duplicate instruments")
+        validate_structure(bounds, mode, require_expiry=True)
+        context = self._margin_context()
+        if mode == "short_strangle":
+            bounds, reserved = reserve_short_margin(bounds, context)
+            budget = self.settings.max_margin_usd
+            if reserved > budget:
+                raise ValueError("Initial prices exceed short-strangle margin budget; reduce quantity or raise MAX_MARGIN_USD")
+        else:
+            reserved, budget = maximum_loss(bounds), self.settings.max_risk_usd
+            if reserved > budget:
+                raise ValueError("Initial BBO prices exceed combination maximum loss limit")
+        return {"strategy_mode": mode, "risk_legs": bounds, "risk_context": context,
+                "risk_budget_usd": budget, "risk_reserved_usd": reserved}
+
+    def _proposed_execution_risk(self, group: dict, prices: dict[str, float]) -> dict:
+        mode = validate_mode(group.get("strategy_mode", "iron_condor"))
+        bounds = group.get("risk_legs")
+        if not bounds or not set(prices) <= set(bounds):
+            raise ValueError("Opening strategy has no execution price risk bounds")
+        proposed = {key: dict(value) for key, value in bounds.items()}
+        for symbol, price in prices.items():
+            if not isfinite(price) or price <= 0:
+                raise ValueError("Invalid execution price")
+            leg = proposed[symbol]
+            if mode == "short_strangle":
+                leg["price_floor"] = min(price, leg.get("price_floor", leg["price_bound"]))
+                leg["price_ceiling"] = max(price, leg.get("price_ceiling", leg["price_bound"]))
+                leg["price_bound"] = price
+            else:
+                leg["price_bound"] = max(price, leg["price_bound"]) if leg["side"] == "Buy" else min(price, leg["price_bound"])
+        if mode == "short_strangle":
+            self._validate_market_snapshot()
+            context = dict(group.get("risk_context") or {})
+            if not context:
+                raise ValueError("Short-strangle opening has no saved margin parameters")
+            current = self._margin_context()
+            for key in ("fee_rate", "fee_cap_pct", "mm_factor", "max_im_factor", "min_im_factor", "liquidation_fee_rate", "margin_buffer_pct"):
+                previous = context.get(key)
+                if not isinstance(previous, (int, float)) or isinstance(previous, bool) or not isfinite(previous) or previous < 0:
+                    raise ValueError("Short-strangle opening has invalid saved margin parameters")
+                # A restart with stricter settings must not relax an existing
+                # inquiry; lower requirements never free a previous reserve.
+                context[key] = max(previous, current[key])
+            context.update(index_price=self.btc_price, market_timestamp=self.chain_updated_at.isoformat())
+            instruments = {item.symbol: item for item in self.chain}
+            for symbol, leg in proposed.items():
+                instrument = instruments.get(symbol)
+                if (instrument is None or instrument.option_type != leg["option_type"] or instrument.strike != leg["strike"]
+                        or instrument.expiry.isoformat() != leg.get("expiry")):
+                    raise ValueError("Short-strangle margin snapshot does not match the original legs")
+                leg["mark_price"] = instrument.mark_price
+            proposed, reserved = reserve_short_margin(proposed, context)
+            budget = group.get("risk_budget_usd")
+            if not isinstance(budget, (int, float)) or isinstance(budget, bool) or not isfinite(budget) or budget <= 0:
+                raise ValueError("Short-strangle opening has no valid saved margin budget")
+            budget = min(self.settings.max_margin_usd, budget)
+            if reserved > budget:
+                raise ValueError(f"Execution prices exceed short-strangle margin budget: {reserved:.2f}")
+            return {"risk_legs": proposed, "risk_context": context, "risk_reserved_usd": reserved}
+        reserved = maximum_loss(proposed)
+        if reserved > self.settings.max_risk_usd:
+            raise ValueError(f"Execution prices exceed combination maximum loss limit: {reserved:.2f}")
+        return {"risk_legs": proposed, "risk_reserved_usd": reserved}
 
     def _record_order(self, link: str, outcome: dict) -> None:
         entry = self.order_journal[link]
@@ -302,28 +402,40 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
             return  # Direct executor use has no strategy context.
         if group.get("risk_blocked"):
             raise ValueError("Combination risk was exceeded; remaining opening orders must stop")
-        if price is None:
-            return
-        if not isfinite(price) or price <= 0:
-            raise ValueError("Invalid execution price")
-        bounds = group.get("risk_legs")
-        if not bounds or symbol not in bounds:
-            raise ValueError("Opening strategy has no execution price risk bounds")
-        proposed = {key: dict(value) for key, value in bounds.items()}
-        leg = proposed[symbol]
-        leg["price_bound"] = max(price, leg["price_bound"]) if leg["side"] == "Buy" else min(price, leg["price_bound"])
-        loss = maximum_loss(proposed)
-        if loss > self.settings.max_risk_usd:
+        entry = self.order_journal.get(link)
+        bound = (group.get("risk_legs") or {}).get(symbol)
+        if entry and (not bound or entry["symbol"] != symbol or entry["side"] != bound["side"]
+                      or not isfinite(entry["qty"]) or not 0 < entry["qty"] <= bound["qty"]):
             group["risk_blocked"] = True
             self._save_state()
-            raise ValueError(f"Execution prices exceed combination maximum loss limit: {loss:.2f}")
-        if proposed != bounds:
+            raise ValueError("Order does not match its original strategy quantity or side")
+        if price is None and group.get("strategy_mode", "iron_condor") == "iron_condor":
+            return
+        try:
+            proposed = self._proposed_execution_risk(group, {} if price is None else {symbol: price})
+        except ValueError:
+            group["risk_blocked"] = True
+            self._save_state()
+            raise
+        if any(group.get(key) != value for key, value in proposed.items()):
             # Keep the worst bound ever submitted; fills can race amendments.
-            group["risk_legs"] = proposed
+            group.update(proposed)
             self._save_state()
 
     async def follow_bbo_order(self, leg, qty: float, order_link_id: str, reduce_only: bool = False) -> dict:
         return await self._execute_order(leg, qty, order_link_id, reduce_only)
+
+    @staticmethod
+    def _validate_leg_quantity(instrument, qty: float) -> None:
+        if (not isfinite(qty) or qty <= 0 or any(not isfinite(value) or value <= 0
+                                               for value in (instrument.min_qty, instrument.max_qty, instrument.qty_step))
+                or instrument.max_qty < instrument.min_qty):
+            raise ValueError("Invalid quantity or exchange lot limits")
+        if qty < instrument.min_qty or qty > instrument.max_qty:
+            raise ValueError(f"Quantity for {instrument.symbol} must be between {instrument.min_qty} and {instrument.max_qty}")
+        steps = round((qty - instrument.min_qty) / instrument.qty_step)
+        if not isclose(instrument.min_qty + steps * instrument.qty_step, qty, rel_tol=0, abs_tol=1e-9):
+            raise ValueError(f"Quantity {qty} does not match Bybit step {instrument.qty_step} for {instrument.symbol}")
 
     async def open_position(self, request: OpenRequest, scheduled: bool = False) -> list[OrderResult]:
         async with self.lock:
@@ -331,7 +443,10 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
             if self.settings.can_send_orders and not request.confirm_live:
                 raise ValueError("Live opening requires explicit confirmation")
             qty = request.quantity or self.settings.leg_qty
-            preview = await self.make_preview(qty)
+            mode = self.settings.strategy_mode if scheduled else request.strategy_mode or self.settings.strategy_mode
+            preview = await self.make_preview(qty, strategy_mode=mode)
+            if preview.strategy_mode != mode:
+                raise ValueError("Preview strategy mode does not match the opening request")
             live = bool(request.confirm_live and self.settings.can_send_orders)
             if live:
                 self._require_resolved_rfq()
@@ -348,14 +463,12 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
             if qty <= 0:
                 raise ValueError("Quantity must be greater than zero")
             for leg in preview.legs:
+                if not isclose(leg.qty, qty, rel_tol=0, abs_tol=1e-9):
+                    raise ValueError("Preview quantity does not match the opening request")
                 instrument = next((item for item in self.chain if item.symbol == leg.symbol), None)
                 if instrument is None:
                     raise ValueError(f"Instrument disappeared from fresh market data: {leg.symbol}")
-                if qty < instrument.min_qty or qty > instrument.max_qty:
-                    raise ValueError(f"Quantity for {leg.symbol} must be between {instrument.min_qty} and {instrument.max_qty}")
-                steps = round((qty - instrument.min_qty) / instrument.qty_step)
-                if not isclose(instrument.min_qty + steps * instrument.qty_step, qty, rel_tol=0, abs_tol=1e-9):
-                    raise ValueError(f"Quantity {qty} does not match Bybit step {instrument.qty_step} for {leg.symbol}")
+                self._validate_leg_quantity(instrument, qty)
                 if live and (instrument.bid <= 0 or instrument.ask <= 0):
                     raise ValueError(f"No executable bid/ask for {leg.symbol}")
                 spread_bps = (instrument.ask - instrument.bid) / instrument.mark_price * 10000 if instrument.mark_price > 0 else float("inf")
@@ -368,14 +481,10 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
                 self._validate_market_snapshot()
                 request_id = uuid4().hex[:12]
                 order_links = [f"ic-{request_id}-{index}" for index, _ in enumerate(preview.legs)]
-                self.execution_groups[request_id] = {"type": "open", "order_tracking": True, "created_at": datetime.now(timezone.utc).isoformat(), "legs": {leg.symbol: {"side": leg.side, "chain_price": (next(item for item in self.chain if item.symbol == leg.symbol).bid if leg.side == "Sell" else next(item for item in self.chain if item.symbol == leg.symbol).ask), "qty": qty} for leg in preview.legs}}
-                instruments = {item.symbol: item for item in self.chain}
-                risk_legs = {leg.symbol: {"side": leg.side, "option_type": leg.option_type, "strike": leg.strike, "qty": qty,
-                                         "price_bound": instruments[leg.symbol].bid if leg.side == "Buy" else instruments[leg.symbol].ask}
-                             for leg in preview.legs}
-                if maximum_loss(risk_legs) > self.settings.max_risk_usd:
-                    raise ValueError("Initial BBO prices exceed combination maximum loss limit")
-                self.execution_groups[request_id]["risk_legs"] = risk_legs
+                risk = self._initial_execution_risk(preview)
+                self.execution_groups[request_id] = {"type": "open", "order_tracking": True, "created_at": datetime.now(timezone.utc).isoformat(), **risk,
+                                                     "legs": {leg.symbol: {"side": leg.side, "option_type": leg.option_type, "strike": leg.strike,
+                                                                           "expiry": preview.expiry.isoformat(), "chain_price": (next(item for item in self.chain if item.symbol == leg.symbol).bid if leg.side == "Sell" else next(item for item in self.chain if item.symbol == leg.symbol).ask), "qty": qty} for leg in preview.legs}}
                 for link in order_links:
                     self.execution_group_links[link] = request_id
                 self._save_state()
@@ -405,13 +514,13 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
                 if any(item.status != "filled" for item in results):
                     self.log("ERROR", "Some legs are incomplete or unresolved; inspect the reported quantities and exchange orders")
                 else:
-                    self.log("INFO", "All four live legs are confirmed filled")
+                    self.log("INFO", f"All {len(preview.legs)} live legs are confirmed filled")
             else:
-                self.log("INFO", "All four legs were simulated")
+                self.log("INFO", f"All {len(preview.legs)} legs were simulated")
             if scheduled:
                 self.last_open_week = datetime.now(timezone.utc).strftime("%G-W%V")
                 self._save_state()
-            self.log("INFO", f"Iron Condor {'processed on Bybit' if live else 'simulated'} with {len(results)} legs")
+            self.log("INFO", f"{mode} {'processed on Bybit' if live else 'simulated'} with {len(results)} legs")
             return results
 
     async def _market_fallback(self, legs, qty, links, results, group_id, all_links) -> None:
@@ -526,31 +635,32 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
                 await self._reconcile_pending_orders()
                 self._require_resolved_rfq()
                 current = await self._sync_positions()
-                if len(self.active_strategy_symbols) < 4:
+                if self._tracking_needs_recovery():
                     recovered = self._track_filled_rfq(current)
                     if not recovered:
                         await self.load_recent_executions()
                         recovered = self._recover_tracked_open_positions(current)
                     if recovered:
-                        self.log("INFO", "Recovered tracked Iron Condor legs from the opening task and current Bybit positions")
+                        self.log("INFO", "Recovered tracked strategy legs from the opening task and current Bybit positions")
             else:
-                preview = self.preview or await self.make_preview()
                 current = [position for position in self.positions if position.source == "demo"]
             if live and not self.active_strategy_symbols:
-                raise ValueError("No tracked live Iron Condor legs found; refusing to close untracked positions")
-            symbols = self.active_strategy_symbols if live else {leg.symbol for leg in preview.legs}
-            if len(symbols) > 4:
-                raise ValueError("Tracked strategy contains more than four symbols; refusing bulk close")
+                raise ValueError("No tracked live strategy legs found; refusing to close untracked positions")
+            symbols = self.active_strategy_symbols if live else {position.symbol for position in current}
+            opening = self.execution_groups.get(self.active_strategy_group_id, {})
+            mode = validate_mode(opening.get("strategy_mode", "iron_condor"))
+            if live and len(symbols) > leg_count(mode):
+                raise ValueError("Tracked strategy contains too many symbols for its original mode; refusing bulk close")
             current = [position for position in current if position.symbol in symbols and position.size > 0]
             if live:
                 current = [position.model_copy(update={"size": min(position.size, self.active_strategy_sizes.get(f"{position.symbol}|{position.side}", 0.0))}) for position in current if self.active_strategy_sizes.get(f"{position.symbol}|{position.side}", 0.0) > 0]
             if not current:
-                raise ValueError("No open Iron Condor legs found to close")
+                raise ValueError("No open strategy legs found to close")
             close_group_id = uuid4().hex[:12]
             links = [f"ic-close-{close_group_id}-{index}" for index, _ in enumerate(current)]
             if live:
                 close_legs = [type("CloseLeg", (), {"symbol": position.symbol, "side": "Sell" if position.side == "Buy" else "Buy"})() for position in current]
-                self.execution_groups[close_group_id] = {"type": "close", "opening_group": self.active_strategy_group_id, "order_tracking": True}
+                self.execution_groups[close_group_id] = {"type": "close", "opening_group": self.active_strategy_group_id, "strategy_mode": mode, "order_tracking": True}
                 for link in links:
                     self.execution_group_links[link] = close_group_id
                 self._save_state()
@@ -588,8 +698,7 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
             week = now.strftime("%G-W%V")
             if self.settings.auto_open and self.is_open_window(now) and self.last_open_week != week:
                 try:
-                    await self.make_preview()
-                    await self.open_position(OpenRequest(confirm_live=self.settings.can_send_orders), scheduled=True)
+                    await self.open_position(OpenRequest(confirm_live=self.settings.can_send_orders, strategy_mode=self.settings.strategy_mode), scheduled=True)
                 except Exception as exc:
                     self.log("ERROR", f"Scheduled open failed: {exc}")
             await asyncio.sleep(5)

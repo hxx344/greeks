@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,9 @@ sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location("greeks_runtime", ROOT / "deploy" / "runtime.py")
 runtime = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runtime)
+config_spec = importlib.util.spec_from_file_location("greeks_configure", ROOT / "deploy" / "configure.py")
+configure = importlib.util.module_from_spec(config_spec)
+config_spec.loader.exec_module(configure)
 
 
 class InstallerRuntimeTests(unittest.TestCase):
@@ -44,6 +48,48 @@ class InstallerRuntimeTests(unittest.TestCase):
         self.assertEqual(values["LIVE_TRADING"], "true")
         self.assertEqual(values["BYBIT_API_SECRET"], "$(touch unwanted)${PATH}")
         self.assertEqual(config.read_text(encoding="utf-8"), content)
+
+    def test_merge_preserves_existing_values_multiline_secrets_and_is_idempotent(self):
+        content = ("# Custom settings\r\nmax_risk_usd=1234\r\nAUTO_OPEN=true\r\nTRADING_MODE=live\r\n"
+                   "LIVE_CONFIRMATION\r\nBYBIT_API_SECRET='first line\r\n$(touch never)${PATH}'")
+        template = "MAX_RISK_USD=2500\nMAX_MARGIN_USD=2500\nLIVE_CONFIRMATION=\nSTRATEGY_MODE=iron_condor\n"
+        merged, added = configure.merged_config(content, template)
+        self.assertTrue(merged.startswith(content))
+        self.assertEqual(added, ["MAX_MARGIN_USD", "STRATEGY_MODE"])
+        values = runtime.dotenv_values(stream=io.StringIO(merged), interpolate=False)
+        self.assertEqual(values["BYBIT_API_SECRET"], "first line\r\n$(touch never)${PATH}")
+        self.assertEqual(values["TRADING_MODE"], "live")
+        self.assertEqual(values["AUTO_OPEN"], "true")
+        self.assertNotIn("MAX_RISK_USD", values)
+        self.assertEqual(configure.merged_config(merged, template), (merged, []))
+
+    def test_strategy_template_matches_example_and_does_not_change_runtime_controls(self):
+        defaults = runtime.read_config(ROOT / "deploy" / "strategy.env")
+        example = runtime.read_config(ROOT / ".env.example")
+        self.assertEqual({key: example[key] for key in defaults}, defaults)
+        for key in ("BYBIT_API_KEY", "BYBIT_API_SECRET", "DASHBOARD_PASSWORD", "DASHBOARD_USERNAME",
+                    "STATE_FILE", "TRADING_MODE", "LIVE_TRADING", "AUTO_OPEN", "BYBIT_TESTNET", "HOST", "PORT"):
+            self.assertNotIn(key, defaults)
+        self.assertEqual(defaults["STRATEGY_MODE"], "iron_condor")
+        self.assertEqual(defaults["MAX_MARGIN_USD"], "2500")
+        self.assertEqual(defaults["OPEN_WINDOW_SECONDS"], "300")
+        self.assertEqual(defaults["MARGIN_MODE"], "PORTFOLIO_MARGIN")
+        self.assertEqual(defaults["BBO_ORDER_TIMEOUT_SECONDS"], "280")
+        self.assertEqual(defaults["ALLOW_MARKET_FALLBACK"], "true")
+
+    def test_prepare_config_writes_a_candidate_without_overwriting_source_or_destination(self):
+        config = self.root / "original.env"
+        content = b"TRADING_MODE=live\nAUTO_OPEN=true\nBYBIT_API_SECRET=KEEP-SECRET\n"
+        config.write_bytes(content)
+        candidate = self.root / "candidate.env"
+        added = configure.prepare_config(config, candidate)
+        self.assertIn("STRATEGY_MODE", added)
+        self.assertEqual(config.read_bytes(), content)
+        self.assertTrue(candidate.read_bytes().startswith(content))
+        candidate_before = candidate.read_bytes()
+        with self.assertRaises(FileExistsError):
+            configure.prepare_config(config, candidate)
+        self.assertEqual(candidate.read_bytes(), candidate_before)
 
     def test_validation_ignores_inherited_environment(self):
         with patch.dict(os.environ, {"LIVE_TRADING": "invalid", "PORT": "not-a-port"}):

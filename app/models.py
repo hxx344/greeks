@@ -4,6 +4,9 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
+StrategyMode = Literal["iron_condor", "short_strangle"]
+
+
 class OptionInstrument(BaseModel):
     symbol: str
     expiry: datetime
@@ -39,12 +42,14 @@ class StrategyLeg(BaseModel):
 
 
 class StrategyPreview(BaseModel):
+    strategy_mode: StrategyMode = "iron_condor"
+    unbounded_loss: bool = False
     expiry: datetime
     legs: list[StrategyLeg]
     net_credit_usd: float
-    max_loss_usd: float
+    max_loss_usd: float | None
     max_profit_usd: float
-    risk_reward: float
+    risk_reward: float | None
     generated_at: datetime
     source: Literal["bybit", "demo"]
     market_timestamp: datetime | None = None
@@ -56,6 +61,7 @@ class StrategyPreview(BaseModel):
     estimated_initial_margin_usd: float = 0.0
     estimated_maintenance_margin_usd: float = 0.0
     margin_mode: str = "REGULAR_MARGIN"
+    margin_basis: Literal["regular_order_im", "portfolio_loss_estimate"] = "regular_order_im"
     margin_formula_status: str = ""
     fee_cap_pct: float = 0.07
 
@@ -63,6 +69,7 @@ class StrategyPreview(BaseModel):
 class OpenRequest(BaseModel):
     confirm_live: bool = False
     quantity: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    strategy_mode: StrategyMode | None = None
 
 
 class CloseRequest(BaseModel):
@@ -73,6 +80,7 @@ class RfqCreateRequest(BaseModel):
     confirm_live: bool = False
     counterparties: list[str] = Field(default_factory=list)
     quantity: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    strategy_mode: StrategyMode | None = None
 
 
 class RfqExecuteRequest(BaseModel):

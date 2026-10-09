@@ -1,6 +1,6 @@
 # BTC Options Iron Condor
 
-一个带可视化面板的 Bybit BTC 期权 Iron Condor 系统。默认是 `dry-run`：读取 Bybit 主网公开行情、计算选腿并记录模拟订单。显式设置 `TRADING_MODE=testnet` 后，行情、合约、账户和下单均使用测试网；`TRADING_MODE=live` 使用主网，并仍要求 `LIVE_TRADING=true`。
+一个带可视化面板的 Bybit BTC 期权策略系统，支持四腿铁鹰（`iron_condor`）和双腿卖出宽跨式（`short_strangle`）。默认是四腿、`dry-run`：读取 Bybit 主网公开行情、计算选腿并记录模拟订单。显式设置 `TRADING_MODE=testnet` 后，行情、合约、账户和下单均使用测试网；`TRADING_MODE=live` 使用主网，并仍要求 `LIVE_TRADING=true`。
 
 ## 启动
 
@@ -33,7 +33,9 @@ sudo systemctl status greeks
 sudo journalctl -u greeks -n 50 --no-pager
 ```
 
-首次默认 `TRADING_MODE=dry-run`、`LIVE_TRADING=false`、`AUTO_OPEN=false`。升级不改已有交易模式、密钥、密码或状态文件；配置按 dotenv 数据读取，不执行 shell 命令，不展开 `${...}`。已有手动运行实例需先停止，再把原配置及已核对的状态迁入上述位置，并把 `STATE_FILE` 改为 `/var/lib/greeks/` 下的绝对路径；安装器不会自动接管工作目录中的 `.env` 或迁移交易状态。每个网络仍须使用独立状态文件。
+首次默认 `TRADING_MODE=dry-run`、`LIVE_TRADING=false`、`AUTO_OPEN=false`、`BYBIT_TESTNET=false`。完整策略参数会合并到 `/etc/greeks/greeks.env`：只补充缺项，保留已有的显式值、交易模式、密钥、密码和状态路径。默认参数见 [deploy/strategy.env](deploy/strategy.env)，包括开仓窗口 `300` 秒、`PORTFOLIO_MARGIN`、BBO 超时 `280` 秒和有价格限制的 IOC 剩余补单；已有同名设置不会被这些值覆盖。安装器先验证候选配置，再切换生效；失败时沿用原来的恢复流程，日志只列出补充的参数名。
+
+配置按 dotenv 数据读取，不执行 shell 命令，不展开 `${...}`。已有手动运行实例需先停止，再把原配置及已核对的状态迁入上述位置，并把 `STATE_FILE` 改为 `/var/lib/greeks/` 下的绝对路径；安装器不会自动接管工作目录中的 `.env` 或迁移交易状态。每个网络仍须使用独立状态文件。
 
 相同源码、配置、依赖和 Python 环境会跳过下载、依赖同步、验证和重启；仅文档变化也不重启服务。依赖变化时执行固定版本 `uv==0.12.10` 的 `uv sync --locked`，复用下载缓存。程序原子切换版本；启动后通过带 Basic 认证的 `/api/health` 检查，有效的 `degraded` 响应可完成部署，其交易限制仍按面板提示处理。启动失败会恢复上次程序和配置，候选配置保存在 `/etc/greeks/greeks.env.failed-*`，交易状态保持原样。配置修改后重新运行安装命令即可校验和应用。
 
@@ -57,6 +59,26 @@ curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/ins
 
 ## 实盘安全开关
 
+### 四腿与双腿选择
+
+页面“执行控制”可选择“四腿铁鹰”或“双腿双卖”。选择后重新计算选腿、权利金、手续费和保证金，并用于本次手动开仓及新建 RFQ；切换会取消已勾选的交易确认。两种模式都使用最近已上市的周日到期合约，卖出 Call 和 Put 的目标绝对 Delta 均为 `0.45`；四腿另外买入约 `0.10` Delta 的外侧保护腿，双腿不购买保护腿。
+
+配置文件中的默认值为：
+
+```dotenv
+STRATEGY_MODE=iron_condor
+MAX_RISK_USD=2500
+MAX_MARGIN_USD=2500
+```
+
+`STRATEGY_MODE=short_strangle` 将默认策略和自动开仓策略设为双腿。页面的手动选择不会改写服务器计划任务；自动开仓仍按配置模式执行，页面同时显示该模式。平仓始终依据已经跟踪的合约和剩余数量；切换新开仓模式不会转换、丢弃或扩大旧持仓。
+
+四腿继续用 `MAX_RISK_USD` 检查到期最大亏损和估算保证金。双腿没有保护腿，理论最大亏损无上限，API 的 `max_loss_usd`、`risk_reward` 返回 `null`，页面明确显示“无上限”。双腿的 `MAX_MARGIN_USD` 仅限制两条卖腿的常规 Order IM 估算之和，再乘以 `1 + PORTFOLIO_MARGIN_BUFFER_PCT`；它不是止损金额，也不是最大亏损承诺。预览、BBO 下单及改价、IOC 补单、RFQ 报价执行均采用这一独立预算。
+
+即使账户使用组合保证金，双腿预算仍按上述常规公式估算，页面不会把它标为真实 PM；真实账户保证金继续从 Bybit 读取。计算依据：[期权保证金公式](https://www.bybit.com/en/help-center/article/Initial-Maintenance-Margin-Calculations-Options)。双腿 RFQ 使用自定义组合并校验完整的两腿报价，依据 [Bybit RFQ 接口](https://bybit-exchange.github.io/docs/v5/rfq/trade/create-rfq)。旧四腿订单、RFQ 和状态文件继续按原策略恢复。
+
+`LIVE_CONFIRMATION` 仅为兼容字段，空值不会阻止自动开仓；`TARGET_DTE_DAYS` 也不会改变固定周日到期规则。部署模板默认不开启实盘或自动交易，升级保留已有开关。
+
 仅当同时满足以下条件时才会调用 Bybit 私有下单 API：
 
 * `.env` 中 `LIVE_TRADING=true`
@@ -64,9 +86,9 @@ curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/ins
 * 请求体中的 `confirm_live=true`
 * `TRADING_MODE=live`；未设置新模式时，兼容旧配置 `BYBIT_TESTNET=false`
 
-默认风险上限为 `MAX_RISK_USD=2500`。策略采用固定周历：仅允许 UTC 周五实盘开仓，四条腿必须属于同一个 UTC 周日到期日；`TARGET_DTE_DAYS` 仅为旧配置兼容项，不再用于滚动选择“开仓后两天”的合约。
-开仓同时检查预估最大亏损与保证金，两者均不得超过风险上限。实盘开仓与 RFQ 执行要求行情不超过 `QUOTE_STALE_SECONDS`；启用实盘后，未明确确认的开平仓请求会被拒绝。
-实盘执行使用 Limit + BBO 跟随：Buy 挂 Bid1（买一），Sell 挂 Ask1（卖一），默认每 1 秒读取最新报价并在 BBO 变化时改单，600 秒未完成则撤单。默认不使用市价兜底。Limit BBO 是程序侧跟单，不是交易所原子组合订单，四腿可能不同步成交。
+策略采用固定周历：仅允许 UTC 周五实盘开仓，组合所有腿必须属于同一个 UTC 周日到期日；`TARGET_DTE_DAYS` 仅为旧配置兼容项，不再用于滚动选择“开仓后两天”的合约。
+四腿开仓同时检查预估最大亏损与保证金，两者均不得超过 `MAX_RISK_USD`；双腿按上面的独立保证金预算检查。实盘开仓与 RFQ 执行要求行情不超过 `QUOTE_STALE_SECONDS`；启用实盘后，未明确确认的开平仓请求会被拒绝。
+实盘执行使用 Limit + BBO 跟随：Buy 挂 Bid1（买一），Sell 挂 Ask1（卖一），默认每 1 秒读取最新报价并在 BBO 变化时改单。超过 `BBO_ORDER_TIMEOUT_SECONDS`（部署模板为 `280` 秒）未完成则撤单。Limit BBO 是程序侧跟单，不是交易所原子组合订单，各腿可能不同步成交。
 
 下单响应丢失、行情/改单请求失败或执行任务取消时，系统按 `orderLinkId` 尝试撤单，并查询订单状态与累计成交量。撤单应答不代表撤单已经完成；查询不到终态时标记为 `unknown`，保留订单日志并阻止新的实盘开平仓，后续刷新持仓或重试交易入口会继续对账。已有策略须先平仓，才能开下一组策略。新订单日志与已确认成交数量保存在 `STATE_FILE`，重启后继续使用。
 
@@ -74,15 +96,15 @@ curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/ins
 
 每次开仓下单、BBO 改单和 IOC 补单前，按四腿保留的最不利限价重新计算完整组合到期最大亏损。价格改善不会立即释放旧限价占用的风险额度，避免改单与成交竞态；价格超限后停止该组后续开仓请求并尝试撤销仍在执行的挂单。该检查不含手续费，也不能保证四腿未全部成交时的中间敞口受同一限额约束；平仓订单不受开仓预算阻止。
 
-RFQ 询价需要 API 凭据；执行报价还必须满足上述实盘开关和明确确认，并检查四腿的合约、数量、价格、到期时间与报价对应的最大亏损。活动询价不能被新询价覆盖，同一询价不能重复执行。执行意图会在请求发送前保存；若请求结果不明，需先核对交易所状态，系统不会自动重试该报价。
+RFQ 询价需要 API 凭据；执行报价还必须满足上述实盘开关和明确确认，并按该询价保存的策略模式检查完整的两腿或四腿合约、数量、价格、到期时间及相应额度。活动询价不能被新询价覆盖，同一询价不能重复执行。执行意图会在请求发送前保存；若请求结果不明，需先核对交易所状态，系统不会自动重试该报价。
 
 RFQ 成交后的持仓跟踪只应用一次，后续刷新不会覆盖部分平仓后的剩余数量。状态文件使用版本化校验和原子替换写入；文件损坏、格式不兼容或写入失败时，会保留原文件并阻止交易，通过 `/api/health` 和页面显示原因。应恢复经核对的状态文件、确认交易所订单与仓位后重启，不能通过删除文件绕过保护。首次启动且文件不存在时允许初始化；本系统仍要求单进程运行。
 
-前端数量选择会实时请求 `/api/strategy/preview?quantity=...` 重算净权利金、Bybit 官方 Regular/Cross 期权 Order IM、短期权 Maintenance MM 和交易成本。手续费使用 Bybit 公式 `min(fee_rate × index_price, 7% × option_price) × qty`。若设置 `MARGIN_MODE=PORTFOLIO_MARGIN`，页面显示的是基于四腿压力损失的下界估算；Portfolio Margin 的精确账户级结果仍由 Bybit 风险引擎根据全账户仓位和动态压力参数决定。
+前端数量和策略选择会带上 `quantity`、`strategy_mode` 重算净权利金、Bybit 官方 Regular/Cross 期权 Order IM、短期权 Maintenance MM 和交易成本。手续费使用 Bybit 公式 `min(fee_rate × index_price, 7% × option_price) × qty`。四腿设置 `MARGIN_MODE=PORTFOLIO_MARGIN` 时，页面显示基于四腿压力损失的下界估算；双腿始终采用常规 IM 加缓冲的估算。Portfolio Margin 的精确账户级结果仍由 Bybit 风险引擎根据全账户仓位和动态压力参数决定。
 
 ## Bybit 铁鹰组合下单说明
 
-Bybit 官方 V5 提供的是单腿期权下单接口 `/v5/order/create`，以及支持现货/永续/期货组合的 Spread Trading 接口 `/v5/spread/order/create`。当前 Spread Instruments 不包含期权铁鹰组合，因此本系统会对四条期权腿分别下单，并使用唯一 `orderLinkId`、数量/价差/风险校验；不发送成交后的反向回滚，部分成交时提示人工核对 Bybit 仓位。不能把截图中的网页策略组合直接映射成一个官方铁鹰 `spread symbol`。
+Bybit 官方 V5 提供的是单腿期权下单接口 `/v5/order/create`，以及支持现货/永续/期货组合的 Spread Trading 接口 `/v5/spread/order/create`。本系统的 BBO 路径会对所选策略的两条或四条期权腿分别下单，并使用唯一 `orderLinkId`、数量/价差/额度校验；不发送成交后的反向回滚，部分成交时提示人工核对 Bybit 仓位。不能把网页上的策略组合直接当作官方 `spread symbol`。
 
 Bybit 非 VIP 期权基础费率：Taker 0.03%、Maker 0.02%；单笔交易手续费不超过期权成交价的 7%。BTC/ETH 到期交割费为 0.015%，强平费为 0.2%。最终成交以 `/v5/execution/list` 返回的 `execFee`、`feeRate` 和 `feeCurrency` 为准。平仓仅允许关闭本系统记录的最多四个策略 symbol，并按本次策略记录的数量限制平仓；未记录的实盘仓位会被拒绝处理。
 
@@ -123,7 +145,7 @@ AUTO_OPEN=false
 
 `RECONCILIATION_SECONDS` 默认 15 秒。后台在启动后自动核对未决单腿订单、RFQ 和已有策略，即使没有打开页面也继续工作。对账与下单共用同一把锁，执行中的订单不会被后台误撤。失败后在后续周期继续核对；状态文件故障时停止交易状态更新。`/api/health` 返回未决订单数量、RFQ 是否未决、最长等待秒数、最近成功时间和对账错误；旧记录缺少创建时间时，等待时长从本次启动计算。对账持续失败或长时间未成功时健康状态为 `degraded`。
 
-普通开仓、RFQ 执行和新建询价均不能绕过未决 RFQ。创建、执行及取消意图在请求前落盘；响应丢失后保留询价 ID、关联 ID、选中报价和四腿信息。后台按身份查询实时记录，缺失时查询历史；不能从账户出现同名四腿推断 RFQ 已成交。取消应答不会直接清除询价记录。接口依据：[RFQ 实时记录](https://bybit-exchange.github.io/docs/v5/rfq/trade/rfq-realtime)、[RFQ 历史](https://bybit-exchange.github.io/docs/v5/rfq/trade/rfq-list)。
+普通开仓、RFQ 执行和新建询价均不能绕过未决 RFQ。创建、执行及取消意图在请求前落盘；响应丢失后保留询价 ID、关联 ID、选中报价及所选策略的全部腿信息。后台按身份查询实时记录，缺失时查询历史；不能从账户出现同名合约推断 RFQ 已成交。取消应答不会直接清除询价记录。接口依据：[RFQ 实时记录](https://bybit-exchange.github.io/docs/v5/rfq/trade/rfq-realtime)、[RFQ 历史](https://bybit-exchange.github.io/docs/v5/rfq/trade/rfq-list)。
 
 策略到期结算或在交易所外部平仓后，系统要求完整仓位查询中对应方向归零，并取得本次开仓之后、同合约同方向且数量足够的平仓记录，再次查询仓位确认后才清理对应本地腿。证据随策略归档，重启后不会重新恢复已归档策略。历史记录延迟、缺少开仓时间、错误分页或证据不充分时保留跟踪，并显示对账原因；不会仅凭空仓响应或到期日删除跟踪。自动历史查询按最多七天的窗口分页，最多回溯 180 天；具体交割或外部平仓信息保存在返回的证据字段中。接口依据：[已平仓期权记录](https://bybit-exchange.github.io/docs/v5/position/close-position)。
 

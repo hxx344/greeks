@@ -80,7 +80,8 @@ function positionExpiryLabel(expiry, now = Date.now()) {
 }
 
 function positionPayoffSvg(model, spot, index, width = 920) {
-  const height = width < 600 ? 270 : 292, left = width < 600 ? 52 : 72, right = 28, top = 34, bottom = 42;
+  const unbounded = model.min === -Infinity;
+  const height = width < 600 ? 270 : 292, left = width < 600 ? 52 : 72, right = 28, top = unbounded ? 55 : 34, bottom = 42;
   const values = model.points.map(point => point.pnl);
   const min = Math.min(0, ...values), max = Math.max(0, ...values), pad = Math.max((max - min) * .16, .1);
   const x = price => left + (price - model.low) / (model.high - model.low) * (width - left - right);
@@ -108,7 +109,8 @@ function positionPayoffSvg(model, spot, index, width = 920) {
   const strikeLines = model.strikes.map(price => `<line class="pp-strike" x1="${n(x(price))}" x2="${n(x(price))}" y1="${top}" y2="${height - bottom}"/>`).join('');
   const breaks = model.breaks.map(price => `<circle class="pp-break" cx="${n(x(price))}" cy="${n(y(0))}" r="4"><title>盈亏平衡 ${num(price)}</title></circle>`).join('');
   const marker = model.current === null ? '' : `<line class="pp-spot" x1="${n(x(spot))}" x2="${n(x(spot))}" y1="${top}" y2="${height - bottom}"/><circle class="pp-spot-dot" cx="${n(x(spot))}" cy="${n(y(model.current))}" r="6"/><text class="pp-spot-label" x="${n(Math.max(left + 70, Math.min(width - right - 70, x(spot))))}" y="19" text-anchor="middle">BTC 现价 ${num(spot, 0)}</text>`;
-  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="持仓到期盈亏曲线。横轴 BTC 到期价格，纵轴盈亏。${model.stage}">${grid}${strikeLines}<path class="pp-profit-fill" d="${fills.profit.join(' ')}"/><path class="pp-loss-fill" d="${fills.loss.join(' ')}"/><line class="pp-zero" x1="${left}" x2="${width-right}" y1="${n(y(0))}" y2="${n(y(0))}"/><path class="pp-line" d="${path}"/>${breaks}${marker}${ticks}</svg>`;
+  const riskNote = unbounded ? `<text class="pp-risk-note" x="${left}" y="40">亏损无上限 · 图示价格范围有限</text>` : '';
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="持仓到期盈亏曲线。横轴 BTC 到期价格，纵轴盈亏。${model.stage}${unbounded ? '。亏损无上限，图示价格范围有限' : ''}">${grid}${strikeLines}<path class="pp-profit-fill" d="${fills.profit.join(' ')}"/><path class="pp-loss-fill" d="${fills.loss.join(' ')}"/><line class="pp-zero" x1="${left}" x2="${width-right}" y1="${n(y(0))}" y2="${n(y(0))}"/><path class="pp-line" d="${path}"/>${breaks}${marker}${ticks}${riskNote}</svg>`;
 }
 
 function renderPositionPayoff() {

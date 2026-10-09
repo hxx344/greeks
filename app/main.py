@@ -18,7 +18,7 @@ from .lease import StateLease
 from .hub import build_summary
 from .security import authorize_dashboard
 from .strategy import SundayExpiryUnavailable
-from .models import CloseRequest, OpenRequest, Position, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest
+from .models import CloseRequest, OpenRequest, Position, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest, StrategyMode
 
 # The dashboard polls several endpoints frequently; HTTP 200 access lines are
 # noise in production logs. Application warnings and errors remain visible.
@@ -112,13 +112,13 @@ async def config():
 
 
 def config_payload():
-    return {"trading_blocked_reason": engine.state_error, "environment": settings.environment, "live_enabled": settings.can_trade_live, "trading_enabled": settings.can_send_orders, "testnet": settings.private_testnet, "market_testnet": settings.environment == "testnet", "opening_blocked_reason": "Unresolved RFQ; awaiting reconciliation" if engine._rfq_unresolved() else None, "auto_open": settings.auto_open, "max_risk_usd": settings.max_risk_usd, "leg_qty": settings.leg_qty, "target_dte_days": settings.target_dte_days, "expiry_rule": "Friday entry / Sunday UTC expiry", "market_refresh_seconds": settings.market_refresh_seconds, "instrument_refresh_seconds": settings.instrument_refresh_seconds, "quote_stale_seconds": settings.quote_stale_seconds, "max_spread_bps": settings.max_spread_bps, "bbo_poll_seconds": settings.bbo_poll_seconds, "bbo_order_timeout_seconds": settings.bbo_order_timeout_seconds, "allow_market_fallback": settings.allow_market_fallback, "failed_leg_retry_delay_seconds": settings.failed_leg_retry_delay_seconds, "failed_leg_position_checks": settings.failed_leg_position_checks, "failed_leg_position_check_interval_seconds": settings.failed_leg_position_check_interval_seconds, "estimated_taker_fee_rate": settings.estimated_taker_fee_rate, "portfolio_margin_buffer_pct": settings.portfolio_margin_buffer_pct, "margin_mode": settings.margin_mode, "option_mm_factor": settings.option_mm_factor, "option_max_im_factor": settings.option_max_im_factor, "option_min_im_factor": settings.option_min_im_factor, "option_liquidation_fee_rate": settings.option_liquidation_fee_rate, "option_fee_cap_pct": settings.option_fee_cap_pct, "open_time": f"Friday {settings.open_hour_utc:02d}:{settings.open_minute_utc:02d} UTC"}
+    return {"trading_blocked_reason": engine.state_error, "environment": settings.environment, "live_enabled": settings.can_trade_live, "trading_enabled": settings.can_send_orders, "testnet": settings.private_testnet, "market_testnet": settings.environment == "testnet", "opening_blocked_reason": "Unresolved RFQ; awaiting reconciliation" if engine._rfq_unresolved() else None, "auto_open": settings.auto_open, "max_risk_usd": settings.max_risk_usd, "max_margin_usd": settings.max_margin_usd, "strategy_mode": settings.strategy_mode, "leg_qty": settings.leg_qty, "target_dte_days": settings.target_dte_days, "expiry_rule": "Friday entry / Sunday UTC expiry", "market_refresh_seconds": settings.market_refresh_seconds, "instrument_refresh_seconds": settings.instrument_refresh_seconds, "quote_stale_seconds": settings.quote_stale_seconds, "max_spread_bps": settings.max_spread_bps, "bbo_poll_seconds": settings.bbo_poll_seconds, "bbo_order_timeout_seconds": settings.bbo_order_timeout_seconds, "allow_market_fallback": settings.allow_market_fallback, "failed_leg_retry_delay_seconds": settings.failed_leg_retry_delay_seconds, "failed_leg_position_checks": settings.failed_leg_position_checks, "failed_leg_position_check_interval_seconds": settings.failed_leg_position_check_interval_seconds, "estimated_taker_fee_rate": settings.estimated_taker_fee_rate, "portfolio_margin_buffer_pct": settings.portfolio_margin_buffer_pct, "margin_mode": settings.margin_mode, "option_mm_factor": settings.option_mm_factor, "option_max_im_factor": settings.option_max_im_factor, "option_min_im_factor": settings.option_min_im_factor, "option_liquidation_fee_rate": settings.option_liquidation_fee_rate, "option_fee_cap_pct": settings.option_fee_cap_pct, "open_time": f"Friday {settings.open_hour_utc:02d}:{settings.open_minute_utc:02d} UTC"}
 
 
 @app.get("/api/dashboard/market")
-async def dashboard_market(quantity: float | None = Query(default=None, gt=0, allow_inf_nan=False)):
+async def dashboard_market(quantity: float | None = Query(default=None, gt=0, allow_inf_nan=False), strategy_mode: StrategyMode | None = None):
     try:
-        strategy = await engine.make_preview(quantity)
+        strategy = await engine.make_preview(quantity, strategy_mode=strategy_mode)
         expiry_items = [item for item in engine.chain if item.expiry == strategy.expiry]
         return {"status": "ready", "config": config_payload(), "preview": strategy.model_dump(mode="json"), "chain": {"source": engine.chain_source, "btc_price": engine.btc_price, "updated_at": engine.chain_updated_at, "items": [item.model_dump(mode="json") for item in expiry_items]}}
     except SundayExpiryUnavailable as exc:
@@ -192,9 +192,9 @@ async def refresh_market():
 
 
 @app.get("/api/strategy/preview")
-async def preview(quantity: float | None = Query(default=None, gt=0, allow_inf_nan=False)):
+async def preview(quantity: float | None = Query(default=None, gt=0, allow_inf_nan=False), strategy_mode: StrategyMode | None = None):
     try:
-        return (await engine.make_preview(quantity)).model_dump(mode="json")
+        return (await engine.make_preview(quantity, strategy_mode=strategy_mode)).model_dump(mode="json")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
