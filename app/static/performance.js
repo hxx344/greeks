@@ -58,14 +58,16 @@ function renderPerformance(payload) {
 }
 
 async function loadPerformance() {
-  if (window.__performanceLoading) return;
-  window.__performanceLoading = true;
+  const read = window.ProjectHub.begin('performance');
+  if (!read) return;
   try {
     const payload = await getJson('/api/dashboard/performance');
+    if (!read.current()) return;
     window.__performance = payload;
     renderPerformance(payload);
   } catch (error) {
+    if (!read.current()) return;
     $('performanceStatus').textContent = '收益台账同步失败，等待重试；下方如有数据则为上次快照。';
     $('performanceStatus').dataset.warning = true;
-  } finally { window.__performanceLoading = false; }
+  } finally { read.finish(); }
 }

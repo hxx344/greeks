@@ -15,6 +15,7 @@ from .config import get_settings
 from .engine import TradingEngine
 from .cache import SnapshotCache
 from .lease import StateLease
+from .hub import build_summary
 from .security import authorize_dashboard
 from .strategy import SundayExpiryUnavailable
 from .models import CloseRequest, OpenRequest, Position, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest
@@ -98,6 +99,11 @@ async def health():
     return {"status": "degraded" if degraded else "ok", "environment": settings.environment,
             "live_enabled": settings.can_trade_live, "trading_enabled": settings.can_send_orders,
             "trading_blocked_reason": engine.state_error, "reconciliation": recovery}
+
+
+@app.get("/api/hub/summary")
+async def hub_summary():
+    return build_summary(engine)
 
 
 @app.get("/api/config")

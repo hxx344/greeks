@@ -17,6 +17,36 @@ uv run --locked uvicorn app.main:app --reload
 
 ## 面板访问与运行配置
 
+### Linux 一键安装与工作台接入
+
+支持 Debian 12/13、Ubuntu 24.04，使用系统 Python 3.11 或更新版本及 systemd。首次安装、后续升级都执行同一条命令：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hxx344/greeks/main/install.sh | sudo bash
+```
+
+安装后默认只监听 `127.0.0.1:8000`，使用独立的 `greeks` 系统用户和单个 worker。配置位于 `/etc/greeks/greeks.env`，交易状态位于 `/var/lib/greeks/engine_state.json`，程序版本位于 `/opt/greeks/releases`，由 `greeks.service` 托管。首次生成 `admin` 用户及独立随机强密码，查看方式：
+
+```bash
+sudo grep '^DASHBOARD_' /etc/greeks/greeks.env
+sudo systemctl status greeks
+sudo journalctl -u greeks -n 50 --no-pager
+```
+
+首次默认 `TRADING_MODE=dry-run`、`LIVE_TRADING=false`、`AUTO_OPEN=false`。升级不改已有交易模式、密钥、密码或状态文件；配置按 dotenv 数据读取，不执行 shell 命令，不展开 `${...}`。已有手动运行实例需先停止，再把原配置及已核对的状态迁入上述位置，并把 `STATE_FILE` 改为 `/var/lib/greeks/` 下的绝对路径；安装器不会自动接管工作目录中的 `.env` 或迁移交易状态。每个网络仍须使用独立状态文件。
+
+相同源码、配置、依赖和 Python 环境会跳过下载、依赖同步、验证和重启；仅文档变化也不重启服务。依赖变化时执行固定版本 `uv==0.12.10` 的 `uv sync --locked`，复用下载缓存。程序原子切换版本；启动后通过带 Basic 认证的 `/api/health` 检查，有效的 `degraded` 响应可完成部署，其交易限制仍按面板提示处理。启动失败会恢复上次程序和配置，候选配置保存在 `/etc/greeks/greeks.env.failed-*`，交易状态保持原样。配置修改后重新运行安装命令即可校验和应用。
+
+与工作台部署到同一台服务器时，也可一次更新 Greeks 和工作台：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only greeks,hub
+```
+
+工作台项目使用 `standard` 摘要、`proxy` 页面，页面地址与 API 地址均为 `http://127.0.0.1:8000`。在工作台“项目管理”保存 Greeks 自己的 `DASHBOARD_USERNAME` 和 `DASHBOARD_PASSWORD`，不要填写 Bybit API 密钥或工作台登录密码。摘要使用只读的 `/api/hub/summary`；页面通过工作台代理认证，仍沿用 Greeks 原有的交易确认与风险限制。电脑只需 SSH 转发工作台 `3100`，用 Chrome/Edge 打开 `http://127.0.0.1:3100`；无需公开 `8000` 端口。
+
+安装检查可运行 `bash tests/test_installer.sh` 和 `python tests/test_installer.py`；GitHub Actions 在独立 Ubuntu 24.04 runner 上以无交易所访问的替身应用验证真实 systemd 首装、无变化跳过、配置保留、增量更新和失败回滚。`tests/test_install_systemd.sh` 只供一次性的 CI 主机使用，不在已有部署服务器上执行。
+
 未设置 `DASHBOARD_PASSWORD` 时，仅允许来自本机且使用 `localhost`、`127.0.0.1` 或 `[::1]` 地址的请求。远程访问需要在 `.env` 中设置 `DASHBOARD_USERNAME`（默认 `admin`）和至少 12 个字符的独立强密码 `DASHBOARD_PASSWORD`，重启后使用浏览器弹出的登录框登录；所有页面与 API 均需认证。远程部署应通过 HTTPS 反向代理访问，因为 HTTP Basic 认证本身不加密密码。
 
 反向代理部署也必须设置面板密码，不要依赖代理连接来自本机来放行用户。代理需保留外部 Host，并正确配置可信代理及转发协议，使服务识别到的访问源与浏览器一致；来自其他站点的 API 请求会被拒绝。脚本调用设置密码后的 API 也需要提供 HTTP Basic 凭据。

@@ -3,9 +3,11 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const {test} = require('node:test');
 
-function dashboard() {
+function dashboard({embedded = false, request} = {}) {
   const elements = new Map();
   const pending = [];
+  const requests = [], events = new Map(), messages = [];
+  const parent = {postMessage(message, origin) { messages.push({message, origin}); }};
   const element = (id) => {
     if (!elements.has(id)) elements.set(id, {
       value: id === 'quantity' ? '0.01' : '', dataset: {}, style: {},
@@ -14,18 +16,23 @@ function dashboard() {
     return elements.get(id);
   };
   const context = vm.createContext({
-    document: {getElementById: element, querySelector() { return null; }},
-    window: {localStorage: {getItem() { return null; }}, addEventListener() {}},
+    document: {visibilityState: 'visible', addEventListener(name, callback) { events.set(name, callback); }, getElementById: element, querySelector() { return null; }},
+    window: {location: {hostname: embedded ? 'p-0123456789abcdef01234567.hub.localhost' : 'localhost', protocol: 'http:', port: '8000'}, parent, navigator: {onLine: true}, localStorage: {getItem() { return null; }}, addEventListener(name, callback) { events.set(name, callback); }},
+    setTimeout() { return 1; }, clearTimeout() {},
     setInterval() {},
-    fetch(url) {
+    fetch(url, options) {
+      requests.push({url, options});
+      if (request) return request(url, options);
       if (!url.includes('/dashboard/market')) return Promise.reject(new Error('offline'));
       return new Promise((resolve) => pending.push({url, resolve}));
     },
   });
+  vm.runInContext(fs.readFileSync(`${__dirname}/../app/static/hub.js`, 'utf8'), context);
   vm.runInContext(fs.readFileSync(`${__dirname}/../app/static/position-payoff.js`, 'utf8'), context);
   vm.runInContext(fs.readFileSync(`${__dirname}/../app/static/performance.js`, 'utf8'), context);
   vm.runInContext(fs.readFileSync(`${__dirname}/../app/static/app.js`, 'utf8'), context);
-  return {context, element, pending};
+  const message = data => events.get('message')?.({source: parent, origin: 'http://hub.localhost:8000', data: {channel: 'project-hub', version: 1, ...data}});
+  return {context, element, pending, requests, events, messages, message};
 }
 
 test('partial and failed orders are not reported as successful', () => {
@@ -90,6 +97,7 @@ test('in-page trade feedback preserves incomplete fills and error detail', () =>
 
 test('account connection failure hides stale health metrics', async () => {
   const {context, element} = dashboard();
+  await new Promise(setImmediate);
   element('healthUnavailable').style.display = 'none';
   element('healthContent').style.display = 'grid';
   await context.loadAccount();
@@ -97,6 +105,48 @@ test('account connection failure hides stale health metrics', async () => {
   assert.equal(element('healthContent').style.display, 'none');
   assert.equal(element('healthMode').textContent, '账户连接异常');
   assert.match(element('positionPayoffContent').innerHTML, /持仓更新失败/);
+});
+
+test('real dashboard initialization waits for proxy activity across all four streams', async () => {
+  const {context, requests, message} = dashboard({embedded: true});
+  assert.equal(requests.length, 0);
+  message({type: 'ready', role: 'host'});
+  assert.equal(requests.length, 0);
+  message({type: 'activity', active: true, backgroundUpdates: true});
+  assert.deepEqual(requests.map(item => item.url.split('?')[0]).sort(),
+    ['/api/dashboard/account', '/api/dashboard/market', '/api/dashboard/performance', '/api/rfq/status'].sort());
+  context.window.navigator.onLine = false;
+});
+
+test('successful POST notifies summary once without aborting or replaying across activity transitions', async () => {
+  let resolveWrite;
+  const {context, requests, messages, message, events} = dashboard({embedded: true,
+    request(url, options) {
+      if (options?.method === 'POST') return new Promise(resolve => { resolveWrite = resolve; });
+      return Promise.reject(new Error('offline'));
+    }});
+  message({type: 'ready', role: 'host'});
+  message({type: 'activity', active: true, backgroundUpdates: true});
+  const write = context.getJson('/api/trading/open', {method:'POST', body:'{"confirm_live":true}'});
+  message({type: 'activity', active: false, backgroundUpdates: true});
+  context.window.navigator.onLine = false; events.get('offline')();
+  context.window.navigator.onLine = true; events.get('online')();
+  message({type: 'activity', active: true, backgroundUpdates: true});
+  assert.equal(requests.filter(item => item.options?.method === 'POST').length, 1);
+  assert.equal(messages.filter(item => item.message.type === 'changed').length, 0);
+  resolveWrite({ok:true, text:async () => '{"results":[]}'});
+  await write;
+  assert.equal(messages.filter(item => item.message.type === 'changed').length, 1);
+  assert.equal(requests.filter(item => item.options?.method === 'POST').length, 1);
+  assert.equal(requests.find(item => item.options?.method === 'POST').options.signal, undefined);
+});
+
+test('failed POST never reports a successful summary change', async () => {
+  const {context, messages, message} = dashboard({embedded: true,
+    request() { return Promise.resolve({ok:false, text:async () => '{"detail":"rejected"}'}); }});
+  message({type: 'ready', role: 'host'});
+  await assert.rejects(context.getJson('/api/trading/open', {method:'POST'}), /rejected/);
+  assert.equal(messages.filter(item => item.message.type === 'changed').length, 0);
 });
 
 test('position chart preserves payoff but removes stale spot, and clears closed positions', () => {
