@@ -147,7 +147,7 @@ grep -qx 'MAX_SPREAD_BPS=0' /etc/greeks/greeks.env
 "/opt/greeks/current/.venv/bin/python" - "$fixture/expected.env" /etc/greeks/greeks.env <<'PY'
 import sys
 from dotenv import dotenv_values
-assert dotenv_values(sys.argv[1], interpolate=False) == dotenv_values(sys.argv[2], interpolate=False)
+assert dict(dotenv_values(sys.argv[1], interpolate=False)) == dict(dotenv_values(sys.argv[2], interpolate=False))
 PY
 cp /etc/greeks/greeks.env "$fixture/expected.env"
 configured_pid=$(pid)
