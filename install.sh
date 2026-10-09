@@ -1,6 +1,135 @@
 #!/usr/bin/env bash
 # Idempotent Debian 12/13 and Ubuntu 24.04 deployment. Never source an .env file.
 set -Eeuo pipefail
+# BEGIN CI RELEASE HELPERS -- keep embedded copies identical to deploy/release-common.sh
+# Only discovery uses latest; the archive is always fetched from its immutable commit tag.
+ci_release_resolve() {
+  local repository=$1 workspace=$2 manifest values
+  [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+  CI_RELEASE_REPOSITORY=$repository
+  CI_RELEASE_WORK=$workspace
+  mkdir -p -- "$workspace" || return 1
+  manifest="$workspace/release-manifest.json"
+  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --retry 3 --connect-timeout 15 --max-time 90 --max-filesize 1048576 \
+    "https://github.com/$repository/releases/latest/download/release-manifest.json" -o "$manifest"; then
+    printf '[CI] %s 暂无可用部署清单或下载失败；现有服务保持原样。\n' "$repository" >&2
+    return 1
+  fi
+  values=$(python3 - "$manifest" "$repository" "$(uname -m)" <<'CI_MANIFEST_PY'
+import json, re, sys
+from pathlib import Path
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+    architecture = {'x86_64': 'linux-x64', 'aarch64': 'linux-arm64', 'arm64': 'linux-arm64'}[sys.argv[3]]
+    require(type(data['schema']) is int and data['schema'] == 1 and data['repository'] == sys.argv[2], 'repository/schema mismatch')
+    commit = data['commit']
+    require(re.fullmatch(r'[a-f0-9]{40}', commit), 'invalid commit')
+    require(data['tag'] == 'deploy-' + commit, 'tag/commit mismatch')
+    item = data['artifacts'][architecture]
+    require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*\.tar\.gz', item['file']), 'invalid archive name')
+    for key in ('sha256', 'application_key'):
+        require(re.fullmatch(r'[a-f0-9]{64}', item[key]), 'invalid ' + key)
+    node = data.get('node_version', '')
+    require(not node or re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', node), 'invalid Node version')
+    print('\n'.join([commit, data['tag'], item['file'], item['sha256'], item['application_key'], node]))
+except (OSError, ValueError, KeyError, TypeError, AssertionError) as error:
+    print('[CI] Invalid deployment manifest: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+CI_MANIFEST_PY
+  ) || return 1
+  local -a fields
+  mapfile -t fields <<< "$values"
+  CI_RELEASE_COMMIT=${fields[0]}
+  CI_RELEASE_TAG=${fields[1]}
+  CI_RELEASE_FILE=${fields[2]}
+  CI_RELEASE_SHA256=${fields[3]}
+  CI_RELEASE_APPLICATION_KEY=${fields[4]}
+  CI_RELEASE_NODE_VERSION=${fields[5]:-}
+  printf '[CI] %s 最新可用部署包：%s。\n' "$repository" "${CI_RELEASE_COMMIT:0:12}"
+}
+
+ci_release_extract() {
+  local cache=$1 destination=$2 archive temporary actual
+  [[ ! -L "$cache" && ( ! -e "$cache" || -d "$cache" ) ]] || { printf '[CI] Invalid archive cache.\n' >&2; return 1; }
+  mkdir -p -- "$cache" || return 1
+  [[ $(stat -c %u "$cache") == "$EUID" ]] || { printf '[CI] Archive cache has an unexpected owner.\n' >&2; return 1; }
+  archive="$cache/$CI_RELEASE_SHA256.tar.gz"
+  [[ ! -L "$archive" && ( ! -e "$archive" || -f "$archive" ) ]] || return 1
+  actual=''
+  if [[ -f "$archive" ]]; then actual=$(sha256sum "$archive" | cut -d ' ' -f1) || return 1; fi
+  if [[ "$actual" != "$CI_RELEASE_SHA256" ]]; then
+    temporary=$(mktemp "$cache/.download.XXXXXXXX") || return 1
+    if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+      --retry 3 --connect-timeout 15 --max-time 600 --max-filesize 2147483648 \
+      "https://github.com/$CI_RELEASE_REPOSITORY/releases/download/$CI_RELEASE_TAG/$CI_RELEASE_FILE" -o "$temporary"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
+    actual=$(sha256sum "$temporary" | cut -d ' ' -f1) || { rm -f -- "$temporary"; return 1; }
+    if [[ "$actual" != "$CI_RELEASE_SHA256" ]]; then
+      printf '[CI] 部署包校验失败；现有服务保持原样。\n' >&2
+      rm -f -- "$temporary"
+      return 1
+    fi
+    chmod 0644 "$temporary" || { rm -f -- "$temporary"; return 1; }
+    mv -f -- "$temporary" "$archive" || return 1
+  else
+    printf '[CI] 部署包已缓存且校验通过，跳过下载。\n'
+  fi
+  python3 - "$archive" "$destination" "$CI_RELEASE_COMMIT" "$CI_RELEASE_APPLICATION_KEY" <<'CI_EXTRACT_PY'
+import os, shutil, sys, tarfile
+from pathlib import Path, PurePosixPath
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+try:
+    destination = Path(sys.argv[2])
+    require(not destination.is_symlink(), 'destination cannot be a symlink')
+    destination.mkdir(parents=True, exist_ok=True)
+    require(not any(destination.iterdir()), 'destination must be empty')
+    with tarfile.open(sys.argv[1], 'r:gz') as archive:
+        members = []
+        names, total = set(), 0
+        for member in archive:
+            require(len(members) < 200000, 'too many archive entries')
+            path = PurePosixPath(member.name)
+            require(not path.is_absolute() and '..' not in path.parts and '\\' not in member.name and ':' not in member.name, 'unsafe archive path')
+            require(member.isdir() or member.isfile(), 'archive links and special files are forbidden')
+            name = str(path)
+            require(name not in names, 'duplicate archive entry')
+            names.add(name)
+            total += member.size
+            require(0 <= member.size and total <= 2147483648, 'archive too large')
+            members.append(member)
+        for member in members:
+            path = destination.joinpath(*PurePosixPath(member.name).parts)
+            if member.isdir():
+                path.mkdir(parents=True, exist_ok=True)
+                path.chmod(0o755)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with archive.extractfile(member) as source, path.open('xb') as target:
+                    shutil.copyfileobj(source, target)
+                path.chmod(0o755 if member.mode & 0o111 else 0o644)
+    destination.chmod(0o755)
+    for directory in destination.rglob('*'):
+        if directory.is_dir():
+            directory.chmod(0o755)
+    require((destination / '.release-commit').read_text().strip() == sys.argv[3], 'archive commit mismatch')
+    require((destination / '.release-application-key').read_text().strip() == sys.argv[4], 'archive application key mismatch')
+except (OSError, ValueError, EOFError, tarfile.TarError, AssertionError) as error:
+    print('[CI] Invalid deployment archive: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+CI_EXTRACT_PY
+}
+# END CI RELEASE HELPERS
+
+deploy_mode=${PROJECT_DEPLOY_MODE:-source}
+case "$deploy_mode" in source|ci) ;; *) printf 'PROJECT_DEPLOY_MODE must be source or ci.\n' >&2; exit 1 ;; esac
 
 APP_DIR=/opt/greeks
 DATA_DIR=/var/lib/greeks
@@ -81,7 +210,9 @@ ensure_os() {
 }
 ensure_tools() {
   local missing=() tool package
-  for tool in curl git tar runuser useradd; do
+  local tools=(curl tar runuser useradd)
+  [[ $deploy_mode != source ]] || tools+=(git)
+  for tool in "${tools[@]}"; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       case "$tool" in runuser) package=util-linux ;; useradd) package=passwd ;; *) package=$tool ;; esac
       missing+=("$package")
@@ -149,6 +280,16 @@ PY
 tree_hash() { git --git-dir="$APP_DIR/repository.git" ls-tree -r "$commit" -- "$@" | hash; }
 input_keys() {
   local dependency_tree application_tree check_tree
+  if [[ $deploy_mode == ci ]]; then
+    prepare_source
+    dependency_tree=$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["dependency_tree"])' "$work_dir/source/.release-inputs.json")
+    [[ "$dependency_tree" =~ ^[a-f0-9]{64}$ ]] || { fail '部署包依赖输入不完整。'; return 1; }
+    dependency_key=$(printf 'dependencies-v1\n%s\n%s' "$dependency_tree" "$runtime_key" | hash)
+    application_key=$(printf 'ci-application-v1\n%s\n%s' "$CI_RELEASE_APPLICATION_KEY" "$dependency_key" | hash)
+    validation_key=$(printf 'ci-validation-v1\n%s\n%s' "$CI_RELEASE_APPLICATION_KEY" "$dependency_key" | hash)
+    dependencies="$APP_DIR/dependencies/$dependency_key"
+    return
+  fi
   dependency_tree=$(tree_hash pyproject.toml uv.lock)
   application_tree=$(tree_hash app deploy)
   check_tree=$(tree_hash app deploy tests/test_installer.py .env.example)
@@ -162,8 +303,13 @@ dependencies_ready() {
 }
 prepare_source() {
   [[ ! -d "$work_dir/source" ]] || return 0
-  mkdir "$work_dir/source"
-  git --git-dir="$APP_DIR/repository.git" archive "$commit" | tar -xf - -C "$work_dir/source"
+  if [[ $deploy_mode == ci ]]; then
+    ci_release_extract "$APP_DIR/cache/ci-archives" "$work_dir/source"
+    [[ -f "$work_dir/source/app/main.py" && -f "$work_dir/source/deploy/runtime.py" && -f "$work_dir/source/uv.lock" ]] || { fail 'CI 部署包不完整。'; return 1; }
+  else
+    mkdir "$work_dir/source"
+    git --git-dir="$APP_DIR/repository.git" archive "$commit" | tar -xf - -C "$work_dir/source"
+  fi
   chmod 0755 "$work_dir"
   chown -R "$SERVICE_USER:$SERVICE_USER" "$work_dir/source"
 }
@@ -204,7 +350,13 @@ prepare_application() {
   if [[ ! -e "$release" ]]; then
     mkdir "$work_dir/publish"
     # Re-extract as root so validation cannot modify the runtime code.
-    git --git-dir="$APP_DIR/repository.git" archive "$commit" app deploy | tar -xf - -C "$work_dir/publish"
+    if [[ $deploy_mode == ci ]]; then
+      # Extract verified bytes again; validation runs under the service account.
+      rmdir "$work_dir/publish"
+      ci_release_extract "$APP_DIR/cache/ci-archives" "$work_dir/publish"
+    else
+      git --git-dir="$APP_DIR/repository.git" archive "$commit" app deploy | tar -xf - -C "$work_dir/publish"
+    fi
     ln -s "$dependencies" "$work_dir/publish/.venv"
     atomic_record "$work_dir/publish/.application-key" "$application_key"
     atomic_record "$work_dir/publish/.managed-release" "$commit"
@@ -346,24 +498,33 @@ main() {
   write_unit
   deployment_key=$({ cat "$ENV_FILE" "$work_dir/service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION"; } | hash)
   log '检查远端版本。'
-  commit=$(git ls-remote --exit-code "$REPOSITORY" "refs/heads/$BRANCH" | cut -f1)
+  if [[ $deploy_mode == ci ]]; then
+    ci_release_resolve hxx344/greeks "$work_dir/ci"
+    commit=$CI_RELEASE_COMMIT
+  else commit=$(git ls-remote --exit-code "$REPOSITORY" "refs/heads/$BRANCH" | cut -f1); fi
   [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || fail '无法确定远端提交。'
   deployed_state=
   [[ ! -f "$APP_DIR/.deployed-state" ]] || deployed_state=$(cat "$APP_DIR/.deployed-state")
   if [[ -n "$old_release" && -f "$old_release/.install-ready" &&
-        "$deployed_state" == "$commit $deployment_key" && -x "$old_release/.venv/bin/python" &&
+        ( ( $deploy_mode == source && "$deployed_state" == "$commit $deployment_key" ) ||
+          ( $deploy_mode == ci && "${deployed_state#* }" == "$deployment_key" &&
+            $(cat "$old_release/.release-application-key" 2>/dev/null || true) == "$CI_RELEASE_APPLICATION_KEY" ) ) &&
+        -x "$old_release/.venv/bin/python" &&
         -f "$old_release/.venv/.complete" &&
         -f "$UNIT_FILE" ]] && cmp -s "$work_dir/service" "$UNIT_FILE" && healthy; then
     log "提交 ${commit:0:12}、配置和运行环境未变化；跳过源码下载、依赖同步、验证及重启。"
+    atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
     cleanup
     trap - ERR INT TERM
     show_access_info
     return
   fi
+  if [[ $deploy_mode == source ]]; then
   [[ -d "$APP_DIR/repository.git" ]] || git init --bare -q "$APP_DIR/repository.git"
   if ! git --git-dir="$APP_DIR/repository.git" cat-file -e "$commit^{commit}" 2>/dev/null; then
     git --git-dir="$APP_DIR/repository.git" fetch --quiet --depth=1 "$REPOSITORY" "$commit"
   else log '源码已缓存，跳过下载。'; fi
+  fi
   input_keys
   prepare_application
   local added_settings candidate_environment="$work_dir/candidate.env"

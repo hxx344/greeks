@@ -36,7 +36,7 @@ git -C "$fixture" config user.name 'Installer CI'
 git -C "$fixture" add .
 git -C "$fixture" commit -qm fixture
 run_install() {
-  GREEKS_INSTALL_SOURCE_ONLY=1 INSTALLER_PATH="$installer" TEST_REPOSITORY="$fixture" bash -c '
+  PROJECT_DEPLOY_MODE=source GREEKS_INSTALL_SOURCE_ONLY=1 INSTALLER_PATH="$installer" TEST_REPOSITORY="$fixture" bash -c '
     source "$INSTALLER_PATH"
     REPOSITORY=$TEST_REPOSITORY
     wait_healthy() { local i; for i in {1..8}; do if healthy; then return 0; fi; sleep 1; done; return 1; }
@@ -196,4 +196,57 @@ before_lock=$(pid)
   if run_install; then echo 'Concurrent installer unexpectedly ran.' >&2; exit 1; fi
 ) 8>>/run/greeks-installer/install.lock
 [[ $(pid) == "$before_lock" ]]
-echo 'Systemd install, no-op, incremental update, credential preservation and rollback passed.'
+# Migrate the same installation to verified CI archives; Python environments and
+# literal user settings survive download rejection and activation failure.
+git -C "$fixture" revert --no-edit HEAD >/dev/null
+build_ci_package() {
+  python3 "$fixture/deploy/package-release.py" --root "$fixture" --output "$fixture/ci-release"
+}
+run_ci_install() {
+  PROJECT_DEPLOY_MODE=ci GREEKS_INSTALL_SOURCE_ONLY=1 INSTALLER_PATH="$installer" CI_FIXTURE="$fixture" bash -c '
+    source "$INSTALLER_PATH"
+    curl() {
+      local argument url="" target="" name
+      for argument in "$@"; do [[ $argument != https://* ]] || url=$argument; done
+      while (( $# )); do if [[ $1 == -o ]]; then target=$2; break; fi; shift; done
+      [[ $url == https://github.com/hxx344/greeks/releases/* && -n $target ]] || return 1
+      name=${url##*/}
+      [[ $name == release-manifest.json ]] || printf "archive\\n" >> "$CI_FIXTURE/ci-downloads"
+      cp "$CI_FIXTURE/ci-release/$name" "$target"
+    }
+    wait_healthy() { local i; for i in {1..8}; do if healthy; then return 0; fi; sleep 1; done; return 1; }
+    main
+  '
+}
+build_ci_package
+run_ci_install
+assert_preserved
+[[ $(stat -c %Y "$dependencies/.complete") == "$dependency_stamp" ]]
+[[ -f /opt/greeks/current/.release-application-key ]]
+ci_pid=$(pid)
+ci_release=$(readlink /opt/greeks/current)
+run_ci_install
+[[ $(pid) == "$ci_pid" && $(readlink /opt/greeks/current) == "$ci_release" ]]
+[[ $(wc -l < "$fixture/ci-downloads") == 1 ]]
+printf '\nCI docs-only update\n' >> "$fixture/README.md"
+git -C "$fixture" add README.md
+git -C "$fixture" commit -qm ci-docs
+build_ci_package
+run_ci_install
+[[ $(pid) == "$ci_pid" && $(readlink /opt/greeks/current) == "$ci_release" ]]
+[[ $(wc -l < "$fixture/ci-downloads") == 1 ]]
+printf '\nraise RuntimeError("CI package startup failure")\n' >> "$fixture/app/main.py"
+git -C "$fixture" add app/main.py
+git -C "$fixture" commit -qm ci-startup-failure
+build_ci_package
+cp "$fixture/ci-release/greeks-linux.tar.gz" "$fixture/good-archive"
+printf 'corrupt archive\n' > "$fixture/ci-release/greeks-linux.tar.gz"
+if run_ci_install; then echo 'Corrupt CI package unexpectedly installed.' >&2; exit 1; fi
+[[ $(pid) == "$ci_pid" && $(readlink /opt/greeks/current) == "$ci_release" ]]
+assert_preserved
+cp "$fixture/good-archive" "$fixture/ci-release/greeks-linux.tar.gz"
+if run_ci_install; then echo 'Broken CI runtime unexpectedly installed.' >&2; exit 1; fi
+[[ $(readlink /opt/greeks/current) == "$ci_release" ]]
+systemctl is-active --quiet greeks
+assert_preserved
+echo 'Source/CI install, no-op, dependency reuse, corrupt package rejection and rollback passed.'
