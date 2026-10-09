@@ -10,6 +10,28 @@ APP_DIR="$temporary/app"
 mkdir -p "$APP_DIR/releases/old" "$APP_DIR/releases/new"
 atomic_record "$APP_DIR/.record" 'exact value'
 [[ "$(cat "$APP_DIR/.record")" == 'exact value' ]]
+cat > "$temporary/uv" <<'SH'
+#!/bin/sh
+printf '%s\n' "$UV_TEST_OUTPUT"
+exit "${UV_TEST_EXIT:-0}"
+SH
+chmod +x "$temporary/uv"
+export UV_TEST_OUTPUT UV_TEST_EXIT=0
+for UV_TEST_OUTPUT in 'uv 0.12.10' 'uv 0.12.10 (abcdef123 2026-10-01)'; do
+  uv_supported "$temporary/uv"
+done
+for UV_TEST_OUTPUT in '' 'uvx 0.12.10' 'uv 0.12.9' 'uv 0.12.100' 'uv 0.12.10rc1'; do
+  if uv_supported "$temporary/uv"; then echo 'Unsupported uv version accepted.' >&2; exit 1; fi
+done
+UV_TEST_OUTPUT='uv 0.12.10 (abcdef123 2026-10-01)'
+UV_TEST_EXIT=1
+if uv_supported "$temporary/uv"; then echo 'Failed uv command accepted.' >&2; exit 1; fi
+UV_TEST_EXIT=0
+mkdir -p "$APP_DIR/tools/bin"
+cp "$temporary/uv" "$APP_DIR/tools/bin/uv"
+PYTHON_BIN=/missing-python-must-not-be-used
+ensure_uv
+unset UV_TEST_OUTPUT UV_TEST_EXIT
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) echo 'Windows: symlink checks run in Linux CI.' ;;
   *)

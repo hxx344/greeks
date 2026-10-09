@@ -97,13 +97,19 @@ ensure_tools() {
   else log '系统依赖齐全，跳过安装。'; fi
   "$PYTHON_BIN" -c 'import sys; assert sys.version_info >= (3, 11)' || fail '需要系统 Python 3.11 或更新版本。'
 }
+uv_supported() {
+  local output program version metadata
+  output=$("$1" --version) || return 1
+  read -r program version metadata <<< "$output"
+  [[ "$program" == uv && "$version" == "$UV_VERSION" ]]
+}
 ensure_uv() {
   UV_BIN="$APP_DIR/tools/bin/uv"
-  if [[ -x "$UV_BIN" && "$("$UV_BIN" --version)" == "uv $UV_VERSION" ]]; then return; fi
+  if [[ -x "$UV_BIN" ]] && uv_supported "$UV_BIN"; then return; fi
   log "安装固定版本 uv $UV_VERSION。"
   "$PYTHON_BIN" -m venv "$APP_DIR/tools"
   "$APP_DIR/tools/bin/python" -m pip install --disable-pip-version-check --only-binary=:all: "uv==$UV_VERSION"
-  [[ "$("$UV_BIN" --version)" == "uv $UV_VERSION" ]] || fail 'uv 版本验证失败。'
+  uv_supported "$UV_BIN" || fail 'uv 版本验证失败。'
 }
 run_as_service() {
   runuser -u "$SERVICE_USER" -- env -i "HOME=$DATA_DIR" PATH=/usr/local/bin:/usr/bin:/bin \
