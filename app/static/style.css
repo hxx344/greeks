@@ -94,6 +94,72 @@ svg { display: block; }
 /* Consistent panels; keep trading controls aligned with the market. */
 .workspace, .bottom-grid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 22px; align-items: stretch; }
 .bottom-grid { margin-top: 22px; }
+
+/* Live order evidence stays readable while a trading request is still running. */
+.orders-panel { margin-top: 22px; }
+.orders-panel .panel-head { margin-bottom: 14px; }
+.orders-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 22px; margin-bottom: 18px; color: var(--quiet); font-size: 11px; }
+.orders-toolbar>span:first-child { color: var(--text); margin-right: auto; }
+#ordersSnapshotTime { font-variant-numeric: tabular-nums; }
+.orders-panel[data-state="stale"] #ordersSyncState, .orders-panel[data-state="offline"] #ordersSyncState { color: var(--warning); border-color: #675737; background: #29251b; }
+.orders-notice { padding: 10px 14px; margin: 0 0 16px; border-left: 2px solid var(--warning); background: #2a251980; color: var(--warning); font-size: 12px; line-height: 1.7; }
+.orders-table-wrap { max-height: 460px; overflow: auto; overscroll-behavior: contain; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); scrollbar-gutter: stable; }
+.orders-table { width: 100%; table-layout: fixed; border-collapse: collapse; text-align: left; font-size: 11px; }
+.orders-table th { position: sticky; top: 0; z-index: 1; padding: 11px 10px; background: var(--surface-raised); color: var(--muted); font-size: 10px; font-weight: 500; }
+.orders-table th small { display: block; color: var(--quiet); font: 9px var(--mono); margin-top: 3px; }
+.orders-table th:nth-child(1) { width: 25%; }
+.orders-table th:nth-child(2) { width: 9%; }
+.orders-table th:nth-child(3) { width: 13%; }
+.orders-table th:nth-child(4) { width: 16%; }
+.orders-table th:nth-child(5) { width: 17%; }
+.orders-table th:nth-child(6) { width: 20%; }
+.orders-table td { padding: 15px 10px; border-bottom: 1px solid var(--line-soft); vertical-align: top; overflow-wrap: anywhere; }
+.orders-table tr:last-child td { border-bottom: 0; }
+.order-contract strong, .order-contract>small { display: block; font-family: var(--mono); overflow-wrap: anywhere; }
+.order-contract strong { color: var(--text); font-size: 11px; font-weight: 500; line-height: 1.7; margin-bottom: 7px; }
+.order-contract>small { font-size: 9px; color: var(--quiet); line-height: 1.8; }
+.order-operation { color: var(--text); line-height: 1.7; }
+.order-operation>span { display: block; font: 10px var(--mono); color: var(--quiet); margin: 3px 0 7px; }
+.order-side { font-size: 10px; }
+.order-side.buy { color: var(--positive); }
+.order-side.sell { color: var(--negative); }
+.order-side.unknown { color: var(--quiet); }
+.order-values { display: grid; gap: 7px; }
+.order-values>span { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 3px 6px; }
+.order-values small { font-size: 10px; color: var(--quiet); }
+.order-values b { font: 11px var(--mono); font-variant-numeric: tabular-nums; color: var(--text); overflow-wrap: anywhere; }
+.order-times b { font-size: 10px; }
+.order-phase { display: inline-block; color: var(--accent); font-size: 11px; line-height: 1.7; }
+.order-phase[data-tone="warning"], .order-stale { color: var(--warning); }
+.order-phase[data-tone="error"] { color: var(--negative); }
+.order-phase[data-tone="filled"] { color: var(--positive); }
+.order-phase[data-tone="ended"] { color: var(--muted); }
+.order-exchange-status, .order-stale { display: block; font-size: 9px; line-height: 1.8; margin-top: 5px; }
+.order-exchange-status { color: var(--quiet); }
+.orders-note { margin: 14px 0 0; color: var(--quiet); font-size: 10px; line-height: 1.8; }
+@media (max-width: 760px) {
+  .orders-panel { margin-top: 18px; }
+  .orders-toolbar { display: grid; gap: 6px; }
+  .orders-table-wrap { max-height: 590px; border-top: 0; }
+  .orders-table, .orders-table tbody { display: block; width: 100%; }
+  .orders-table thead { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .orders-table tr { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px 20px; padding: 18px 0; border-bottom: 1px solid var(--line); }
+  .orders-table tr:first-child { padding-top: 0; }
+  .orders-table tr:last-child { border-bottom: 0; }
+  .orders-table td { display: block; min-width: 0; padding: 0; border: 0; }
+  .orders-table td::before { content: attr(data-label); display: block; margin-bottom: 7px; font-size: 10px; color: var(--quiet); }
+  .orders-table td.order-contract, .orders-table td:last-child { grid-column: 1 / -1; }
+  .order-contract strong { font-size: 12px; }
+  .order-contract>small { font-size: 10px; }
+  .order-operation>span { display: inline; margin-left: 7px; }
+  .order-side { display: block; margin-top: 5px; }
+  .order-values b { font-size: 12px; }
+  .order-times { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  .order-times>span { display: grid; justify-content: start; gap: 5px; }
+  .order-times b { font-size: 10px; }
+  .order-phase { font-size: 12px; }
+  .orders-note { font-size: 11px; }
+}
 .panel { min-width: 0; padding: 24px; border: 1px solid var(--line); background: var(--surface); border-radius: var(--radius); box-shadow: 0 3px 12px #0000000b; }
 .panel-head, .health-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 22px; }
 .panel h2 { font-size: 17px; line-height: 1.4; font-weight: 550; margin: 0; letter-spacing: -.025em; }

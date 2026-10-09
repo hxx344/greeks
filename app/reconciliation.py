@@ -233,7 +233,9 @@ class ReconciliationMixin:
     async def _reconcile_pending_orders(self) -> None:
         executor = OrderExecutor(self.client, self.settings, self.log)
         async def reconcile(link, entry):
-            outcome = await executor.reconcile(entry["symbol"], entry["side"], entry["qty"], link, entry)
+            outcome = await executor.reconcile(entry["symbol"], entry["side"], entry["qty"], link, entry,
+                                               observer=lambda event: self._observe_order(link, event),
+                                               record=lambda outcome: self._record_order(link, outcome))
             self._record_order(link, outcome)
         await asyncio.gather(*(reconcile(link, dict(entry)) for link, entry in list(self.order_journal.items()) if not entry.get("terminal")))
         if any(not entry.get("terminal") for entry in self.order_journal.values()):

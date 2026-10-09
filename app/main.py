@@ -150,6 +150,11 @@ async def dashboard_account():
     return await account_cache.get(_build_account_dashboard)
 
 
+@app.get("/api/dashboard/orders")
+async def dashboard_orders():
+    return engine.order_snapshot()
+
+
 performance_cache = SnapshotCache(15)
 
 

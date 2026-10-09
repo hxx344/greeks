@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#0d1110" />
   <title>CONDOR · BTC 期权策略台</title>
-  <link rel="stylesheet" href="/static/style.css?v=20261009-2" />
+  <link rel="stylesheet" href="/static/style.css?v=20261010-1" />
 </head>
 <body>
   <a class="skip-link" href="#overview">跳转到策略总览</a>
@@ -14,7 +14,7 @@
       <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><path d="M5 23 11 9h10l6 14M8 18h16M12 23l4-9 4 9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
       <span><strong>CONDOR<span class="brand-dot">.</span></strong><small>OPTIONS WORKSPACE</small></span>
     </a>
-    <nav class="top-nav" aria-label="页面导航"><a href="#overview">总览</a><a href="#account">账户</a><a href="#market">期权链</a><a href="#position-payoff">持仓</a><a href="#performance">收益</a><a href="#rfq">组合询价</a></nav>
+    <nav class="top-nav" aria-label="页面导航"><a href="#overview">总览</a><a href="#account">账户</a><a href="#market">期权链</a><a href="#orders">挂单</a><a href="#position-payoff">持仓</a><a href="#performance">收益</a><a href="#rfq">组合询价</a></nav>
     <div class="top-meta"><span id="environment" class="status-chip">连接中</span><span id="clock" class="clock">--:--:-- UTC</span></div>
   </header>
   <main class="shell" id="overview">
@@ -66,6 +66,19 @@
         <div class="schedule"><span>计划开仓 <small id="automaticMode">自动任务模式待同步</small></span><strong id="nextOpen">周五 21:00 UTC</strong></div>
       </aside>
     </section>
+    <section class="panel orders-panel" id="orders" aria-labelledby="ordersTitle" data-state="loading">
+      <div class="panel-head"><div><div class="kicker">EXECUTION / LIVE ORDERS</div><h2 id="ordersTitle">执行挂单<span class="heading-detail">逐腿成交进度</span></h2></div><span id="ordersSyncState" class="source-tag">等待同步</span></div>
+      <div class="orders-toolbar"><span id="ordersSummary">正在读取委托记录…</span><span id="ordersSnapshotTime">服务器快照 --</span><span>前台每 1 秒 · 后台至少 30 秒</span></div>
+      <p id="ordersNotice" class="orders-notice" role="status" aria-live="polite" hidden></p>
+      <div id="ordersEmpty" class="empty">等待挂单同步…</div>
+      <div id="ordersTableWrap" class="orders-table-wrap" tabindex="0" role="region" aria-label="执行挂单记录，可滚动查看" hidden>
+        <table class="orders-table" role="table" aria-label="执行挂单，价格单位 USD，数量单位 BTC，时间为 UTC">
+          <thead role="rowgroup"><tr role="row"><th scope="col">合约 / 订单标识</th><th scope="col">执行</th><th scope="col">价格 <small>USD</small></th><th scope="col">数量 <small>BTC</small></th><th scope="col">状态阶段</th><th scope="col">时间 <small>UTC</small></th></tr></thead>
+          <tbody id="ordersBody" role="rowgroup"></tbody>
+        </table>
+      </div>
+      <p class="orders-note">显示本系统跟踪的单腿委托与最近 30 条结束记录；RFQ 见组合询价。快照更新不代表交易所已确认，撤单或拒绝也可能已有部分成交。</p>
+    </section>
     <section class="bottom-grid" aria-label="策略与活动">
       <div class="panel strategy-panel">
         <div class="panel-head"><div><div class="kicker">03 / STRATEGY</div><h2>组合结构</h2></div><span id="strategyDescription" class="muted">双侧卖出 · 远端保护</span></div>
@@ -105,6 +118,6 @@
   <script src="/static/hub.js?v=20261009-1"></script>
   <script src="/static/position-payoff.js?v=20261009-2"></script>
   <script src="/static/performance.js?v=20261009-1"></script>
-  <script src="/static/app.js?v=20261009-2"></script>
+  <script src="/static/app.js?v=20261010-1"></script>
 </body>
 </html>

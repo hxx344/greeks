@@ -12,6 +12,7 @@ from .config import Settings
 from .models import AccountHealth, CloseRequest, ExecutionRecord, LogEntry, OpenRequest, OrderResult, PerformanceSample, Position, StrategyMode, StrategyPreview
 from .strategy import build_strategy
 from .orders import OrderExecutor
+from .order_activity import observe_order, order_dashboard
 from .state import EngineState
 from .risk import leg_count, maximum_loss, reserve_short_margin, strategy_mode as validate_mode, validate_structure
 from .rfq import RfqMixin
@@ -42,6 +43,7 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
         self.execution_group_links: dict[str, str] = {}
         self.pm_baseline: dict = {}
         self.order_journal: dict[str, dict] = {}
+        self.order_activity: dict[str, dict] = {}
         self.state_error: str | None = None
         self.performance_executions: dict[str, ExecutionRecord] = {}
         self.performance_start_ms = None
@@ -63,6 +65,7 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
         self.log("INFO", f"Engine started in {settings.environment} mode")
 
     def _load_state(self) -> None:
+        self.order_activity.clear()
         try:
             def reject_constant(value):
                 raise ValueError(f"Invalid JSON number: {value}")
@@ -357,14 +360,26 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
             raise ValueError(f"Execution prices exceed combination maximum loss limit: {reserved:.2f}")
         return {"risk_legs": proposed, "risk_reserved_usd": reserved}
 
+    def _observe_order(self, link: str, event: dict) -> None:
+        observe_order(self.order_activity, link, event)
+
+    def order_snapshot(self) -> dict:
+        return order_dashboard(self.order_journal, self.order_activity,
+                               stale_seconds=max(15, self.settings.reconciliation_seconds * 2, self.settings.bbo_poll_seconds * 3),
+                               groups=self.execution_groups, group_links=self.execution_group_links)
+
     def _record_order(self, link: str, outcome: dict) -> None:
         entry = self.order_journal[link]
+        # Reconciliation carries a copy of the journal; its old display timestamp
+        # must not turn unchanged exchange observations into repeated disk writes.
+        outcome = {key: value for key, value in outcome.items() if key != "updated_at"}
         previous_filled = float(entry.get("filledQty", 0))
         if float(outcome.get("filledQty", 0)) < previous_filled:
             outcome = {**outcome, "filledQty": previous_filled}
         if all(entry.get(key) == value for key, value in outcome.items()):
             return
         entry.update(outcome)
+        entry["updated_at"] = datetime.now(timezone.utc).isoformat()
         delta = max(0.0, float(entry.get("filledQty", 0)) - previous_filled)
         group_id = self.execution_group_links.get(link)
         group = self.execution_groups.get(group_id, {})
@@ -389,11 +404,13 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
         if link in self.order_journal:
             raise ValueError("Order link has already been used; reconcile it instead of resubmitting")
         self.order_journal[link] = {"symbol": leg.symbol, "side": leg.side, "qty": qty,
-                                    "reduce_only": reduce_only, "status": "unknown", "terminal": False, "filledQty": 0.0, "created_at": datetime.now(timezone.utc).isoformat()}
+                                    "reduce_only": reduce_only, "status": "unknown", "terminal": False, "filledQty": 0.0,
+                                    "execution_type": "IOC" if market else "BBO", "created_at": datetime.now(timezone.utc).isoformat()}
         self._save_state()
         executor = OrderExecutor(self.client, self.settings, self.log)
         guard = None if reduce_only else lambda price: self._reserve_execution_price(link, leg.symbol, price)
-        return await executor.execute(instrument, leg.side, qty, link, lambda outcome: self._record_order(link, outcome), reduce_only, market, guard)
+        return await executor.execute(instrument, leg.side, qty, link, lambda outcome: self._record_order(link, outcome), reduce_only, market, guard,
+                                      observer=lambda event: self._observe_order(link, event))
 
     def _reserve_execution_price(self, link: str, symbol: str, price: float | None) -> None:
         self._require_trading_state()
@@ -532,7 +549,9 @@ class TradingEngine(RfqMixin, ReconciliationMixin, PerformanceMixin):
                 continue
             # Re-read the original order, even if cancellation was previously
             # confirmed. Neither account holdings nor a missing order proves it safe.
-            confirmed = await executor.reconcile(leg.symbol, leg.side, qty, link, original, cancel=False)
+            confirmed = await executor.reconcile(leg.symbol, leg.side, qty, link, original, cancel=False,
+                                                 observer=lambda event: self._observe_order(link, event),
+                                                 record=lambda outcome: self._record_order(link, outcome))
             self._record_order(link, confirmed)
             result.qty = confirmed["filledQty"]
             result.status = confirmed["status"]

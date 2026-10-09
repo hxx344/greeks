@@ -7,6 +7,8 @@ function dashboard({embedded = false, request} = {}) {
   const elements = new Map();
   const pending = [];
   const requests = [], events = new Map(), messages = [];
+  const timers = new Map();
+  let nextTimer = 0;
   const parent = {postMessage(message, origin) { messages.push({message, origin}); }};
   const drawing = new Proxy({}, {get(target, name) { return target[name] ?? (() => {}); }});
   const element = (id) => {
@@ -22,7 +24,8 @@ function dashboard({embedded = false, request} = {}) {
   const context = vm.createContext({
     document: {visibilityState: 'visible', addEventListener(name, callback) { events.set(name, callback); }, getElementById: element, querySelector() { return null; }, querySelectorAll() { return []; }},
     window: {location: {hostname: embedded ? 'p-0123456789abcdef01234567.hub.localhost' : 'localhost', protocol: 'http:', port: '8000'}, parent, navigator: {onLine: true}, localStorage: {getItem() { return null; }, setItem() {}}, addEventListener(name, callback) { events.set(name, callback); }},
-    setTimeout() { return 1; }, clearTimeout() {},
+    setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, {callback, delay}); return id; },
+    clearTimeout(id) { timers.delete(id); },
     setInterval() {},
     fetch(url, options) {
       requests.push({url, options});
@@ -36,7 +39,8 @@ function dashboard({embedded = false, request} = {}) {
   vm.runInContext(fs.readFileSync(`${__dirname}/../app/static/performance.js`, 'utf8'), context);
   vm.runInContext(fs.readFileSync(`${__dirname}/../app/static/app.js`, 'utf8'), context);
   const message = data => events.get('message')?.({source: parent, origin: 'http://hub.localhost:8000', data: {channel: 'project-hub', version: 1, ...data}});
-  return {context, element, pending, requests, events, messages, message};
+  const fireTimer = (id) => { const timer = timers.get(id); assert.ok(timer); timers.delete(id); timer.callback(); };
+  return {context, element, pending, requests, events, messages, message, timers, fireTimer};
 }
 
 test('partial and failed orders are not reported as successful', () => {
@@ -111,14 +115,14 @@ test('account connection failure hides stale health metrics', async () => {
   assert.match(element('positionPayoffContent').innerHTML, /持仓更新失败/);
 });
 
-test('real dashboard initialization waits for proxy activity across all four streams', async () => {
+test('real dashboard initialization waits for proxy activity across all five streams', async () => {
   const {context, requests, message} = dashboard({embedded: true});
   assert.equal(requests.length, 0);
   message({type: 'ready', role: 'host'});
   assert.equal(requests.length, 0);
   message({type: 'activity', active: true, backgroundUpdates: true});
   assert.deepEqual(requests.map(item => item.url.split('?')[0]).sort(),
-    ['/api/dashboard/account', '/api/dashboard/market', '/api/dashboard/performance', '/api/rfq/status'].sort());
+    ['/api/dashboard/account', '/api/dashboard/market', '/api/dashboard/orders', '/api/dashboard/performance', '/api/rfq/status'].sort());
   context.window.navigator.onLine = false;
 });
 
@@ -572,4 +576,167 @@ test('two-leg tracked positions retain unbounded-loss annotation inside a narrow
   assert.match(element('positionPayoffContent').innerHTML, /<text class="pp-risk-note"[^>]*>亏损无上限 · 图示价格范围有限<\/text>/);
   assert.match(element('positionPayoffContent').innerHTML, /最大到期亏损<\/span><strong class="">无上限/);
   assert.doesNotMatch(element('positionPayoffContent').innerHTML, /NaN|Infinity/);
+});
+
+function orderSnapshot(item = {}, snapshot = {}) {
+  return {generated_at: '2026-10-10T04:00:05Z', execution_active: true, active_count: 1, terminal_count: 0,
+    items: [{order_link_id: 'ic-open-0', order_id: 'exchange-0', symbol: 'BTC-11OCT26-100000-C',
+      operation: 'open', side: 'Sell', execution_type: 'BBO', qty: .01, filled_qty: 0, remaining_qty: .01,
+      requested_price: 100, confirmed_price: 100, terminal: false, status: 'pending', phase: 'working',
+      exchange_status: 'New', created_at: '2026-10-10T04:00:00Z', updated_at: '2026-10-10T04:00:04Z',
+      last_confirmed_at: '2026-10-10T04:00:03Z', stale: false, ...item}], ...snapshot};
+}
+const jsonResponse = payload => ({ok: true, text: async () => JSON.stringify(payload)});
+
+test('order polling updates fills and requested prices every second while the opening POST is pending', async () => {
+  let resolveWrite, orderReads = 0;
+  const page = dashboard({request(url, options) {
+    if (options?.method === 'POST') return new Promise(resolve => { resolveWrite = resolve; });
+    if (url.startsWith('/api/dashboard/market')) return Promise.resolve(jsonResponse(strategyMarket()));
+    if (url === '/api/dashboard/orders') {
+      orderReads++;
+      return Promise.resolve(jsonResponse(orderSnapshot(orderReads === 1 ? {} : {
+        phase: 'amending', requested_price: 105, confirmed_price: 100, filled_qty: .002, remaining_qty: .008,
+      })));
+    }
+    return Promise.reject(new Error('offline'));
+  }});
+  await new Promise(setImmediate);
+  page.element('confirm').checked = true;
+  const write = page.context.openTrade();
+  assert.equal(page.element('openTrade').dataset.busy, '1');
+  assert.equal(page.requests.filter(item => item.options?.method === 'POST').length, 1);
+  const timer = [...page.timers].find(([, item]) => item.delay === 1000);
+  assert.ok(timer, 'orders have an independent one-second timer');
+  page.fireTimer(timer[0]);
+  await new Promise(setImmediate);
+  assert.equal(orderReads, 2);
+  assert.equal(page.element('openTrade').dataset.busy, '1');
+  assert.equal(page.element('openTrade').textContent, '执行中…');
+  assert.match(page.element('ordersBody').innerHTML, /正在改价/);
+  assert.match(page.element('ordersBody').innerHTML, /申请<\/small><b>105\.00/);
+  assert.match(page.element('ordersBody').innerHTML, /已确认<\/small><b>100\.00/);
+  assert.match(page.element('ordersBody').innerHTML, /累计成交<\/small><b>0\.002/);
+  assert.match(page.element('ordersBody').innerHTML, /未成交<\/small><b>0\.008/);
+  assert.equal(page.element('ordersSyncState').textContent, '执行中 · 持续同步');
+  resolveWrite(jsonResponse({live: true, results: [{status: 'filled'}]}));
+  await write;
+  assert.equal(page.requests.filter(item => item.options?.method === 'POST').length, 1);
+});
+
+test('order failures and offline transitions preserve the last snapshot and recover with a fresh read', async () => {
+  let payload = orderSnapshot(), fail = false;
+  const {context, element, events} = dashboard({request(url) {
+    if (url !== '/api/dashboard/orders') return Promise.reject(new Error('offline'));
+    return fail ? Promise.reject(new Error('unavailable')) : Promise.resolve(jsonResponse(payload));
+  }});
+  await new Promise(setImmediate);
+  const previousRows = element('ordersBody').innerHTML, previousTime = element('ordersSnapshotTime').textContent;
+  fail = true;
+  await context.loadOrders();
+  assert.equal(element('ordersBody').innerHTML, previousRows);
+  assert.equal(element('ordersSnapshotTime').textContent, previousTime);
+  assert.equal(element('orders').dataset.state, 'stale');
+  assert.match(element('ordersNotice').textContent, /最近一次记录.*已过期/);
+  context.window.navigator.onLine = false; events.get('offline')(); context.renderOrdersFreshness();
+  assert.equal(element('orders').dataset.state, 'offline');
+  assert.match(element('ordersNotice').textContent, /保留最近委托记录/);
+  assert.equal(element('ordersBody').innerHTML, previousRows);
+  fail = false;
+  payload = orderSnapshot({terminal: true, status: 'timeout_cancelled', phase: 'terminal', exchange_status: 'Cancelled',
+    filled_qty: .004, remaining_qty: .006}, {generated_at: '2026-10-10T04:00:20Z', execution_active: false});
+  context.window.navigator.onLine = true; events.get('online')();
+  await new Promise(setImmediate);
+  assert.equal(element('orders').dataset.state, 'ready');
+  assert.equal(element('ordersNotice').hidden, true);
+  assert.match(element('ordersBody').innerHTML, /已撤单/);
+  assert.match(element('ordersBody').innerHTML, /累计成交<\/small><b>0\.004/);
+  assert.doesNotMatch(element('ordersBody').innerHTML, /已全部成交/);
+  assert.equal(element('ordersSummary').textContent, '未结束 0 笔 · 最近结束 1 笔');
+  assert.notEqual(element('ordersSnapshotTime').textContent, previousTime);
+});
+
+test('order states preserve unknown values and distinguish rejected, cancelled, partial, and full execution', () => {
+  const {context, element} = dashboard({embedded: true});
+  const base = orderSnapshot().items[0];
+  for (const [overrides, expected] of [
+    [{terminal: true, status: 'filled', filled_qty: .01, remaining_qty: 0}, '已全部成交'],
+    [{terminal: true, status: 'filled', filled_qty: .004, remaining_qty: .006}, '部分成交 · 已结束'],
+    [{terminal: true, exchange_status: 'Rejected', filled_qty: .004}, '已拒绝'],
+    [{terminal: true, status: 'filled', exchange_status: 'Cancelled', filled_qty: .01, remaining_qty: 0}, '已撤单'],
+    [{terminal: false, phase: '__proto__'}, '状态未知 · 待核对'],
+  ]) assert.equal(context.orderDisplayState({...base, ...overrides}).label, expected);
+  context.renderOrders(orderSnapshot({requested_price: null, confirmed_price: null, qty: null, filled_qty: null,
+    remaining_qty: null, created_at: null, updated_at: null, last_confirmed_at: null, stale: true,
+    phase: 'unknown', symbol: '<script>attack()</script>', order_link_id: 'bad" onmouseover="attack()',
+    order_id: '<img src=x onerror=attack()>', exchange_status: '<svg onload=attack()>'}));
+  const html = element('ordersBody').innerHTML;
+  assert.match(html, /申请<\/small><b>--/);
+  assert.match(html, /已确认<\/small><b>--/);
+  assert.match(html, /累计成交<\/small><b>--/);
+  assert.match(html, /确认<\/small><b>--/);
+  assert.match(html, /尚无交易所确认 · 待核对/);
+  assert.match(html, /&lt;script&gt;/);
+  assert.match(html, /bad&quot; onmouseover=&quot;attack\(\)/);
+  assert.doesNotMatch(html, /<script|<img|<svg|NaN|Infinity|>0\.00</);
+});
+
+test('order reads coalesce, discard offline responses, and throttle in the background', async () => {
+  const reads = [];
+  const page = dashboard({embedded: true, request(url) {
+    if (url === '/api/dashboard/orders') return new Promise(resolve => reads.push(resolve));
+    return Promise.reject(new Error('offline'));
+  }});
+  page.message({type: 'ready', role: 'host'});
+  page.message({type: 'activity', active: true, backgroundUpdates: true});
+  assert.equal(reads.length, 1);
+  await page.context.loadOrders(); await page.context.loadOrders();
+  assert.equal(reads.length, 1);
+  reads[0](jsonResponse(orderSnapshot({symbol: 'superseded'})));
+  await new Promise(setImmediate);
+  assert.equal(reads.length, 2);
+  assert.doesNotMatch(page.element('ordersBody').innerHTML || '', /superseded/);
+  page.context.window.navigator.onLine = false; page.events.get('offline')();
+  reads[1](jsonResponse(orderSnapshot({symbol: 'late-offline'})));
+  await new Promise(setImmediate);
+  assert.equal(reads.length, 2);
+  assert.equal(page.timers.size, 0);
+  assert.doesNotMatch(page.element('ordersBody').innerHTML || '', /late-offline/);
+  page.context.window.navigator.onLine = true; page.events.get('online')();
+  assert.equal(reads.length, 3);
+  reads[2](jsonResponse(orderSnapshot({symbol: 'fresh-online'})));
+  await new Promise(setImmediate);
+  assert.match(page.element('ordersBody').innerHTML, /fresh-online/);
+  page.message({type: 'activity', active: false, backgroundUpdates: true});
+  assert.equal(reads.length, 3);
+  assert.equal(page.timers.size, 5);
+  assert.ok([...page.timers.values()].every(timer => timer.delay >= 30000));
+  for (const id of [...page.timers.keys()]) page.fireTimer(id);
+  assert.equal(reads.length, 4);
+  page.message({type: 'activity', active: false, backgroundUpdates: false});
+  reads[3](jsonResponse(orderSnapshot({symbol: 'late-paused'})));
+  await new Promise(setImmediate);
+  assert.equal(page.timers.size, 0);
+  assert.match(page.element('ordersBody').innerHTML, /fresh-online/);
+});
+
+test('order clock updates leave unchanged rows in place and invalid payloads retain the previous snapshot', async () => {
+  let payload = orderSnapshot();
+  const {context, element} = dashboard({request(url) {
+    return url === '/api/dashboard/orders' ? Promise.resolve(jsonResponse(payload)) : Promise.reject(new Error('offline'));
+  }});
+  await new Promise(setImmediate);
+  let rows = element('ordersBody').innerHTML, replacements = 0;
+  Object.defineProperty(element('ordersBody'), 'innerHTML', {
+    get() { return rows; }, set(value) { rows = value; replacements++; },
+  });
+  payload = {...payload, generated_at: '2026-10-10T04:00:06Z'};
+  await context.loadOrders();
+  assert.equal(replacements, 0);
+  assert.equal(element('ordersSnapshotTime').textContent, '服务器快照 10-10 04:00:06 UTC');
+  payload = {items: [null]};
+  await context.loadOrders();
+  assert.equal(replacements, 0);
+  assert.equal(element('orders').dataset.state, 'stale');
+  assert.equal(element('ordersSnapshotTime').textContent, '服务器快照 10-10 04:00:06 UTC');
 });

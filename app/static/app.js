@@ -373,6 +373,105 @@ async function loadMarket() {
   } catch (error) { if (!current()) return; window.__positionMarket = null; renderPositionPayoff(); window.__strategyUnavailable = true; clearStrategyDisplay('策略暂不可用'); updateTradeControls(); $('statusValue').dataset.state = 'error'; $('statusValue').textContent = '行情异常'; $('statusSub').textContent = error.message; $('updateText').textContent = '等待重试'; $('updateDot').style.background = '#df9f99'; }
   finally { read.finish(); }
 }
+let ordersSnapshot = null;
+let ordersReceivedAt = null;
+let ordersReadFailed = false;
+
+function orderNumber(value, price = false) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '--';
+  return value.toLocaleString('en-US', {minimumFractionDigits: price ? 2 : 0, maximumFractionDigits: 8});
+}
+function orderTime(value) {
+  if (typeof value !== 'string' || !value || !Number.isFinite(Date.parse(value))) return '--';
+  return new Date(value).toISOString().slice(5, 19).replace('T', ' ');
+}
+function orderDisplayState(item) {
+  if (item.terminal === true) {
+    if (item.exchange_status === 'Rejected' || item.status === 'rejected') return {label: '已拒绝', tone: 'error'};
+    if (['Cancelled', 'Canceled', 'PartiallyFilledCanceled', 'Deactivated'].includes(item.exchange_status)
+        || item.status === 'timeout_cancelled') return {label: '已撤单', tone: 'ended'};
+    if (item.status === 'not_submitted') return {label: '未提交', tone: 'ended'};
+    const full = Number.isFinite(item.qty) && item.qty > 0 && Number.isFinite(item.filled_qty)
+      && Math.abs(item.filled_qty - item.qty) <= 1e-9 && Number.isFinite(item.remaining_qty) && item.remaining_qty <= 1e-9;
+    if (item.status === 'filled' && full) return {label: '已全部成交', tone: 'filled'};
+    if (item.filled_qty > 0) return {label: '部分成交 · 已结束', tone: 'warning'};
+    return {label: item.status === 'error' ? '执行失败' : '已结束', tone: item.status === 'error' ? 'error' : 'ended'};
+  }
+  const phases = {submitting: '正在提交', amending: '正在改价', cancelling: '正在撤单',
+    reconciling: '正在核对', working: '挂单中'};
+  const label = typeof phases[item.phase] === 'string' ? phases[item.phase] : null;
+  return {label: label || '状态未知 · 待核对', tone: label ? 'working' : 'warning'};
+}
+function orderRow(item) {
+  const state = orderDisplayState(item);
+  const operation = item.operation === 'open' ? '开仓' : item.operation === 'close' ? '平仓' : '--';
+  const executionType = ['BBO', 'IOC'].includes(item.execution_type) ? item.execution_type : '--';
+  const side = item.side === 'Buy' ? '买入' : item.side === 'Sell' ? '卖出' : '--';
+  const sideClass = item.side === 'Buy' ? 'buy' : item.side === 'Sell' ? 'sell' : 'unknown';
+  const confirmation = item.stale === true && item.terminal !== true
+    ? `<span class="order-stale">${orderTime(item.last_confirmed_at) === '--' ? '尚无交易所确认 · 待核对' : '交易所确认已过期 · 待核对'}</span>` : '';
+  return `<tr role="row" data-order-link="${esc(item.order_link_id)}">
+    <td role="cell" data-label="合约 / 订单标识" class="order-contract"><strong>${esc(item.symbol || '--')}</strong><small>关联 ${esc(item.order_link_id || '--')}</small><small>交易所 ${esc(item.order_id || '--')}</small></td>
+    <td role="cell" data-label="执行"><div class="order-operation">${operation} <span>${executionType}</span></div><span class="order-side ${sideClass}">${side}</span></td>
+    <td role="cell" data-label="价格 · USD"><div class="order-values"><span><small>申请</small><b>${orderNumber(item.requested_price, true)}</b></span><span><small>已确认</small><b>${orderNumber(item.confirmed_price, true)}</b></span></div></td>
+    <td role="cell" data-label="数量 · BTC"><div class="order-values"><span><small>委托</small><b>${orderNumber(item.qty)}</b></span><span><small>累计成交</small><b>${orderNumber(item.filled_qty)}</b></span><span><small>未成交</small><b>${orderNumber(item.remaining_qty)}</b></span></div></td>
+    <td role="cell" data-label="状态阶段"><span class="order-phase" data-tone="${state.tone}">${state.label}</span><small class="order-exchange-status">${item.exchange_status ? `交易所 ${esc(item.exchange_status)}` : `本地 ${esc(item.status || '--')}`}</small>${confirmation}</td>
+    <td role="cell" data-label="时间 · UTC"><div class="order-values order-times"><span><small>更新</small><b>${orderTime(item.updated_at)}</b></span><span><small>确认</small><b>${orderTime(item.last_confirmed_at)}</b></span><span><small>创建</small><b>${orderTime(item.created_at)}</b></span></div></td>
+  </tr>`;
+}
+function renderOrdersFreshness() {
+  const offline = window.navigator.onLine === false;
+  const expired = ordersReceivedAt !== null && Date.now() - ordersReceivedAt > 45000;
+  const stale = ordersReadFailed || expired;
+  const hasSnapshot = ordersSnapshot !== null;
+  $('orders').dataset.state = offline ? 'offline' : stale ? 'stale' : hasSnapshot ? 'ready' : 'loading';
+  const label = offline ? '离线 · 同步暂停' : stale ? '数据已过期' : !hasSnapshot ? '等待同步'
+    : ordersSnapshot.execution_active ? '执行中 · 持续同步' : '每秒同步';
+  if ($('ordersSyncState').textContent !== label) $('ordersSyncState').textContent = label;
+  let notice = '';
+  if (offline) notice = hasSnapshot ? '网络已断开，保留最近委托记录；联网后自动补读。' : '网络已断开；联网后自动读取委托记录。';
+  else if (ordersReadFailed) notice = hasSnapshot ? '挂单更新失败，以下为最近一次记录，数据已过期；正在自动重试。' : '挂单暂不可用，正在自动重试。';
+  else if (expired) notice = '挂单快照已过期，以下为最近一次记录；等待同步恢复。';
+  // Only connection-state transitions are announced; prices and timestamps are not live regions.
+  if ($('ordersNotice').textContent !== notice) $('ordersNotice').textContent = notice;
+  $('ordersNotice').hidden = !notice;
+  if (!hasSnapshot) $('ordersEmpty').textContent = stale || offline ? '尚未取得委托记录' : '等待挂单同步…';
+  else if (!ordersSnapshot.items.length) {
+    const busy = $('openTrade').dataset.busy || $('closeTrade').dataset.busy;
+    $('ordersEmpty').textContent = busy && !stale && !offline ? '正在等待首笔委托，执行期间持续同步…' : '暂无本系统跟踪的单腿委托';
+  }
+}
+function renderOrders(payload) {
+  if (!payload || !Array.isArray(payload.items) || payload.items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
+    throw new Error('Invalid order snapshot');
+  }
+  const rows = payload.items.map(orderRow).join('');
+  const active = payload.items.filter(item => item.terminal !== true).length;
+  const terminal = payload.items.length - active;
+  ordersSnapshot = payload;
+  ordersReceivedAt = Date.now();
+  ordersReadFailed = false;
+  $('ordersSummary').textContent = `未结束 ${active} 笔 · 最近结束 ${terminal} 笔`;
+  $('ordersSnapshotTime').textContent = `服务器快照 ${orderTime(payload.generated_at)} UTC`;
+  $('ordersEmpty').hidden = payload.items.length > 0;
+  $('ordersTableWrap').hidden = payload.items.length === 0;
+  // A clock-only snapshot must not replace rows or disturb the user's reading position.
+  if ($('ordersBody').innerHTML !== rows) $('ordersBody').innerHTML = rows;
+  renderOrdersFreshness();
+}
+async function loadOrders() {
+  const read = window.ProjectHub.begin('orders');
+  if (!read) return;
+  try {
+    const payload = await getJson('/api/dashboard/orders');
+    if (read.current()) renderOrders(payload);
+  } catch (_) {
+    if (!read.current()) return;
+    ordersReadFailed = true;
+    renderOrdersFreshness();
+  } finally { read.finish(); }
+}
+
 async function loadAccount() {
   const read = window.ProjectHub.begin('account');
   if (!read) return;
@@ -402,7 +501,7 @@ async function openTrade() {
   } catch (error) { showNotice(error.message, '操作未完成', 'error'); }
   finally { delete button.dataset.busy; updateTradeControls(); }
 }
-function tick() { $('clock').textContent = `${new Date().toLocaleTimeString('en-GB',{hour12:false,timeZone:'UTC'})} UTC`; }
+function tick() { $('clock').textContent = `${new Date().toLocaleTimeString('en-GB',{hour12:false,timeZone:'UTC'})} UTC`; renderOrdersFreshness(); }
 setInterval(renderPositionPayoff, 10000);
 $('refresh').addEventListener('click', async () => { try { await getJson('/api/market/refresh',{method:'POST'}); await loadMarket(); } catch (error) { $('statusSub').textContent = error.message; } }); $('reloadPositions').addEventListener('click', loadAccount); $('openTrade').addEventListener('click', openTrade); $('confirm').addEventListener('change', updateTradeControls); tick(); setInterval(tick,1000);
 let payoffResizeFrame; window.addEventListener('resize', () => { cancelAnimationFrame(payoffResizeFrame); payoffResizeFrame = requestAnimationFrame(() => { if (window.__latestPreview) renderPayoff(window.__latestPreview); renderPositionPayoff(); }); });
@@ -469,6 +568,7 @@ $('performanceCurrency').addEventListener('change', () => { if (window.__perform
 window.addEventListener('resize', () => { if (window.__performance) renderPerformance(window.__performance); });
 window.ProjectHub.register('market', 10000, loadMarket);
 window.ProjectHub.register('account', 15000, loadAccount);
+window.ProjectHub.register('orders', 1000, loadOrders);
 window.ProjectHub.register('rfq', 3000, loadRfq);
 window.ProjectHub.register('performance', 30000, loadPerformance);
 window.ProjectHub.start();
