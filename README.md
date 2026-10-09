@@ -25,7 +25,7 @@ uv run --locked uvicorn app.main:app --reload
 curl -fsSL https://raw.githubusercontent.com/hxx344/greeks/main/install.sh | sudo bash
 ```
 
-安装后默认只监听 `127.0.0.1:8000`，使用独立的 `greeks` 系统用户和单个 worker。配置位于 `/etc/greeks/greeks.env`，交易状态位于 `/var/lib/greeks/engine_state.json`，程序版本位于 `/opt/greeks/releases`，由 `greeks.service` 托管。首次生成 `admin` 用户及独立随机强密码，查看方式：
+安装后默认只监听 `127.0.0.1:8000`，使用独立的 `greeks` 系统用户和单个 worker。配置位于 `/etc/greeks/greeks.env`，交易状态位于 `/var/lib/greeks/engine_state.json`，程序版本位于 `/opt/greeks/releases`，由 `greeks.service` 托管。首次生成 `admin` 用户及独立随机强密码，安装成功后直接显示用户名和密码；后续更新保留已有凭据，结束时始终提示查看命令。错过首次输出也可随时查看：
 
 ```bash
 sudo grep '^DASHBOARD_' /etc/greeks/greeks.env

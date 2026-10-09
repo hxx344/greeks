@@ -128,7 +128,23 @@ with open(path, "x", encoding="utf-8") as file:
     file.write(f"STATE_FILE={data}/engine_state.json\nBYBIT_API_KEY=\nBYBIT_API_SECRET=\n")
 PY
   chown "root:$SERVICE_USER" "$ENV_FILE"
-  log "已生成独立面板密码。查看面板凭据：sudo grep '^DASHBOARD_' $ENV_FILE"
+  log '已生成独立面板密码，安装成功后显示登录凭据。'
+}
+show_access_info() {
+  if [[ -z "$old_release" ]]; then
+    log '首次安装成功，Greeks 面板登录凭据：'
+    run_as_service "$APP_DIR/current/.venv/bin/python" - "$ENV_FILE" <<'PY'
+import sys
+from dotenv import dotenv_values
+
+values = {key: value for key, value in dotenv_values(sys.argv[1], interpolate=False).items() if value is not None}
+print(f"[greeks] 用户名：{values.get('DASHBOARD_USERNAME', 'admin')}")
+print(f"[greeks] 密码：{values.get('DASHBOARD_PASSWORD', '')}")
+PY
+  fi
+  log "查看当前用户名和密码：sudo grep '^DASHBOARD_' $ENV_FILE"
+  log '在工作台“项目管理 → Greeks · BTC 期权”中保存面板用户名和密码。'
+  log '服务日志：sudo journalctl -u greeks -n 50 --no-pager'
 }
 tree_hash() { git --git-dir="$APP_DIR/repository.git" ls-tree -r "$commit" -- "$@" | hash; }
 input_keys() {
@@ -335,6 +351,7 @@ main() {
     log "提交 ${commit:0:12}、配置和运行环境未变化；跳过源码下载、依赖同步、验证及重启。"
     cleanup
     trap - ERR INT TERM
+    show_access_info
     return
   fi
   [[ -d "$APP_DIR/repository.git" ]] || git init --bare -q "$APP_DIR/repository.git"
@@ -351,6 +368,7 @@ main() {
     log '运行代码未变化，复用当前版本，跳过服务重启。'
     cleanup
     trap - ERR INT TERM
+    show_access_info
     return
   fi
   if [[ -n "$old_release" ]]; then
@@ -373,7 +391,7 @@ main() {
   cleanup
   trap - ERR INT TERM
   log "安装完成：${commit:0:12}，greeks.service；配置与交易状态已保留。"
-  log "面板凭据：sudo grep '^DASHBOARD_' $ENV_FILE；日志：sudo journalctl -u greeks -n 50 --no-pager"
+  show_access_info
 }
 
 # Tests source helpers without running any system changes.

@@ -72,7 +72,12 @@ chown nobody /run/greeks-installer
 if run_install; then echo 'Non-root lock directory unexpectedly accepted.' >&2; exit 1; fi
 [[ ! -e /opt/greeks ]]
 chown root /run/greeks-installer
-run_install
+run_install > "$fixture/first-install.log" 2>&1 || { cat "$fixture/first-install.log"; exit 1; }
+cat "$fixture/first-install.log"
+panel_password=$(sed -n 's/^DASHBOARD_PASSWORD=//p' /etc/greeks/greeks.env)
+grep -Fxq '[greeks] 用户名：admin' "$fixture/first-install.log"
+grep -Fxq "[greeks] 密码：$panel_password" "$fixture/first-install.log"
+grep -Fq "sudo grep '^DASHBOARD_' /etc/greeks/greeks.env" "$fixture/first-install.log"
 systemctl is-active --quiet greeks
 [[ $(stat -c %a /etc/greeks/greeks.env) == 640 ]]
 [[ $(stat -c %U /opt/greeks/current/app/main.py) == root ]]
@@ -85,7 +90,29 @@ grep -qx 'LIVE_TRADING=false' /etc/greeks/greeks.env
 dependencies=$(readlink /opt/greeks/current/.venv)
 dependency_stamp=$(stat -c %Y "$dependencies/.complete")
 first_pid=$(pid)
-run_install
+
+# Read the same literal dotenv semantics as runtime, including a bare optional key.
+cat > "$fixture/access.env" <<'ENV'
+DASHBOARD_USERNAME
+DASHBOARD_PASSWORD='literal${PATH}$(touch forbidden)password'
+BYBIT_API_SECRET=NEVER-PRINT-EXCHANGE-SECRET
+ENV
+access_hash=$(sha256sum "$fixture/access.env")
+GREEKS_INSTALL_SOURCE_ONLY=1 INSTALLER_PATH="$installer" TEST_ENV="$fixture/access.env" bash -c '
+  source "$INSTALLER_PATH"
+  ENV_FILE=$TEST_ENV
+  run_as_service() { "$@"; }
+  show_access_info
+' > "$fixture/access.log"
+grep -Fxq '[greeks] 用户名：admin' "$fixture/access.log"
+grep -Fxq '[greeks] 密码：literal${PATH}$(touch forbidden)password' "$fixture/access.log"
+if grep -Fq 'NEVER-PRINT-EXCHANGE-SECRET' "$fixture/access.log"; then echo 'Exchange secret printed.' >&2; exit 1; fi
+[[ ! -e forbidden && "$(sha256sum "$fixture/access.env")" == "$access_hash" ]]
+
+run_install > "$fixture/noop-install.log" 2>&1 || { cat "$fixture/noop-install.log"; exit 1; }
+cat "$fixture/noop-install.log"
+grep -Fq "sudo grep '^DASHBOARD_' /etc/greeks/greeks.env" "$fixture/noop-install.log"
+if grep -Fq "$panel_password" "$fixture/noop-install.log"; then echo 'Update repeated the panel password.' >&2; exit 1; fi
 [[ $(pid) == "$first_pid" ]]
 [[ $(stat -c %Y "$dependencies/.complete") == "$dependency_stamp" ]]
 
@@ -95,7 +122,12 @@ printf "BYBIT_API_SECRET='literal\044{PATH}\044(touch forbidden)'\n" >> /etc/gre
 printf 'state-must-survive' > /var/lib/greeks/engine_state.json
 chown greeks:greeks /var/lib/greeks/engine_state.json
 cp /etc/greeks/greeks.env "$fixture/expected.env"
-run_install
+run_install > "$fixture/config-install.log" 2>&1 || { cat "$fixture/config-install.log"; exit 1; }
+cat "$fixture/config-install.log"
+grep -Fq "sudo grep '^DASHBOARD_' /etc/greeks/greeks.env" "$fixture/config-install.log"
+if grep -Fq "$panel_password" "$fixture/config-install.log" || grep -Fq 'literal${PATH}' "$fixture/config-install.log"; then
+  echo 'Update printed configuration secrets.' >&2; exit 1
+fi
 assert_preserved
 configured_pid=$(pid)
 [[ "$configured_pid" != "$first_pid" ]]
@@ -105,7 +137,10 @@ configured_pid=$(pid)
 printf '\nCI documentation change\n' >> "$fixture/README.md"
 git -C "$fixture" add README.md
 git -C "$fixture" commit -qm docs
-run_install
+run_install > "$fixture/docs-install.log" 2>&1 || { cat "$fixture/docs-install.log"; exit 1; }
+cat "$fixture/docs-install.log"
+grep -Fq "sudo grep '^DASHBOARD_' /etc/greeks/greeks.env" "$fixture/docs-install.log"
+if grep -Fq "$panel_password" "$fixture/docs-install.log"; then echo 'Documentation update repeated the panel password.' >&2; exit 1; fi
 [[ $(pid) == "$configured_pid" ]]
 assert_preserved
 
