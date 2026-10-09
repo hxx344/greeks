@@ -19,7 +19,7 @@ uv run --locked uvicorn app.main:app --reload
 
 ### Linux 一键安装与工作台接入
 
-安装器支持 `PROJECT_DEPLOY_MODE=ci`：从 GitHub Release 下载最新通过检查的运行包，固定提交标签、验证 SHA-256，复用原有 `uv.lock` 与 Python 环境缓存；不复制 CI 的虚拟环境。仅文档更新不重启，坏包不切换，启动失败恢复原程序及配置。当前默认仍为 `source`；可用 `curl -fsSL https://raw.githubusercontent.com/hxx344/greeks/main/install.sh | sudo env PROJECT_DEPLOY_MODE=ci bash` 选择 CI 包，`PROJECT_DEPLOY_MODE=source` 保留源码方式。
+安装器默认使用 `PROJECT_DEPLOY_MODE=ci`：从 GitHub Release 下载最新通过检查的运行包，固定提交标签、验证 SHA-256，复用原有 `uv.lock` 与 Python 环境缓存；不复制 CI 的虚拟环境。仅文档更新不重启，坏包不切换，启动失败恢复原程序及配置。直接运行下方一键命令即可使用 CI 包；需要源码方式时使用 `curl -fsSL https://raw.githubusercontent.com/hxx344/greeks/main/install.sh | sudo env PROJECT_DEPLOY_MODE=source bash`。CI 尚未通过的新提交不会覆盖已有可用包。
 
 支持 Debian 12/13、Ubuntu 24.04，使用系统 Python 3.11 或更新版本及 systemd。首次安装、后续升级都执行同一条命令：
 

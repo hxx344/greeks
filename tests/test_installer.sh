@@ -2,8 +2,10 @@
 # Pure filesystem/mocked-service checks; compatible with Linux and Git Bash.
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
+unset PROJECT_DEPLOY_MODE
 export GREEKS_INSTALL_SOURCE_ONLY=1
 source ./install.sh
+[[ $deploy_mode == ci ]]
 temporary=$(mktemp -d)
 trap 'rm -rf -- "$temporary"' EXIT
 APP_DIR="$temporary/app"

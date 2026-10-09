@@ -203,7 +203,7 @@ build_ci_package() {
   python3 "$fixture/deploy/package-release.py" --root "$fixture" --output "$fixture/ci-release"
 }
 run_ci_install() {
-  PROJECT_DEPLOY_MODE=ci GREEKS_INSTALL_SOURCE_ONLY=1 INSTALLER_PATH="$installer" CI_FIXTURE="$fixture" bash -c '
+  env -u PROJECT_DEPLOY_MODE GREEKS_INSTALL_SOURCE_ONLY=1 INSTALLER_PATH="$installer" CI_FIXTURE="$fixture" bash -c '
     source "$INSTALLER_PATH"
     curl() {
       local argument url="" target="" name
