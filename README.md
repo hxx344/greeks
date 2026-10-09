@@ -19,7 +19,9 @@ uv run --locked uvicorn app.main:app --reload
 
 ### Linux 一键安装与工作台接入
 
-安装器默认使用 `PROJECT_DEPLOY_MODE=ci`：从 GitHub Release 下载最新通过检查的运行包，固定提交标签、验证 SHA-256，复用原有 `uv.lock` 与 Python 环境缓存；不复制 CI 的虚拟环境。仅文档更新不重启，坏包不切换，启动失败恢复原程序及配置。直接运行下方一键命令即可使用 CI 包；需要源码方式时使用 `curl -fsSL https://raw.githubusercontent.com/hxx344/greeks/main/install.sh | sudo env PROJECT_DEPLOY_MODE=source bash`。CI 尚未通过的新提交不会覆盖已有可用包。
+安装器默认使用 `PROJECT_DEPLOY_MODE=ci`：从 GitHub Release 下载经过 CI 验证并明确发布的最新正式运行包，固定提交标签、验证 SHA-256，复用原有 `uv.lock` 与 Python 环境缓存；不复制 CI 的虚拟环境。仅文档更新不重启，坏包不切换，启动失败恢复原程序及配置。直接运行下方一键命令即可使用正式包；需要源码方式时使用 `curl -fsSL https://raw.githubusercontent.com/hxx344/greeks/main/install.sh | sudo env PROJECT_DEPLOY_MODE=source bash`。尚未晋级正式版的新提交不会覆盖现有正式包。
+
+`main` CI 全部通过后，只发布 `deploy-<完整提交号>` 候选 Release（`prerelease`），不改变当前正式版。发布者在 GitHub Actions 选择 **[Publish stable release](.github/workflows/promote-release.yml)**，分支选 `main`，在 `commit` 中填写已通过本仓库 CI 的完整 40 位提交 SHA 后运行；核验清单和部署包后，候选才晋级为最新正式版。默认安装及工作台前端更新只使用正式版，未晋级的候选不会自动安装。
 
 支持 Debian 12/13、Ubuntu 24.04，使用系统 Python 3.11 或更新版本及 systemd。首次安装、后续升级都执行同一条命令：
 
