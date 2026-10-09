@@ -248,7 +248,11 @@ class TradingEngine(TradeTaskMixin, RfqMixin, ReconciliationMixin, PerformanceMi
 
     async def make_preview(self, quantity: float | None = None, strategy_mode: StrategyMode | None = None) -> StrategyPreview:
         await self.refresh_chain()
-        self.preview = self._build_preview_from_chain(quantity, strategy_mode)
+        try:
+            self.preview = self._build_preview_from_chain(quantity, strategy_mode)
+        except ValueError:
+            self.preview = None
+            raise
         if self.preview.unbounded_loss:
             level = "WARNING" if self.preview.estimated_margin_usd > self.settings.max_margin_usd else "INFO"
             self.log(level, f"Short strangle preview: unbounded loss, margin budget ${self.preview.estimated_margin_usd:.2f} / ${self.settings.max_margin_usd:.2f}")

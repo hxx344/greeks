@@ -19,7 +19,7 @@ from .cache import SnapshotCache
 from .lease import StateLease
 from .hub import build_summary
 from .security import authorize_dashboard
-from .strategy import SundayExpiryUnavailable
+from .strategy import StrategyUnavailable, SundayExpiryUnavailable
 from .models import CloseRequest, OpenRequest, Position, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest, StrategyMode, TradePlanRequest, TradeTaskRequest
 
 # The dashboard polls several endpoints frequently; HTTP 200 access lines are
@@ -147,6 +147,23 @@ async def dashboard_market(quantity: float | None = Query(default=None, gt=0, al
                 "config": config_payload(), "preview": None,
                 "chain": {"source": engine.chain_source, "btc_price": engine.btc_price, "updated_at": engine.chain_updated_at,
                           "expiry": observation_expiry, "items": [item.model_dump(mode="json") for item in observation_items]}}
+    except StrategyUnavailable as exc:
+        now = datetime.now(timezone.utc)
+        age = (now - engine.chain_updated_at).total_seconds() if engine.chain_updated_at else None
+        if engine.chain_source != "bybit" or age is None or not 0 <= age <= settings.quote_stale_seconds:
+            raise HTTPException(status_code=503, detail="行情暂不可用或已过期，请等待行情恢复后重新核对策略") from exc
+        messages = {
+            "short_strike_order": "当前候选卖出 Put 的行权价不低于卖出 Call，暂不满足策略结构要求；盘口可继续查看，系统将自动重新检查。",
+            "missing_protective_wings": "当前到期合约缺少符合要求的保护腿，暂时无法生成四腿策略；盘口可继续查看，系统将自动重新检查。",
+            "missing_option_side": "当前到期合约缺少可用的 Call 或 Put 报价，暂时无法生成策略；盘口可继续查看，系统将自动重新检查。",
+        }
+        # This is a read-only display result. Opening, RFQ and confirmed task
+        # admission still receive the original strategy validation exception.
+        expiry_items = [item for item in engine.chain if item.expiry == exc.expiry]
+        return {"status": "strategy_unavailable", "read_only": True, "reason_code": exc.reason_code,
+                "message": messages[exc.reason_code], "config": config_payload(), "preview": None,
+                "chain": {"source": engine.chain_source, "btc_price": engine.btc_price, "updated_at": engine.chain_updated_at,
+                          "expiry": exc.expiry, "items": [item.model_dump(mode="json") for item in expiry_items]}}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

@@ -9,6 +9,15 @@ class SundayExpiryUnavailable(ValueError):
     """The strategy's expiry is not currently available in the chain."""
 
 
+class StrategyUnavailable(ValueError):
+    """Current quotes cannot form the requested structure; market data is still usable."""
+
+    def __init__(self, reason_code: str, message: str, expiry: datetime):
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.expiry = expiry
+
+
 def _nearest(options: list[OptionInstrument], target: float) -> OptionInstrument:
     return min(options, key=lambda item: abs(abs(item.delta) - target))
 
@@ -34,11 +43,11 @@ def build_strategy(options: list[OptionInstrument], now: datetime, target_dte: i
     calls = sorted((item for item in chain if item.option_type == "Call"), key=lambda item: item.strike)
     puts = sorted((item for item in chain if item.option_type == "Put"), key=lambda item: item.strike)
     if not calls or not puts:
-        raise ValueError("Selected expiry requires both calls and puts with usable prices and deltas")
+        raise StrategyUnavailable("missing_option_side", "Selected expiry requires both calls and puts with usable prices and deltas", expiry)
     short_call = _nearest(calls, 0.45)
     short_put = _nearest(puts, 0.45)
     if short_put.strike >= short_call.strike:
-        raise ValueError("Strategy short put strike must be below short call strike")
+        raise StrategyUnavailable("short_strike_order", "Strategy short put strike must be below short call strike", expiry)
     legs = [
         StrategyLeg(symbol=short_call.symbol, side="Sell", option_type="Call", strike=short_call.strike, delta=short_call.delta, qty=qty, mark_price=short_call.mark_price, target_delta=0.45),
         StrategyLeg(symbol=short_put.symbol, side="Sell", option_type="Put", strike=short_put.strike, delta=short_put.delta, qty=qty, mark_price=short_put.mark_price, target_delta=0.45),
@@ -48,7 +57,7 @@ def build_strategy(options: list[OptionInstrument], now: datetime, target_dte: i
         long_calls = [item for item in calls if item.strike > short_call.strike]
         long_puts = [item for item in puts if item.strike < short_put.strike]
         if not long_calls or not long_puts:
-            raise ValueError("Unable to find protective wings beyond short strikes")
+            raise StrategyUnavailable("missing_protective_wings", "Unable to find protective wings beyond short strikes", expiry)
         long_call = _nearest(long_calls, 0.10)
         long_put = _nearest(long_puts, 0.10)
         legs.extend([

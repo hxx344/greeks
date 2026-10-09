@@ -364,6 +364,33 @@ async function loadMarket() {
     $('modeTitle').textContent = enabled ? (config.environment === 'testnet' ? '测试网模式已启用' : '实盘模式已启用') : '模拟模式';
     $('modeText').textContent = enabled ? (config.environment === 'testnet' ? '确认后将向 Bybit 测试网发送订单。' : '确认后将向 Bybit 主网发送 BBO 限价订单。') : '不会向交易所发送订单。';
     updateTradeControls();
+    if (payload.status === 'strategy_unavailable') {
+      const message = payload.message || '当前合约暂不能组成所选策略，等待行情更新。';
+      const quoteTime = Date.parse(chain.updated_at || ''), quoteAge = Date.now() - quoteTime;
+      const staleSeconds = Number(config.quote_stale_seconds);
+      const validTime = Number.isFinite(quoteTime) && quoteAge >= 0 && Number.isFinite(staleSeconds) && staleSeconds > 0;
+      const fresh = validTime && quoteAge <= staleSeconds * 1000;
+      const quoteStatus = !validTime ? '行情时间待核对' : fresh ? '策略暂不可用' : '行情已过期';
+      const notice = fresh ? message : `${quoteStatus}，保留最近收到的真实盘口，等待更新。${message}`;
+      if (!validTime) window.__positionMarket = null;
+      if (!fresh) renderPositionPayoff();
+      clearStrategyDisplay(message);
+      window.__latestChain = chain.items || [];
+      $('chainPanel').dataset.availability = fresh ? 'ready' : validTime ? 'stale' : 'time_unknown';
+      renderChain(window.__latestChain, {expiry: chain.expiry, btc_price: chain.btc_price, legs: []});
+      $('expiry').textContent = `到期 ${new Date(chain.expiry).toLocaleDateString('zh-CN', {month: '2-digit', day: '2-digit', timeZone: 'UTC'})}`;
+      $('legSummary').textContent = '暂无可用策略';
+      $('marketNotice').textContent = notice;
+      $('marketNotice').hidden = false;
+      $('btcPrice').textContent = chain.btc_price ? money(chain.btc_price) : '--';
+      $('environment').textContent = modeLabel;
+      $('statusValue').dataset.state = config.trading_blocked_reason ? 'error' : 'waiting';
+      $('statusValue').textContent = config.trading_blocked_reason ? '交易已阻止' : quoteStatus;
+      $('statusSub').textContent = config.trading_blocked_reason || notice;
+      $('updateText').textContent = fresh ? '行情更新正常 · 策略等待' : `${quoteStatus} · 等待更新`;
+      $('updateDot').style.background = '#d6bc86';
+      return;
+    }
     if (payload.status === 'waiting_for_listing') {
       clearStrategyDisplay('等待周日到期合约上线');
       if (chain.expiry && chain.items?.length) {

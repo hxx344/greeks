@@ -428,6 +428,171 @@ async function readyStrategy(page, mode) {
   await deliverMarket(page, strategyMarket(mode));
 }
 
+function unavailableStrategyMarket(mode, environment = 'live') {
+  const payload = strategyMarket(mode), expiry = payload.preview.expiry;
+  Object.assign(payload.config, {environment, trading_enabled:true});
+  payload.chain = {source:'bybit', btc_price:102000, updated_at:new Date().toISOString(), expiry,
+    items:payload.preview.legs.map(leg => ({...leg, expiry, bid:leg.mark_price, ask:leg.mark_price + 10}))};
+  return {...payload, status:'strategy_unavailable', read_only:true, reason_code:'short_strike_order',
+    message:'当前报价下，卖出 Put 的行权价必须低于卖出 Call，暂不能组成所选策略。', preview:null};
+}
+
+test('strategy unavailability preserves real quotes and position spot, isolates opening controls, and recovers automatically', async (t) => {
+  for (const [mode, environment] of [['iron_condor', 'live'], ['short_strangle', 'testnet']]) {
+    await t.test(`${mode}/${environment}`, async () => {
+      const page = dashboard(), {context, element} = page;
+      await readyStrategy(page, mode);
+      const unavailable = unavailableStrategyMarket(mode, environment);
+      context.window.__positionError = false;
+      context.window.__positionSnapshot = [{symbol:'BTC-13Sep99-100000-C-USDT', side:'Buy', size:.1, avg_price:100, unrealised_pnl:3}];
+      const ready = {...strategyMarket(mode), config:unavailable.config, chain:unavailable.chain};
+      const previous = context.loadMarket(); await deliverMarket(page, ready); await previous;
+      assert.match(element('chain').innerHTML, /selected-mark/);
+      assert.notEqual(element('creditValue').textContent, '--');
+      element('confirm').checked = true;
+
+      const waiting = context.loadMarket(); await deliverMarket(page, unavailable); await waiting;
+      assert.equal(element('statusValue').textContent, '策略暂不可用');
+      assert.equal(element('statusValue').dataset.state, 'waiting');
+      assert.equal(element('statusSub').textContent, unavailable.message);
+      assert.equal(element('marketNotice').textContent, unavailable.message);
+      assert.equal(element('marketNotice').hidden, false);
+      assert.equal(element('updateText').textContent, '行情更新正常 · 策略等待');
+      assert.equal(element('environment').textContent, environment === 'testnet' ? 'TESTNET' : 'LIVE');
+      assert.equal(element('modeBox').dataset.mode, environment);
+      assert.equal(element('modeTitle').textContent, environment === 'testnet' ? '测试网模式已启用' : '实盘模式已启用');
+      assert.doesNotMatch(element('modeText').textContent, /备用|仅供查看|只读/);
+      assert.match(element('btcPrice').textContent, /102,000/);
+      assert.equal(element('chainPanel').dataset.availability, 'ready');
+      assert.match(element('chain').innerHTML, /600.00/);
+      assert.doesNotMatch(element('chain').innerHTML, /selected-mark|class="(?:atm )?selected"/);
+      assert.equal(element('legSummary').textContent, '暂无可用策略');
+      assert.equal(context.window.__latestChain.length, unavailable.chain.items.length);
+      assert.equal(context.window.__latestPreview, null);
+      assert.equal(context.window.__previewSelection, null);
+      for (const id of ['creditValue', 'lossValue', 'marginValue', 'maintenanceValue', 'costValue', 'rrValue']) assert.equal(element(id).textContent, '--');
+      assert.equal(element('legs').textContent, unavailable.message);
+      assert.equal(element('payoffStats').textContent, '等待可用策略');
+      assert.equal(context.window.__positionMarket.price, 102000);
+      assert.equal(context.window.__positionMarket.timestamp, Date.parse(unavailable.chain.updated_at));
+      assert.match(element('positionPayoffContent').innerHTML, /pp-spot-dot/);
+      assert.equal(element('openTrade').disabled, true);
+      assert.equal(element('rfqCreate').disabled, true);
+      assert.equal(element('closeTrade').disabled, false);
+      await context.openTrade(); await context.createRfq();
+      assert.equal(page.requests.filter(item => item.options?.method === 'POST').length, 0);
+
+      const recovering = context.loadMarket(); await deliverMarket(page, ready); await recovering;
+      assert.equal(element('statusValue').textContent, '策略就绪');
+      assert.equal(element('marketNotice').hidden, true);
+      assert.equal(context.window.__latestPreview.strategy_mode, mode);
+      assert.match(element('chain').innerHTML, /selected-mark/);
+      assert.equal(element('openTrade').disabled, false);
+      assert.equal(element('rfqCreate').disabled, false);
+      assert.equal(page.requests.filter(item => item.options?.method === 'POST').length, 0);
+
+      const failed = context.loadMarket();
+      page.pending.at(-1).resolve({ok:false, status:503, text:async () => JSON.stringify({detail:'行情已过期'})});
+      await failed;
+      assert.equal(element('statusValue').textContent, '行情异常');
+      assert.equal(element('statusSub').textContent, '行情已过期');
+      assert.equal(element('updateText').textContent, '等待重试');
+      assert.equal(context.window.__positionMarket, null);
+      assert.doesNotMatch(element('positionPayoffContent').innerHTML, /pp-spot-dot/);
+      assert.equal(element('chainPanel').dataset.availability, 'unavailable');
+      assert.equal(element('openTrade').disabled, true);
+    });
+  }
+});
+
+test('strategy unavailable responses that expire in transit retain the chain without claiming fresh quotes', async () => {
+  const page = dashboard(), {context, element} = page;
+  await new Promise(setImmediate);
+  const payload = unavailableStrategyMarket('iron_condor');
+  const sampledAt = Date.parse(payload.chain.updated_at), arrivedAt = sampledAt + 31000;
+  vm.runInContext(`Date.now = () => ${arrivedAt}`, context);
+  context.window.__positionError = false;
+  context.window.__positionSnapshot = [{symbol:'BTC-13Sep99-100000-C-USDT', side:'Buy', size:.1, avg_price:100, unrealised_pnl:3}];
+  await deliverMarket(page, payload);
+  assert.equal(element('statusValue').textContent, '行情已过期');
+  assert.equal(element('updateText').textContent, '行情已过期 · 等待更新');
+  assert.match(element('marketNotice').textContent, /保留最近收到的真实盘口/);
+  assert.match(element('marketNotice').textContent, /卖出 Put/);
+  assert.equal(element('chainPanel').dataset.availability, 'stale');
+  assert.match(element('chain').innerHTML, /600.00/);
+  assert.match(element('btcPrice').textContent, /102,000/);
+  assert.equal(context.window.__latestChain.length, payload.chain.items.length);
+  assert.equal(context.window.__positionMarket.timestamp, sampledAt);
+  assert.doesNotMatch(element('positionPayoffContent').innerHTML, /pp-spot-dot/);
+  assert.match(element('positionPayoffContent').innerHTML, /pp-line/);
+  assert.equal(element('openTrade').disabled, true);
+  assert.equal(element('rfqCreate').disabled, true);
+  assert.equal(element('closeTrade').disabled, false);
+  const refresh = context.loadMarket();
+  await deliverMarket(page, {...payload, chain:{...payload.chain, updated_at:new Date(arrivedAt).toISOString()}});
+  await refresh;
+  assert.equal(element('statusValue').textContent, '策略暂不可用');
+  assert.equal(element('updateText').textContent, '行情更新正常 · 策略等待');
+  assert.equal(element('chainPanel').dataset.availability, 'ready');
+  assert.match(element('positionPayoffContent').innerHTML, /pp-spot-dot/);
+  assert.equal(element('openTrade').disabled, true);
+});
+
+test('strategy unavailable responses with invalid or future timestamps cannot mark prices as fresh', async (t) => {
+  for (const [name, timestamp] of [['invalid', 'not-a-date'], ['missing', undefined], ['future', new Date(Date.now() + 60000).toISOString()]]) {
+    await t.test(name, async () => {
+      const page = dashboard(), {context, element} = page;
+      await new Promise(setImmediate);
+      const payload = unavailableStrategyMarket('iron_condor');
+      payload.chain.updated_at = timestamp;
+      context.window.__positionError = false;
+      context.window.__positionSnapshot = [{symbol:'BTC-13Sep99-100000-C-USDT', side:'Buy', size:.1, avg_price:100, unrealised_pnl:3}];
+      await deliverMarket(page, payload);
+      assert.equal(element('statusValue').textContent, '行情时间待核对');
+      assert.equal(element('updateText').textContent, '行情时间待核对 · 等待更新');
+      assert.equal(element('chainPanel').dataset.availability, 'time_unknown');
+      assert.match(element('chain').innerHTML, /600.00/);
+      assert.match(element('btcPrice').textContent, /102,000/);
+      assert.equal(context.window.__positionMarket, null);
+      assert.doesNotMatch(element('positionPayoffContent').innerHTML, /pp-spot-dot/);
+      assert.match(element('positionPayoffContent').innerHTML, /pp-line/);
+      assert.equal(element('openTrade').disabled, true);
+      assert.equal(element('rfqCreate').disabled, true);
+      assert.equal(element('closeTrade').disabled, false);
+    });
+  }
+});
+
+test('strategy unavailability preserves execution stop and existing close blockers', async (t) => {
+  for (const blocked of [false, true]) await t.test(blocked ? 'state error' : 'active execution', async () => {
+    const page = dashboard(), {context, element} = page;
+    const payload = unavailableStrategyMarket('iron_condor');
+    if (blocked) payload.config.trading_blocked_reason = 'State file unreadable';
+    context.renderOrders({items:[], groups:[executionGroup()], execution_active:true});
+    await deliverMarket(page, payload);
+    assert.equal(element('closeTrade').disabled, true);
+    assert.match(element('activeExecutions').innerHTML, /data-stop="execution-one" >停止执行/);
+    assert.equal(element('statusValue').textContent, blocked ? '交易已阻止' : '策略暂不可用');
+    assert.equal(element('statusSub').textContent, blocked ? 'State file unreadable' : payload.message);
+    context.renderOrders({items:[], groups:[], execution_active:false});
+    assert.equal(element('closeTrade').disabled, blocked);
+  });
+});
+
+test('an unavailable response from the previous strategy selection cannot replace the current selection', async () => {
+  const page = dashboard(), {context, element} = page;
+  element('strategyMode').value = 'short_strangle';
+  element('strategyMode').dispatch('change');
+  await deliverMarket(page, unavailableStrategyMarket('iron_condor'));
+  assert.equal(element('strategyMode').value, 'short_strangle');
+  assert.notEqual(element('statusValue').textContent, '策略暂不可用');
+  assert.equal(context.window.__latestPreview, null);
+  assert.equal(element('openTrade').disabled, true);
+  await deliverMarket(page, strategyMarket('short_strangle'));
+  assert.equal(element('statusValue').textContent, '策略就绪');
+  assert.equal(context.window.__latestPreview.strategy_mode, 'short_strangle');
+});
+
 test('mode changes clear confirmation and discard the old preview before showing an unbounded strategy', async () => {
   const page = dashboard(), {context, element, pending} = page;
   element('confirm').checked = true;
