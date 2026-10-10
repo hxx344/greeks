@@ -396,7 +396,7 @@ svg { display: block; }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; } *, *::before, *::after { transition: none !important; animation: none !important; }
 }
-.position-payoff-panel { margin-top: 24px; }
+.position-payoff-panel { margin: 0 0 24px; }
 .pp-group + .pp-group { border-top: 1px solid var(--line); margin-top: 28px; padding-top: 28px; }
 .pp-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
 .pp-heading h3 { font: 600 19px var(--mono); margin: 0; }
@@ -408,6 +408,7 @@ svg { display: block; }
 .pp-timing { display: flex; justify-content: space-between; gap: 12px; margin: 20px 0 10px; color: var(--quiet); font-size: 11px; }
 .pp-chart { overflow-x: auto; border-radius: 10px; background: #101613; }
 .pp-chart svg { width: 100%; max-height: 360px; }
+#position-payoff .pp-chart svg { max-width: 920px; height: auto; max-height: none; margin: auto; }
 .pp-chart text { fill: var(--muted); font: 11px var(--mono); }
 .pp-grid { stroke: var(--line-soft); stroke-width: 1; }
 .pp-strike { stroke: #36473c; stroke-dasharray: 3 6; }
@@ -418,6 +419,13 @@ svg { display: block; }
 .pp-spot { stroke: var(--warning); stroke-dasharray: 5 4; }
 .pp-spot-dot { fill: var(--warning); stroke: #29291e; stroke-width: 3; }
 .pp-chart .pp-spot-label { fill: var(--warning); font-weight: 600; }
+.pp-max-summary { display: flex; align-items: baseline; flex-wrap: wrap; gap: 7px 16px; margin: 14px 0; padding: 11px 14px; border-left: 2px solid var(--accent); background: #1c2c2380; color: var(--muted); font-size: 12px; line-height: 1.8; }
+.pp-max-summary strong { color: var(--text); font: 600 14px var(--mono); line-height: 1.8; overflow-wrap: anywhere; }
+.pp-max-band { fill: #a6d7b916; }
+.pp-max-line { fill: none; stroke: var(--accent); stroke-width: 3; vector-effect: non-scaling-stroke; }
+.pp-max-point { fill: var(--accent); stroke: var(--surface); stroke-width: 2; }
+.pp-chart .pp-max-label { fill: var(--accent); font: 600 12px var(--font); }
+.pp-grid, .pp-strike, .pp-zero, .pp-spot { vector-effect: non-scaling-stroke; }
 .pp-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 22px 0; }
 .pp-metrics > div { border-left: 1px solid var(--line); padding-left: 22px; }
 .pp-metrics > div:first-child { border-left: 0; padding-left: 0; }
@@ -430,7 +438,7 @@ svg { display: block; }
 .pp-warning { font-size: 12px; color: var(--warning); }
 .market-notice { margin: -4px 0 18px; padding: 11px 14px; border: 1px solid #5d5035; border-radius: 8px; background: #2b261c; color: var(--warning); font-size: 12px; line-height: 1.8; }
 @media (max-width: 600px) {
-  .position-payoff-panel { margin-top: 18px; }
+  .position-payoff-panel { margin: 0 0 18px; }
   .pp-heading { align-items: flex-start; flex-direction: column; gap: 12px; }
   .pp-heading h3 span { display: block; margin: 6px 0 0; }
   .pp-stage { padding: 7px 12px; font-size: 12px; }
@@ -492,8 +500,7 @@ svg { display: block; }
 .performance-sample-title { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin: 22px 0 12px; font-size: 12px; }
 .performance-sample-title span { font-size: 10px; font-weight: 400; color: var(--quiet); }
 .performance-detail .performance-fills { margin-top: 20px; }
-/* Fixed plans and combination-level execution are the primary reading path. */
-.orders-panel { margin: 0 0 22px; }
+/* Fixed plans and combination-level execution follow the option chain. */
 #heroExecution { color: var(--accent); }
 .execution-groups { display: grid; gap: 16px; }
 .execution-card { border: 1px solid var(--line); border-radius: 10px; padding: 18px; min-width: 0; }
@@ -545,7 +552,6 @@ button, summary { touch-action: manipulation; }
   .intro { margin-bottom: 16px; }
   .intro h1 { font-size: 23px; }
   .intro .kicker { font-size: 9px; margin-bottom: 5px; }
-  .orders-panel { margin: 0 0 18px; }
   .execution-card { padding: 14px; }
   .execution-card-head { gap: 12px; }
   .execution-card-head>div { width: 100%; }

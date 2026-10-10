@@ -32,15 +32,37 @@ function analyzePositionPayoff(group, spot) {
   const nodes = [0, ...strikes];
   const values = nodes.map(price => positionPayoffAt(price, legs));
   const slope = legs.filter(leg => leg.type === 'C').reduce((sum, leg) => sum + leg.quantity, 0);
-  const tolerance = 1e-8;
-  const max = slope > tolerance ? Infinity : Math.max(...values);
-  const min = slope < -tolerance ? -Infinity : Math.min(...values);
+  // Scale roundoff to this position so a small but real exposure is never treated as flat.
+  const quantityScale = legs.reduce((sum, leg) => sum + Math.abs(leg.quantity), 0);
+  const slopeTolerance = quantityScale * Number.EPSILON * 16;
+  const valueScale = legs.reduce((sum, leg) => sum + Math.abs(leg.quantity) * (leg.entry + Math.max(...nodes)), 0);
+  const tolerance = valueScale * Number.EPSILON * 16;
+  const segmentSlopes = nodes.slice(0, -1).map(price => legs.reduce((sum, leg) => sum +
+    (leg.type === 'C' && leg.strike <= price ? leg.quantity : leg.type === 'P' && leg.strike > price ? -leg.quantity : 0), 0));
+  const max = slope > slopeTolerance ? Infinity : Math.max(...values);
+  const min = slope < -slopeTolerance ? -Infinity : Math.min(...values);
+  const maxRanges = [];
+  if (Number.isFinite(max)) {
+    const atMax = value => Math.abs(value - max) <= tolerance;
+    for (let i = 0; i < nodes.length; i++) {
+      let end = i;
+      while (end < segmentSlopes.length && Math.abs(segmentSlopes[end]) <= slopeTolerance) end++;
+      const before = i ? segmentSlopes[i - 1] : Infinity;
+      const after = end < segmentSlopes.length ? segmentSlopes[end] : slope;
+      // Check the whole flat run is a local maximum: a tiny subsequent rise
+      // must not turn a lower plateau into a maximum through value rounding.
+      if (atMax(values[end]) && before >= -slopeTolerance && after <= slopeTolerance) {
+        maxRanges.push([nodes[i], end === nodes.length - 1 && Math.abs(after) <= slopeTolerance ? Infinity : nodes[end]]);
+      }
+      i = end;
+    }
+  }
   const roots = [];
   for (let i = 0; i < nodes.length; i++) {
-    if (Math.abs(values[i]) < tolerance) roots.push(nodes[i]);
+    if (Math.abs(values[i]) <= tolerance) roots.push(nodes[i]);
     if (i && values[i - 1] * values[i] < 0) roots.push(nodes[i - 1] - values[i - 1] * (nodes[i] - nodes[i - 1]) / (values[i] - values[i - 1]));
   }
-  if (Math.abs(slope) > tolerance) {
+  if (Math.abs(slope) > slopeTolerance) {
     const root = nodes.at(-1) - values.at(-1) / slope;
     if (root > nodes.at(-1)) roots.push(root);
   }
@@ -50,26 +72,40 @@ function analyzePositionPayoff(group, spot) {
     const key = `${leg.type}/${leg.strike}`;
     net.set(key, {...leg, quantity: (net.get(key)?.quantity || 0) + leg.quantity});
   }
-  const netLegs = [...net.values()].filter(leg => Math.abs(leg.quantity) > tolerance).sort((a, b) => a.strike - b.strike);
+  const netLegs = [...net.values()].filter(leg => Math.abs(leg.quantity) > slopeTolerance).sort((a, b) => a.strike - b.strike);
   const condor = netLegs.length === 4 && netLegs.map(leg => leg.type).join('') === 'PPCC' &&
     netLegs.every((leg, i) => i === 0 || leg.strike > netLegs[i - 1].strike) &&
-    netLegs.every((leg, i) => (i === 0 || i === 3 ? leg.quantity > 0 : leg.quantity < 0) && Math.abs(Math.abs(leg.quantity) - netLegs[0].quantity) < tolerance);
+    netLegs.every((leg, i) => (i === 0 || i === 3 ? leg.quantity > 0 : leg.quantity < 0) && Math.abs(Math.abs(leg.quantity) - netLegs[0].quantity) <= slopeTolerance);
   const current = Number.isFinite(spot) && spot > 0 ? positionPayoffAt(spot, legs) : null;
   let stage = '等待现价', tone = 'neutral';
   if (current !== null) {
     tone = current > .005 ? 'profit' : current < -.005 ? 'loss' : 'neutral';
     if (Math.abs(current) <= .005) stage = '盈亏平衡';
     else if (breaks.some(price => Math.abs(spot - price) / spot <= .001)) stage = '盈亏平衡附近';
-    else if (condor && current > 0 && Math.abs(current - max) < tolerance) stage = '最大盈利区';
-    else if (condor && current < 0 && Math.abs(current - min) < tolerance) stage = '最大亏损区';
+    else if (current > 0 && maxRanges.some(([start, end]) => spot >= start && spot <= end)) stage = '最大盈利区';
+    else if (condor && current < 0 && Math.abs(current - min) <= tolerance) stage = '最大亏损区';
     else stage = current > 0 ? (condor ? '盈利缓冲区' : '到期盈利区') : (condor ? '亏损扩大区' : '到期亏损区');
   }
-  const anchors = [...strikes, ...breaks, ...(current !== null ? [spot] : [])];
-  const pad = Math.max((Math.max(...anchors) - Math.min(...anchors)) * .16, strikes[0] * .03);
+  const anchors = [...strikes, ...breaks, ...maxRanges.filter(([start, end]) => start === end).map(([start]) => start), ...(current !== null ? [spot] : [])];
+  if (!anchors.length) anchors.push(0, 1);
+  const pad = Math.max((Math.max(...anchors) - Math.min(...anchors)) * .16, (strikes[0] || 1) * .03);
   const low = Math.max(0, Math.min(...anchors) - pad), high = Math.max(...anchors) + pad;
   const points = [low, ...strikes, ...breaks, ...(current !== null ? [spot] : []), high]
     .filter(price => price >= low && price <= high).sort((a, b) => a - b).map(price => ({price, pnl: positionPayoffAt(price, legs)}));
-  return {strikes, breaks, max, min, current, stage, tone, condor, low, high, points};
+  return {strikes, breaks, max, maxRanges, min, current, stage, tone, condor, low, high, points};
+}
+
+function positionPayoffRangeText([start, end]) {
+  const price = value => value.toLocaleString('en-US', {maximumFractionDigits: 20});
+  if (start === 0 && end === Infinity) return '全部非负价格（0–∞）';
+  if (start === end) return `${price(start)}（单点）`;
+  if (end === Infinity) return `≥${price(start)}`;
+  return `${price(start)}–${price(end)}`;
+}
+
+function positionPayoffMaxDescription(model) {
+  return model.max === Infinity ? '收益无上限，无有限最大收益区间' :
+    `${model.max > 0 ? '最大收益' : '最高盈亏'}对应 BTC 到期价格（USD）：${model.maxRanges.map(positionPayoffRangeText).join('；')}`;
 }
 
 function positionExpiryLabel(expiry, now = Date.now()) {
@@ -81,7 +117,24 @@ function positionExpiryLabel(expiry, now = Date.now()) {
 
 function positionPayoffSvg(model, spot, index, width = 920) {
   const unbounded = model.min === -Infinity;
-  const height = width < 600 ? 270 : 292, left = width < 600 ? 52 : 72, right = 28, top = unbounded ? 55 : 34, bottom = 42;
+  const onlyPoints = model.maxRanges.length && model.maxRanges.every(([start, end]) => start === end);
+  const maxTitle = `${model.max > 0 ? '最大收益' : '最高盈亏'}${onlyPoints ? '价格' : '区间'} · USD`;
+  const rangeParts = model.maxRanges.map(positionPayoffRangeText);
+  const labelLines = [];
+  const labelWidth = text => [...text].reduce((total, char) => total + (/[^\x00-\x7f]/.test(char) ? 12 : 7), 0);
+  let label = model.max === Infinity ? '收益无上限 · 无有限最大收益区间' : `${maxTitle} · `;
+  for (const part of rangeParts) {
+    const next = label + (label.endsWith(' · ') ? '' : '；') + part;
+    if (labelWidth(next) > width - 24 && label) { labelLines.push(label.replace(/ · $/, '')); label = part; }
+    else label = next;
+  }
+  labelLines.push(label);
+  if (labelLines.length > 3) labelLines.splice(0, labelLines.length, `${maxTitle} · 共 ${rangeParts.length} 段`, '完整到期价格见上方');
+  const maxLabel = labelLines.map((text, i) => `<text class="pp-max-label" x="${width / 2}" y="${19 + i * 18}" text-anchor="middle">${text}</text>`).join('');
+  const spotY = 19 + labelLines.length * 18;
+  const riskY = spotY + (model.current === null ? 0 : 19);
+  const top = (unbounded ? riskY : model.current === null ? spotY - 18 : spotY) + 19;
+  const height = (width < 600 ? 270 : 292) + top - 34, left = width < 600 ? 52 : 72, right = 28, bottom = 42;
   const values = model.points.map(point => point.pnl);
   const min = Math.min(0, ...values), max = Math.max(0, ...values), pad = Math.max((max - min) * .16, .1);
   const x = price => left + (price - model.low) / (model.high - model.low) * (width - left - right);
@@ -107,10 +160,22 @@ function positionPayoffSvg(model, spot, index, width = 920) {
     return `<text x="${n(x(price))}" y="${height - 12}" text-anchor="middle">${num(price, 0)}</text>`;
   }).join('');
   const strikeLines = model.strikes.map(price => `<line class="pp-strike" x1="${n(x(price))}" x2="${n(x(price))}" y1="${top}" y2="${height - bottom}"/>`).join('');
+  const maxBands = [], maxMarks = [];
+  for (const [start, end] of model.maxRanges) {
+    if (end < model.low || start > model.high) continue;
+    const x1 = n(x(Math.max(start, model.low))), x2 = n(x(Math.min(end, model.high))), peakY = n(y(model.max));
+    if (start === end) maxMarks.push(`<circle class="pp-max-point" cx="${x1}" cy="${peakY}" r="5"/>`);
+    else {
+      maxBands.push(`<rect class="pp-max-band" x="${x1}" y="${top}" width="${n(x2 - x1)}" height="${height - top - bottom}"/>`);
+      const leftArrow = start < model.low ? ` M${x1 + 5},${peakY - 4} L${x1},${peakY} L${x1 + 5},${peakY + 4}` : '';
+      const rightArrow = end > model.high ? ` M${x2 - 5},${peakY - 4} L${x2},${peakY} L${x2 - 5},${peakY + 4}` : '';
+      maxMarks.push(`<path class="pp-max-line" d="M${x1},${peakY} L${x2},${peakY}${leftArrow}${rightArrow}"/>`);
+    }
+  }
   const breaks = model.breaks.map(price => `<circle class="pp-break" cx="${n(x(price))}" cy="${n(y(0))}" r="4"><title>盈亏平衡 ${num(price)}</title></circle>`).join('');
-  const marker = model.current === null ? '' : `<line class="pp-spot" x1="${n(x(spot))}" x2="${n(x(spot))}" y1="${top}" y2="${height - bottom}"/><circle class="pp-spot-dot" cx="${n(x(spot))}" cy="${n(y(model.current))}" r="6"/><text class="pp-spot-label" x="${n(Math.max(left + 70, Math.min(width - right - 70, x(spot))))}" y="19" text-anchor="middle">BTC 现价 ${num(spot, 0)}</text>`;
-  const riskNote = unbounded ? `<text class="pp-risk-note" x="${left}" y="40">亏损无上限 · 图示价格范围有限</text>` : '';
-  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="持仓到期盈亏曲线。横轴 BTC 到期价格，纵轴盈亏。${model.stage}${unbounded ? '。亏损无上限，图示价格范围有限' : ''}">${grid}${strikeLines}<path class="pp-profit-fill" d="${fills.profit.join(' ')}"/><path class="pp-loss-fill" d="${fills.loss.join(' ')}"/><line class="pp-zero" x1="${left}" x2="${width-right}" y1="${n(y(0))}" y2="${n(y(0))}"/><path class="pp-line" d="${path}"/>${breaks}${marker}${ticks}${riskNote}</svg>`;
+  const marker = model.current === null ? '' : `<line class="pp-spot" x1="${n(x(spot))}" x2="${n(x(spot))}" y1="${top}" y2="${height - bottom}"/><circle class="pp-spot-dot" cx="${n(x(spot))}" cy="${n(y(model.current))}" r="6"/><text class="pp-spot-label" x="${n(Math.max(left + 70, Math.min(width - right - 70, x(spot))))}" y="${spotY}" text-anchor="middle">BTC 现价 ${num(spot, 0)}</text>`;
+  const riskNote = unbounded ? `<text class="pp-risk-note" x="${width / 2}" y="${riskY}" text-anchor="middle">亏损无上限 · 图示价格范围有限</text>` : '';
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="持仓到期盈亏曲线。横轴 BTC 到期价格，纵轴盈亏。${positionPayoffMaxDescription(model)}。${model.stage}${unbounded ? '。亏损无上限，图示价格范围有限' : ''}">${maxBands.join('')}${grid}${strikeLines}<path class="pp-profit-fill" d="${fills.profit.join(' ')}"/><path class="pp-loss-fill" d="${fills.loss.join(' ')}"/><line class="pp-zero" x1="${left}" x2="${width-right}" y1="${n(y(0))}" y2="${n(y(0))}"/><path class="pp-line" d="${path}"/>${maxMarks.join('')}${breaks}${marker}${ticks}${maxLabel}${riskNote}</svg>`;
 }
 
 function renderPositionPayoff() {
@@ -132,6 +197,7 @@ function renderPositionPayoff() {
     const stage = expired ? '已到期 · 等待结算确认' : model.stage;
     const date = new Date(group.expiry).toISOString().slice(0, 10);
     const metric = (label, value, tone = '') => `<div><span>${label}</span><strong class="${tone}">${value}</strong></div>`;
-    return `<article class="pp-group"><div class="pp-heading"><div><h3>${date}<span>08:00 UTC · ${esc(group.currency)}${group.source === 'demo' ? ' · 模拟持仓' : ''}</span></h3><p>${model.condor ? '铁鹰组合' : '期权组合'} · ${group.legs.length} 笔持仓 · 按实际数量与开仓均价</p></div><span class="pp-stage" data-tone="${expired ? 'neutral' : model.tone}">${stage}</span></div><div class="pp-timing"><span>${positionExpiryLabel(group.expiry)}</span><span>${fresh ? '现价随行情更新' : '行情不可用或已过期，暂不判断当前阶段'}</span></div><div class="pp-chart" tabindex="0" role="region" aria-label="持仓盈亏曲线，可横向滚动">${positionPayoffSvg(expired ? {...model, current: null} : model, spot, i, Math.max(300, Math.min(920, root.clientWidth || 920)))}</div><div class="pp-metrics">${metric('现价对应到期盈亏', !expired && model.current !== null ? money(model.current) : '--', model.tone)}${metric('当前浮动盈亏', group.floating === null ? '--' : money(group.floating), group.floating >= 0 ? 'profit' : 'loss')}${metric('最大到期收益', model.max === Infinity ? '无上限' : money(Math.max(0, model.max)))}${metric('最大到期亏损', model.min === -Infinity ? '无上限' : money(Math.max(0, -model.min)))}</div><div class="pp-boundaries"><span>盈亏平衡点 <b>${model.breaks.length ? model.breaks.map(value => money(value)).join(' / ') : '无独立交点'}</b></span><span>行权价 <b>${model.strikes.map(value => num(value, 0)).join(' / ')}</b></span></div></article>`;
+    const maxSummary = `<p class="pp-max-summary" data-tone="${model.max > 0 ? 'profit' : 'neutral'}"><span>${model.max > 0 ? '最大收益' : '最高盈亏'}对应 BTC 到期价格 · USD</span><strong>${model.max === Infinity ? '收益无上限，无有限最大收益区间' : model.maxRanges.map(positionPayoffRangeText).join('；')}</strong></p>`;
+    return `<article class="pp-group"><div class="pp-heading"><div><h3>${date}<span>08:00 UTC · ${esc(group.currency)}${group.source === 'demo' ? ' · 模拟持仓' : ''}</span></h3><p>${model.condor ? '铁鹰组合' : '期权组合'} · ${group.legs.length} 笔持仓 · 按实际数量与开仓均价</p></div><span class="pp-stage" data-tone="${expired ? 'neutral' : model.tone}">${stage}</span></div><div class="pp-timing"><span>${positionExpiryLabel(group.expiry)}</span><span>${fresh ? '现价随行情更新' : '行情不可用或已过期，暂不判断当前阶段'}</span></div>${maxSummary}<div class="pp-chart" tabindex="0" role="region" aria-label="持仓盈亏曲线，可横向滚动">${positionPayoffSvg(expired ? {...model, current: null} : model, spot, i, Math.max(300, Math.min(920, root.clientWidth || 920)))}</div><div class="pp-metrics">${metric('现价对应到期盈亏', !expired && model.current !== null ? money(model.current) : '--', model.tone)}${metric('当前浮动盈亏', group.floating === null ? '--' : money(group.floating), group.floating >= 0 ? 'profit' : 'loss')}${metric(model.max > 0 ? '最大到期收益' : '最高到期盈亏', model.max === Infinity ? '无上限' : money(model.max))}${metric('最大到期亏损', model.min === -Infinity ? '无上限' : money(Math.max(0, -model.min)))}</div><div class="pp-boundaries"><span>盈亏平衡点 <b>${model.breaks.length ? model.breaks.map(value => money(value)).join(' / ') : '无独立交点'}</b></span><span>行权价 <b>${model.strikes.map(value => num(value, 0)).join(' / ')}</b></span></div></article>`;
   }).join(''));
 }
