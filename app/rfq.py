@@ -8,11 +8,14 @@ from .models import Position, RfqCreateRequest, RfqExecuteRequest, RfqCancelRequ
 from .risk import leg_count, maximum_loss, strategy_mode as validate_mode, validate_structure
 
 
+RFQ_TERMINAL_STATUSES = {"Canceled", "Expired", "Filled", "Failed"}
+
+
 class RfqMixin:
     """RFQ lifecycle; public mutations share the engine transaction lock."""
 
-    def _rfq_unresolved(self) -> bool:
-        state = self.rfq_state
+    def _rfq_unresolved(self, state: dict | None = None) -> bool:
+        state = self.rfq_state if state is None else state
         if state.get("status") in {"ExecutionUnknown", "PendingFill", "CreationUnknown", "CancelUnknown"}:
             return True
         if state.get("status") == "Filled":
@@ -39,14 +42,28 @@ class RfqMixin:
         if not self.settings.bybit_api_key or not self.settings.bybit_api_secret:
             raise ValueError("Bybit API credentials are not configured")
         counterparties = list(request.counterparties)
-        rfq_config = {}
-        try:
-            rfq_config = await self.client.rfq_config()
-        except Exception as exc:
-            if not counterparties:
-                raise
-            self.log("WARNING", f"Could not load RFQ config; using specified counterparties: {exc}")
         mode = validate_mode(request.strategy_mode or self.settings.strategy_mode)
+
+        async def load_config():
+            try:
+                return await self.client.rfq_config()
+            except Exception as exc:
+                if not counterparties:
+                    raise
+                self.log("WARNING", f"Could not load RFQ config; using specified counterparties: {exc}")
+                return {}
+
+        reads = [asyncio.create_task(load_config()),
+                 asyncio.create_task(self.make_preview(request.quantity or self.settings.leg_qty, strategy_mode=mode))]
+        try:
+            rfq_config, preview = await asyncio.gather(*reads)
+        except BaseException:
+            # A failed or canceled request must leave no preview worker behind
+            # after the transaction lock is released.
+            for read in reads:
+                read.cancel()
+            await asyncio.gather(*reads, return_exceptions=True)
+            raise
         strategy_type = "custom"
         if mode == "iron_condor":
             for item in rfq_config.get("strategyTypes") or []:
@@ -63,7 +80,8 @@ class RfqMixin:
             counterparties = counterparties[:max_lp] if max_lp else counterparties
         if not counterparties:
             raise ValueError("Bybit returned no available RFQ counterparties")
-        preview = await self.make_preview(request.quantity or self.settings.leg_qty, strategy_mode=mode)
+        self._require_trading_state()
+        self._require_resolved_rfq()
         if preview.strategy_mode != mode:
             raise ValueError("Preview strategy mode does not match the RFQ request")
         self._validate_market_snapshot()
@@ -91,54 +109,103 @@ class RfqMixin:
                                "expires_at": result.get("expiresAt"), "updated_at": datetime.now(timezone.utc).isoformat()})
         self._save_state()
         self.log("INFO", f"RFQ created: {self.rfq_state['rfq_id']}")
-        return self.rfq_state
+        return deepcopy(self.rfq_state)
 
     async def refresh_rfq(self) -> dict:
-        if self.lock.locked() or self._trade_admitting:
-            return self.rfq_state
+        if self.lock.locked() or self._trade_admitting or getattr(self, "_rfq_refreshing", False):
+            return deepcopy(self.rfq_state)
         async with self.lock:
-            return await self._refresh_rfq()
+            self._require_trading_state()
+            snapshot = deepcopy(self.rfq_state)
+        if not self._rfq_needs_refresh(snapshot):
+            return snapshot
+        # Only public polls share this claim. Reconciliation already owns the
+        # engine lock and must never wait for a poll that needs it to apply.
+        self._rfq_refreshing = True
+        try:
+            observation = await self._fetch_rfq(snapshot)
+            if self.lock.locked() or self._trade_admitting:
+                return deepcopy(self.rfq_state)
+            async with self.lock:
+                self._require_trading_state()
+                if self.rfq_state != snapshot:
+                    return deepcopy(self.rfq_state)
+                return self._apply_rfq_observation(*observation)
+        finally:
+            self._rfq_refreshing = False
 
     async def _refresh_rfq(self, include_quotes: bool = True) -> dict:
+        """Refresh while the caller owns the engine lock (reconciliation)."""
         self._require_trading_state()
-        if not self.rfq_state.get("rfq_id") and not self.rfq_state.get("rfq_link_id"):
-            return self.rfq_state
-        rfq_id = self.rfq_state.get("rfq_id")
-        link = self.rfq_state.get("rfq_link_id")
+        snapshot = deepcopy(self.rfq_state)
+        if not self._rfq_needs_refresh(snapshot):
+            return snapshot
+        observation = await self._fetch_rfq(snapshot, include_quotes=include_quotes)
+        return self._apply_rfq_observation(*observation)
+
+    def _rfq_needs_refresh(self, state: dict) -> bool:
+        if not state.get("rfq_id") and not state.get("rfq_link_id"):
+            return False
+        return state.get("status") not in RFQ_TERMINAL_STATUSES or self._rfq_unresolved(state)
+
+    async def _fetch_rfq(self, snapshot: dict, include_quotes: bool = True) -> tuple[dict | None, list | None]:
+        """Read an isolated inquiry snapshot without mutating engine state."""
+        rfq_id = snapshot.get("rfq_id")
+        link = snapshot.get("rfq_link_id")
+
         def match(rows):
             if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
                 raise ValueError("Invalid RFQ response")
             return next((row for row in rows if (row.get("rfqId") == rfq_id if rfq_id else row.get("rfqLinkId") == link)), None)
+
         rows = await self.client.rfq_realtime(rfq_id) if rfq_id else await self.client.rfq_realtime(rfq_link_id=link)
         item = match(rows)
         if item is None:
             item = match(await self.client.rfq_history(rfq_id, rfq_link_id=link))
+        elif snapshot.get("status") == "CancelUnknown" and item.get("status") == "Active":
+            # The realtime endpoint can lag a cancellation. One bounded history
+            # lookup may confirm it, but an Active response never clears intent.
+            historical = match(await self.client.rfq_history(rfq_id, rfq_link_id=link))
+            if historical and historical.get("status") in RFQ_TERMINAL_STATUSES:
+                item = historical
         if item is None:
-            if self._rfq_unresolved():
+            if self._rfq_unresolved(snapshot):
                 raise ValueError("RFQ remains unknown in exchange realtime and history")
-            return self.rfq_state
+            return None, None
         status = item.get("status")
-        if status not in {"Active", "PendingFill", "Canceled", "Expired", "Filled", "Failed"}:
+        if status not in {"Active", "PendingFill", *RFQ_TERMINAL_STATUSES}:
             raise ValueError("Unknown exchange RFQ status")
         if not isinstance(item.get("rfqId"), str) or not item["rfqId"]:
             raise ValueError("RFQ response has no inquiry identity")
+        quotes = None
+        if include_quotes and status == "Active" and snapshot.get("status") != "CancelUnknown" and not snapshot.get("execution_resolved"):
+            quotes = await self.client.quote_realtime(item["rfqId"])
+        return item, quotes
+
+    def _apply_rfq_observation(self, item: dict | None, quotes: list | None) -> dict:
+        if item is None:
+            return deepcopy(self.rfq_state)
+        status = item["status"]
         # Terminal observations cannot regress when the exchange serves lagging data.
-        if self.rfq_state.get("execution_resolved") and status not in {"Filled", "Canceled", "Expired", "Failed"}:
-            return self.rfq_state
+        if self.rfq_state.get("execution_resolved") and status not in RFQ_TERMINAL_STATUSES:
+            return deepcopy(self.rfq_state)
+        # Keep the durable cancellation intent through every nonterminal
+        # observation, including PendingFill followed by a lagging Active.
+        if self.rfq_state.get("status") == "CancelUnknown" and status not in RFQ_TERMINAL_STATUSES:
+            return deepcopy(self.rfq_state)
         self.rfq_state.update({"rfq_id": item["rfqId"], "status": status,
                                "expires_at": item.get("expiresAt", self.rfq_state.get("expires_at"))})
         if not self.rfq_state.get("created_at") and item.get("createdAt"):
             self.rfq_state["created_at"] = datetime.fromtimestamp(float(item["createdAt"]) / 1000, timezone.utc).isoformat()
-        if status in {"Filled", "Canceled", "Expired", "Failed"}:
+        if status in RFQ_TERMINAL_STATUSES:
             self.rfq_state["execution_resolved"] = True
         if self.rfq_state.get("status") == "Filled":
             self._track_filled_rfq()
         self.rfq_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        if quotes is not None:
+            self.rfq_state["quotes"] = deepcopy(quotes)
         self._save_state()
-        if include_quotes and status == "Active":
-            self.rfq_state["quotes"] = await self.client.quote_realtime(self.rfq_state["rfq_id"])
-            self._save_state()
-        return self.rfq_state
+        return deepcopy(self.rfq_state)
 
     async def execute_rfq(self, request: RfqExecuteRequest) -> dict:
         self._admit_trading_operation()
@@ -295,11 +362,10 @@ class RfqMixin:
         if request.rfq_id != self.rfq_state.get("rfq_id"):
             raise ValueError("RFQ is not the active inquiry")
         self._require_resolved_rfq()
-        if self.rfq_state.get("status") != "Active":
+        if self.rfq_state.get("status") != "Active" or self.rfq_state.get("selected_quote_id"):
             raise ValueError("Only an active, unexecuted RFQ may be canceled")
         self.rfq_state.update(status="CancelUnknown", updated_at=datetime.now(timezone.utc).isoformat())
         self._save_state()
         result = await self.client.cancel_rfq(request.rfq_id)
-        await self._refresh_rfq(include_quotes=False)
         self.log("INFO", f"RFQ cancellation requested: {request.rfq_id}")
-        return {**self.rfq_state, "cancellation": result}
+        return deepcopy({**self.rfq_state, "cancellation": result})

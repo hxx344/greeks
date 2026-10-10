@@ -11,14 +11,17 @@ const previewStrategyMode = (preview) => preview?.strategy_mode ?? 'iron_condor'
 const unboundedPreview = (preview) => preview?.unbounded_loss === true || previewStrategyMode(preview) === 'short_strangle';
 let strategySelectionInitialized = false;
 const activeExecutionStatuses = new Set(['accepted', 'running', 'stopping', 'recovering', 'recovery_needed']);
-const tradeFlow = {lock: null, plan: null, generation: 0, pending: null, accepted: null, resolving: false, rfq: null, rfqConfirmation: null, stops: new Set(), stopStates: new Map()};
+const tradeFlow = {lock: null, plan: null, generation: 0, pending: null, accepted: null, resolving: false, rfq: null, rfqGeneration: 0, rfqMutation: null, rfqConfirmation: null, stops: new Set(), stopStates: new Map()};
 try { tradeFlow.pending = JSON.parse(window.localStorage.getItem('ic-pending-execution') || 'null'); } catch (_) { /* Ignore a damaged local recovery hint. */ }
 if (!tradeFlow.pending?.request_id || typeof tradeFlow.pending.request_id !== 'string') tradeFlow.pending = null;
 if (tradeFlow.pending?.request_id) tradeFlow.lock = 'recovering';
 const isActiveExecution = (group) => activeExecutionStatuses.has(group?.execution_status);
 const hasStopRequest = (group) => Boolean(group?.stop_requested === true || group?.stop_requested_at || group?.execution_status === 'stopping');
+const rfqTerminal = (state) => ['Filled', 'Canceled', 'Expired', 'Failed'].includes(state?.status);
+const activeRfq = (state) => Boolean(state?.rfq_id && !rfqTerminal(state));
 const transactionBusy = () => Boolean(tradeFlow.lock || tradeFlow.pending || tradeFlow.accepted || window.__executionActive
-  || (tradeFlow.rfq?.selected_quote_id && !['Filled', 'Canceled', 'Expired', 'Failed'].includes(tradeFlow.rfq.status)));
+  || ['CreationUnknown', 'CancelUnknown', 'ExecutionUnknown', 'PendingFill'].includes(tradeFlow.rfq?.status)
+  || (tradeFlow.rfq?.selected_quote_id && !rfqTerminal(tradeFlow.rfq)));
 
 function setTradeLock(action) {
   tradeFlow.lock = action;
@@ -76,7 +79,7 @@ $('toggleDepth')?.addEventListener('click', () => {
   for (const heading of document.querySelectorAll('.call-head, .put-head')) heading.colSpan = full ? 9 : 5;
 });
 
-async function getJson(url, options) {
+async function getJson(url, options, {notifyChange = true} = {}) {
   const response = await fetch(url, options);
   const raw = await response.text();
   let data;
@@ -86,7 +89,7 @@ async function getJson(url, options) {
     error.status = response.status;
     throw error;
   }
-  if (options?.method?.toUpperCase() === 'POST') window.ProjectHub.changed();
+  if (notifyChange && options?.method?.toUpperCase() === 'POST') window.ProjectHub.changed();
   if (url.includes('/api/trading/executions')) window.__latestExecutions = data.items || [];
   return data;
 }
@@ -294,10 +297,11 @@ function updateTradeControls() {
   $('closeTrade').textContent = tradeFlow.lock === 'closeTrade' ? '读取跟踪持仓…' : `核对${live ? '' : '模拟'}平仓已跟踪持仓`;
   $('openTrade').disabled = openingDisabled;
   $('closeTrade').disabled = busy || Boolean(window.__tradingBlocked);
-  $('rfqCreate').disabled = openingDisabled || (live && !$('confirm').checked);
+  $('rfqCreate').disabled = openingDisabled || activeRfq(tradeFlow.rfq) || (live && !$('confirm').checked);
   $('rfqCreate').textContent = tradeFlow.lock === 'rfqCreate' ? '创建中…' : '创建 RFQ ↗';
   for (const button of document.querySelectorAll('.rfq-execute')) button.disabled = busy || button.dataset.executable !== 'true' || Boolean(window.__tradingBlocked);
-  $('rfqCancel').disabled = Boolean(tradeFlow.rfq?.selected_quote_id || ['rfqExecute', 'rfqExecutionUnknown'].includes(tradeFlow.lock) || ['Filled', 'Canceled', 'Expired', 'Failed'].includes(tradeFlow.rfq?.status));
+  $('rfqCancel').disabled = busy || !tradeFlow.rfq?.rfq_id || tradeFlow.rfq.status !== 'Active' || Boolean(tradeFlow.rfq.selected_quote_id);
+  $('rfqCancel').textContent = tradeFlow.rfqMutation === 'rfqCancel' ? '取消中…' : tradeFlow.rfq?.status === 'CancelUnknown' ? '核对取消中…' : '取消询价';
   $('executionPending').hidden = !tradeFlow.pending && !tradeFlow.accepted;
   $('executionPending').textContent = tradeFlow.pending ? '提交结果待核对，正在按本次请求恢复任务；请勿重复提交。' : tradeFlow.accepted ? '任务已受理，正在同步组合进度。' : '';
   updatePlanControls();
@@ -809,31 +813,61 @@ function rfqStrategyLabel(state) {
   if (state.strategy_mode === 'iron_condor') return '四腿铁鹰';
   return `${(state.legs || []).length} 腿组合`;
 }
+function rfqStatusLabel(state) {
+  return ({CreationUnknown: '创建结果待核对', CancelUnknown: '取消已提交，待交易所确认', ExecutionUnknown: '执行结果待核对',
+    PendingFill: '已提交执行，等待成交', Canceled: '已取消', Expired: '已过期', Filled: '已成交', Failed: '失败'})[state?.status] || state?.status || '未创建';
+}
 function renderRfq(state) {
   tradeFlow.rfq = state;
   if (tradeFlow.lock === 'rfqExecutionUnknown' && (state?.selected_quote_id || ['Filled', 'Canceled', 'Expired', 'Failed'].includes(state?.status))) tradeFlow.lock = null;
   if (tradeFlow.lock === 'rfqExecutionUnknown' && tradeFlow.rfqRejectedId === state?.rfq_id && state?.status === 'Active' && !state.selected_quote_id) tradeFlow.lock = null;
   if (tradeFlow.lock === 'rfqCreateUnknown' && state?.rfq_id && state.rfq_id !== tradeFlow.previousRfqId) tradeFlow.lock = null;
   updateRfqConfirmation();
-  if (!state || !state.rfq_id || ['Canceled', 'Expired', 'Filled', 'Failed'].includes(state.status)) { $('rfqStatus').textContent = state?.status || '未创建'; $('rfqId').textContent = '--'; $('rfqType').textContent = '--'; $('rfqExpires').textContent = '--'; $('rfqQuoteCount').textContent = '0'; $('rfqQuotes').className = 'rfq-quotes empty'; $('rfqQuotes').textContent = '暂无活动 RFQ'; updateTradeControls(); return; }
-  $('rfqStatus').textContent = state.status || '--'; $('rfqId').textContent = state.rfq_id; $('rfqType').textContent = rfqStrategyLabel(state); $('rfqExpires').textContent = state.expires_at ? new Date(Number(state.expires_at)).toLocaleTimeString('zh-CN') : '--'; const quotes = (state.quotes || []).slice().sort((a, b) => { const aCount = quoteLegCount(a); const bCount = quoteLegCount(b); const total = (state.legs || []).length; if ((aCount >= total) !== (bCount >= total)) return aCount >= total ? -1 : 1; if ((aCount > 0) !== (bCount > 0)) return aCount > 0 ? -1 : 1; return quoteNet(b, 'Sell', state) - quoteNet(a, 'Sell', state); }); $('rfqQuoteCount').textContent = String(quotes.length);
+  if (!state || !state.rfq_id || rfqTerminal(state)) { $('rfqStatus').textContent = rfqStatusLabel(state); $('rfqId').textContent = '--'; $('rfqType').textContent = '--'; $('rfqExpires').textContent = '--'; $('rfqQuoteCount').textContent = '0'; $('rfqQuotes').className = 'rfq-quotes empty'; $('rfqQuotes').textContent = '暂无活动 RFQ'; updateTradeControls(); return; }
+  $('rfqStatus').textContent = rfqStatusLabel(state); $('rfqId').textContent = state.rfq_id; $('rfqType').textContent = rfqStrategyLabel(state); $('rfqExpires').textContent = state.expires_at ? new Date(Number(state.expires_at)).toLocaleTimeString('zh-CN') : '--'; const quotes = (state.quotes || []).slice().sort((a, b) => { const aCount = quoteLegCount(a); const bCount = quoteLegCount(b); const total = (state.legs || []).length; if ((aCount >= total) !== (bCount >= total)) return aCount >= total ? -1 : 1; if ((aCount > 0) !== (bCount > 0)) return aCount > 0 ? -1 : 1; return quoteNet(b, 'Sell', state) - quoteNet(a, 'Sell', state); }); $('rfqQuoteCount').textContent = String(quotes.length);
   $('rfqQuotes').className = quotes.length ? 'rfq-quotes' : 'rfq-quotes empty'; $('rfqQuotes').innerHTML = quotes.length ? quotes.map((quote) => { const legCount = quoteLegCount(quote); const complete = legCount >= (state.legs || []).length; const executable = complete && state.status === 'Active' && !state.selected_quote_id; const disabled = executable && !transactionBusy() ? '' : ' disabled title="报价不完整或询价已经提交/结束"'; const netDiff = quoteNetDiff(quote, state); return `<div class="rfq-quote"><div><strong>${esc(quote.deskCode || '做市商')} · ${legCount}/${(state.legs || []).length} 腿</strong><span>${esc(quote.status || '--')} · 到期 ${quote.expiresAt ? new Date(Number(quote.expiresAt)).toLocaleTimeString('zh-CN') : '--'}</span></div><div class="rfq-quote-values"><span>Sell 净额 ${quoteNet(quote, 'Sell', state).toFixed(4)}</span><span class="${netDiff >= 0 ? 'rfq-diff-positive' : 'rfq-diff-negative'}">链净额差 ${netDiff >= 0 ? '+' : ''}${netDiff.toFixed(4)}</span><span class="rfq-fee">预估手续费 ${rfqFeeEstimate(quote).toFixed(6)} USDT <small>预估费率0.03% · 单腿上限7%</small></span><button class="button ghost rfq-execute" data-rfq="${esc(quote.rfqId || state.rfq_id)}" data-quote="${esc(quote.quoteId || '')}" data-side="Sell" data-executable="${executable}"${disabled}>执行 Sell</button></div><div class="rfq-compare-title">Sell 报价方向 · 本次询价 ${(state.legs || []).length} 腿成交方向（Sell 用 Bid1，Buy 用 Ask1）</div><div class="rfq-leg-compare">${quoteLegComparison(quote, 'Sell', state) || '<span>无 Sell 方向报价</span>'}</div></div>`; }).join('') : '等待做市商报价';
   document.querySelectorAll('.rfq-execute').forEach((button) => button.addEventListener('click', executeRfq));
   updateTradeControls();
 }
-async function loadRfq() { const read = window.ProjectHub.begin('rfq'); if (!read) return; try { const payload = await getJson('/api/rfq/status'); if (read.current()) renderRfq(payload); } catch (error) { if (read.current()) $('rfqStatus').textContent = error.message; } finally { read.finish(); } }
+async function loadRfq() {
+  const read = window.ProjectHub.begin('rfq');
+  if (!read) return;
+  const generation = tradeFlow.rfqGeneration;
+  const current = () => read.current() && generation === tradeFlow.rfqGeneration && !tradeFlow.rfqMutation;
+  try {
+    if (tradeFlow.rfqMutation) return;
+    const payload = await getJson('/api/rfq/status');
+    if (current()) renderRfq(payload);
+  } catch (error) { if (current()) $('rfqStatus').textContent = `${rfqStatusLabel(tradeFlow.rfq)} · 状态同步失败：${error.message}`; }
+  finally { read.finish(); }
+}
+function beginRfqMutation(action) {
+  tradeFlow.rfqGeneration += 1;
+  tradeFlow.rfqMutation = action;
+  setTradeLock(action);
+}
+function finishRfqMutation(action, changed) {
+  // A read started before or during a write cannot replace its result or error.
+  tradeFlow.rfqGeneration += 1;
+  tradeFlow.rfqMutation = null;
+  if (tradeFlow.lock === action) tradeFlow.lock = null;
+  updateTradeControls();
+  if (changed) window.ProjectHub.changed(); else void loadRfq();
+}
 async function createRfq() {
-  if (transactionBusy()) return;
+  if (transactionBusy() || activeRfq(tradeFlow.rfq)) return;
+  let started = false, changed = false;
   try {
     const selection = openingSelection();
     tradeFlow.previousRfqId = tradeFlow.rfq?.rfq_id;
-    setTradeLock('rfqCreate');
-    await getJson('/api/rfq/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({...selection, counterparties:[]})});
-    await loadRfq();
+    beginRfqMutation('rfqCreate'); started = true;
+    const result = await getJson('/api/rfq/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({...selection, counterparties:[]})}, {notifyChange: false});
+    if (!result.rfq_id) throw new Error('RFQ 创建响应缺少询价标识');
+    renderRfq(result); changed = true;
   } catch (error) {
-    if (tradeFlow.lock === 'rfqCreate' && (!error.status || error.status >= 500)) setTradeLock('rfqCreateUnknown');
+    if (tradeFlow.lock === 'rfqCreate' && (!error.status || error.status >= 500 || [408, 429].includes(error.status))) setTradeLock('rfqCreateUnknown');
     showNotice(tradeFlow.lock === 'rfqCreateUnknown' ? 'RFQ 创建结果待核对，正在同步询价状态；请勿重复创建。' : error.message, '操作未完成', 'error');
-  } finally { if (tradeFlow.lock === 'rfqCreate') tradeFlow.lock = null; updateTradeControls(); }
+  } finally { if (started) finishRfqMutation('rfqCreate', changed); }
 }
 function rfqQuoteFingerprint(state, quote) { return JSON.stringify([state.rfq_id, state.legs, quote.quoteId, quote.quoteSellList, quote.expiresAt]); }
 function updateRfqConfirmation() {
@@ -865,29 +899,32 @@ async function submitRfqConfirmation() {
   if ($('rfqConfirmSubmit').disabled) return;
   const {rfq_id, quote_id, quote_side} = tradeFlow.rfqConfirmation;
   tradeFlow.rfqRejectedId = null;
-  setTradeLock('rfqExecute'); hideDialog('rfqConfirmDialog'); tradeFlow.rfqConfirmation = null;
+  beginRfqMutation('rfqExecute'); hideDialog('rfqConfirmDialog'); tradeFlow.rfqConfirmation = null;
+  let changed = false;
   try {
-    const result = await getJson('/api/rfq/execute', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({confirm_live: $('rfqConfirm').checked === true, rfq_id, quote_id, quote_side})});
+    const result = await getJson('/api/rfq/execute', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({confirm_live: $('rfqConfirm').checked === true, rfq_id, quote_id, quote_side})}, {notifyChange: false});
     renderRfq(result.rfq_id ? result : {...tradeFlow.rfq, selected_quote_id: quote_id, status: 'PendingFill'});
-    await loadRfq();
+    changed = true;
   } catch (error) {
     if (error.status >= 400 && error.status < 500 && ![408, 429].includes(error.status)) tradeFlow.rfqRejectedId = rfq_id;
     setTradeLock('rfqExecutionUnknown');
     showNotice(`RFQ 执行结果待核对：${error.message}。正在同步；取消询价不能撤回已提交执行。`, 'RFQ 执行状态', 'error');
-    void loadRfq();
-  } finally { if (tradeFlow.lock === 'rfqExecute') tradeFlow.lock = null; updateTradeControls(); }
+  } finally { finishRfqMutation('rfqExecute', changed); }
 }
 async function cancelRfq() {
-  if ($('rfqCancel').disabled || tradeFlow.cancellingRfq) return;
-  tradeFlow.cancellingRfq = true;
+  const state = tradeFlow.rfq;
+  if (transactionBusy() || !state?.rfq_id || state.status !== 'Active' || state.selected_quote_id) return;
+  beginRfqMutation('rfqCancel');
+  let changed = false;
   try {
-    const state = await getJson('/api/rfq/status?refresh=false');
-    if (!state.rfq_id) throw new Error('没有活动 RFQ');
-    if (state.selected_quote_id) throw new Error('报价已经提交执行，取消询价不能撤回执行，请核对成交。');
-    await getJson('/api/rfq/cancel', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({confirm_live: true, rfq_id: state.rfq_id})});
-    await loadRfq();
-  } catch (error) { showNotice(error.message, '询价取消结果', 'error'); }
-  finally { tradeFlow.cancellingRfq = false; }
+    const result = await getJson('/api/rfq/cancel', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({confirm_live: true, rfq_id: state.rfq_id})}, {notifyChange: false});
+    if (result.rfq_id !== state.rfq_id) throw new Error('RFQ 取消响应与当前询价不匹配');
+    renderRfq(result); changed = true;
+  } catch (error) {
+    const unknown = !error.status || error.status >= 500 || [408, 429].includes(error.status);
+    if (unknown) renderRfq({...state, status: 'CancelUnknown'});
+    showNotice(unknown ? `取消结果待核对：${error.message}。正在同步，请勿重复取消。` : error.message, '询价取消结果', 'error');
+  } finally { finishRfqMutation('rfqCancel', changed); }
 }
 $('rfqConfirm').addEventListener('change', updateRfqConfirmation);
 $('rfqConfirmSubmit').addEventListener('click', submitRfqConfirmation);

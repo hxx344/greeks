@@ -1214,3 +1214,228 @@ test('RFQ uses independent quote consent and preserves all button locks through 
   assert.equal(page.requests.filter(item => item.url === '/api/rfq/execute').length, 1);
   finish(jsonResponse({status:'Filled'})); await submitting;
 });
+
+function rfqState(overrides = {}) {
+  const legs = strategyMarket('short_strangle').preview.legs;
+  return {rfq_id:'rfq-one', status:'Active', strategy_mode:'short_strangle', legs,
+    quotes:[{quoteId:'quote-one', quoteSellList:legs.map(leg => ({symbol:leg.symbol, qty:leg.qty, price:600}))}], ...overrides};
+}
+
+async function deferredRfqPage() {
+  const reads = [], writes = [];
+  const page = dashboard({request(url, options) {
+    if (url.startsWith('/api/dashboard/market')) return Promise.resolve(jsonResponse(strategyMarket()));
+    if (url === '/api/rfq/status') return new Promise((resolve, reject) => reads.push({resolve, reject}));
+    if (options?.method === 'POST') return new Promise((resolve, reject) => writes.push({url, options, resolve, reject}));
+    return Promise.reject(new Error('offline'));
+  }});
+  await new Promise(setImmediate);
+  page.element('confirm').checked = true;
+  return {...page, reads, writes};
+}
+
+test('RFQ creation renders the POST state and releases its request before slow status reads or summary refresh', async () => {
+  const page = await deferredRfqPage(), notifications = [];
+  const changed = page.context.window.ProjectHub.changed;
+  page.context.window.ProjectHub.changed = () => {
+    notifications.push({id:page.element('rfqId').textContent, create:page.element('rfqCreate').textContent,
+      cancelDisabled:page.element('rfqCancel').disabled});
+    changed();
+  };
+  let completed = false;
+  const creation = page.context.createRfq().then(() => { completed = true; });
+  await page.context.createRfq();
+  assert.equal(page.writes.length, 1);
+  assert.equal(page.element('rfqCreate').textContent, '创建中…');
+  assert.equal(page.element('rfqCancel').disabled, true);
+  const created = rfqState({rfq_id:'new-rfq', quotes:[]});
+  page.writes[0].resolve(jsonResponse(created));
+  await new Promise(setImmediate);
+  assert.equal(completed, true, 'a pending status GET must not hold the create request open');
+  assert.deepEqual(notifications, [{id:'new-rfq', create:'创建 RFQ ↗', cancelDisabled:false}]);
+  assert.equal(page.element('rfqCreate').disabled, true, 'an active inquiry cannot be created twice');
+  assert.equal(page.writes[0].options.notifyChange, undefined);
+  assert.equal(page.writes[0].options.signal, undefined);
+  page.reads[0].resolve(jsonResponse(rfqState({rfq_id:'old-rfq'})));
+  await new Promise(setImmediate);
+  assert.equal(page.element('rfqId').textContent, 'new-rfq');
+  assert.equal(page.reads.length, 2, 'summary refresh continues with a fresh GET');
+  page.reads[1].resolve(jsonResponse({...created, quotes:rfqState().quotes}));
+  await new Promise(setImmediate);
+  assert.equal(page.element('rfqQuoteCount').textContent, '1');
+  assert.equal(page.writes.length, 1);
+  await creation;
+});
+
+test('RFQ cancel posts the displayed identity without a preflight GET and waits for exchange confirmation', async () => {
+  const page = await deferredRfqPage(), notifications = [];
+  page.context.renderRfq(rfqState());
+  const changed = page.context.window.ProjectHub.changed;
+  page.context.window.ProjectHub.changed = () => {
+    notifications.push({status:page.element('rfqStatus').textContent, cancel:page.element('rfqCancel').textContent});
+    changed();
+  };
+  const before = page.requests.length;
+  let completed = false;
+  const cancellation = page.context.cancelRfq().then(() => { completed = true; });
+  await page.context.cancelRfq();
+  assert.deepEqual(page.requests.slice(before).map(item => item.url), ['/api/rfq/cancel']);
+  assert.deepEqual(JSON.parse(page.writes[0].options.body), {confirm_live:true, rfq_id:'rfq-one'});
+  assert.equal(page.writes[0].options.signal, undefined);
+  assert.equal(page.element('rfqCancel').textContent, '取消中…');
+  for (const id of ['openTrade','closeTrade','rfqCreate','rfqCancel']) assert.equal(page.element(id).disabled, true);
+  page.writes[0].resolve(jsonResponse(rfqState({status:'CancelUnknown', cancellation:{}})));
+  await new Promise(setImmediate);
+  assert.equal(completed, true, 'cancel ACK must finish without awaiting the status GET');
+  assert.deepEqual(notifications, [{status:'取消已提交，待交易所确认', cancel:'核对取消中…'}]);
+  assert.match(page.element('rfqQuotes').innerHTML, /data-executable="false" disabled/);
+  page.reads[0].resolve(jsonResponse(rfqState()));
+  await new Promise(setImmediate);
+  assert.equal(page.element('rfqStatus').textContent, '取消已提交，待交易所确认');
+  assert.match(page.element('rfqQuotes').innerHTML, /data-executable="false" disabled/);
+  await page.context.cancelRfq(); await page.context.createRfq();
+  assert.equal(page.writes.length, 1, 'pending cancellation must never replay a write');
+  page.reads[1].resolve(jsonResponse(rfqState({status:'Canceled'})));
+  await new Promise(setImmediate);
+  assert.equal(page.element('rfqStatus').textContent, '已取消');
+  assert.equal(page.element('rfqId').textContent, '--');
+  assert.equal(page.element('rfqCancel').disabled, true);
+  assert.equal(page.element('rfqCreate').disabled, false);
+  await cancellation;
+});
+
+test('RFQ reads completed during a mutation or failed before it cannot replace its state or error', async (t) => {
+  for (const outcome of ['success', 'failure']) await t.test(outcome, async () => {
+    const page = await deferredRfqPage();
+    page.context.renderRfq(rfqState());
+    const cancellation = page.context.cancelRfq();
+    page.reads[0].resolve(jsonResponse(rfqState({rfq_id:'stale-rfq', status:'Canceled'})));
+    await new Promise(setImmediate);
+    assert.equal(page.element('rfqId').textContent, 'rfq-one');
+    assert.equal(page.element('rfqStatus').textContent, 'Active');
+    assert.equal(page.element('rfqCancel').textContent, '取消中…');
+    await page.context.loadRfq();
+    assert.equal(page.reads.length, 1, 'reads requested during a mutation wait for its completion');
+    if (outcome === 'success') page.writes[0].resolve(jsonResponse(rfqState({status:'Canceled'})));
+    else page.writes[0].reject(new Error('connection lost'));
+    await cancellation;
+    assert.equal(page.element('rfqCancel').textContent, outcome === 'success' ? '取消询价' : '核对取消中…');
+    assert.equal(page.reads.length, 2);
+    assert.equal(page.writes.length, 1);
+    if (outcome === 'failure') assert.match(page.element('noticeText').textContent, /取消结果待核对.*connection lost/);
+  });
+  const page = await deferredRfqPage();
+  page.context.renderRfq(rfqState());
+  const cancellation = page.context.cancelRfq();
+  page.writes[0].reject(new Error('write disconnected'));
+  await cancellation;
+  const status = page.element('rfqStatus').textContent, notice = page.element('noticeText').textContent;
+  page.reads[0].reject(new Error('old GET failure'));
+  await new Promise(setImmediate);
+  assert.equal(page.element('rfqStatus').textContent, status);
+  assert.equal(page.element('noticeText').textContent, notice);
+  assert.equal(page.element('rfqCancel').disabled, true);
+});
+
+test('RFQ uncertain creation preserves its recovery lock and only reads status after a lost write', async () => {
+  const page = await deferredRfqPage();
+  const creation = page.context.createRfq();
+  page.writes[0].reject(new Error('connection lost'));
+  await creation;
+  assert.equal(page.element('rfqCreate').textContent, '创建 RFQ ↗');
+  assert.equal(page.element('rfqCreate').disabled, true);
+  assert.match(page.element('noticeText').textContent, /创建结果待核对/);
+  page.reads[0].resolve(jsonResponse({}));
+  await new Promise(setImmediate);
+  await page.context.createRfq(); await page.context.cancelRfq();
+  assert.equal(page.writes.length, 1);
+  page.reads[1].resolve(jsonResponse(rfqState({rfq_id:'recovered-rfq'})));
+  await new Promise(setImmediate);
+  assert.equal(page.element('rfqId').textContent, 'recovered-rfq');
+  assert.equal(page.element('rfqCancel').disabled, false);
+  assert.equal(page.element('rfqCreate').disabled, true);
+});
+
+test('RFQ terminal or selected inquiries cannot be canceled and pending states immediately lock trading', async (t) => {
+  for (const state of [{}, rfqState({status:'Canceled'}), rfqState({status:'Filled'}),
+    rfqState({selected_quote_id:'quote-one'}), rfqState({status:'PendingFill'}), rfqState({status:'ExecutionUnknown'}),
+    rfqState({status:'CancelUnknown'}), rfqState({rfq_id:'', status:'CreationUnknown'})]) {
+    await t.test(`${state.status || 'empty'}${state.selected_quote_id ? ' selected' : ''}`, async () => {
+      const page = dashboard({embedded:true});
+      page.context.renderRfq(state);
+      assert.equal(page.element('rfqCancel').disabled, true);
+      await page.context.cancelRfq();
+      assert.equal(page.requests.length, 0);
+      if (['CreationUnknown','CancelUnknown','ExecutionUnknown','PendingFill'].includes(state.status)) {
+        for (const id of ['openTrade','closeTrade','rfqCreate']) assert.equal(page.element(id).disabled, true);
+        assert.doesNotMatch(page.element('rfqQuotes').innerHTML || '', /data-executable="true"/);
+      }
+    });
+  }
+});
+
+test('RFQ execution response settles before status reads and stale Active data cannot restore quote execution', async () => {
+  const page = await deferredRfqPage();
+  page.context.renderRfq(rfqState());
+  await page.context.executeRfq({currentTarget:{dataset:{rfq:'rfq-one', quote:'quote-one', side:'Sell'}}});
+  page.element('rfqConfirm').checked = true;
+  let completed = false;
+  const execution = page.context.submitRfqConfirmation().then(() => { completed = true; });
+  page.writes[0].resolve(jsonResponse(rfqState({status:'PendingFill', selected_quote_id:'quote-one'})));
+  await new Promise(setImmediate);
+  assert.equal(completed, true);
+  page.reads[0].resolve(jsonResponse(rfqState()));
+  await new Promise(setImmediate);
+  assert.equal(page.element('rfqStatus').textContent, '已提交执行，等待成交');
+  assert.match(page.element('rfqQuotes').innerHTML, /data-executable="false" disabled/);
+  assert.equal(page.element('rfqCancel').disabled, true);
+  await page.context.cancelRfq();
+  assert.equal(page.writes.length, 1);
+  await execution;
+});
+
+test('RFQ execution failures preserve unknown locks until fresh evidence resolves the submitted quote', async (t) => {
+  for (const failure of ['network', 'rejected']) await t.test(failure, async () => {
+    const page = await deferredRfqPage();
+    page.context.renderRfq(rfqState());
+    await page.context.executeRfq({currentTarget:{dataset:{rfq:'rfq-one', quote:'quote-one', side:'Sell'}}});
+    page.element('rfqConfirm').checked = true;
+    const execution = page.context.submitRfqConfirmation();
+    if (failure === 'network') page.writes[0].reject(new Error('connection lost'));
+    else page.writes[0].resolve({ok:false, status:400, text:async () => JSON.stringify({detail:'quote rejected'})});
+    await execution;
+    assert.match(page.element('noticeText').textContent, /执行结果待核对/);
+    assert.equal(page.element('rfqCancel').disabled, true);
+    page.reads[0].resolve(jsonResponse(rfqState()));
+    await new Promise(setImmediate);
+    assert.equal(page.element('rfqCancel').disabled, true, 'an old Active snapshot is not recovery evidence');
+    await page.context.cancelRfq(); await page.context.createRfq();
+    assert.equal(page.writes.length, 1);
+    page.reads[1].resolve(jsonResponse(rfqState()));
+    await new Promise(setImmediate);
+    assert.equal(page.element('rfqCancel').disabled, failure === 'network', 'only an explicit rejection plus fresh Active can release the execution lock');
+    if (failure === 'network') {
+      const reconciliation = page.context.loadRfq();
+      page.reads[2].resolve(jsonResponse(rfqState({status:'Filled', selected_quote_id:'quote-one', tracking_applied:true})));
+      await reconciliation;
+      assert.equal(page.element('rfqStatus').textContent, '已成交');
+      assert.equal(page.element('closeTrade').disabled, false);
+    }
+  });
+});
+
+test('RFQ terminal refresh preserves unrelated transaction and server opening blockers', async () => {
+  const page = await deferredRfqPage();
+  page.context.setTradeLock('recovering');
+  page.context.window.__openingBlocked = true;
+  page.context.renderRfq(rfqState({status:'Canceled'}));
+  assert.equal(page.element('openTrade').disabled, true);
+  assert.equal(page.element('closeTrade').disabled, true);
+  assert.equal(page.element('rfqCreate').disabled, true);
+  page.context.setTradeLock(null);
+  assert.equal(page.element('closeTrade').disabled, false);
+  assert.equal(page.element('openTrade').disabled, true);
+  assert.equal(page.element('rfqCreate').disabled, true);
+  await page.context.createRfq();
+  assert.equal(page.writes.length, 0);
+});
