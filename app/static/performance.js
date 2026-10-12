@@ -1,31 +1,38 @@
 function performanceChart(series, width = 920) {
-  const points = (series.points || []).slice().sort((a,b) => Date.parse(a.time) - Date.parse(b.time));
+  const points = (series.points || []).map(point => ({point, time: Date.parse(point.time)})).sort((a,b) => a.time - b.time);
   if (!points.length) return `<div class="empty">${series.holding ? '暂无持仓期间采样。开始采集后显示真实盈亏路径，历史缺失时段无法还原。' : '暂无已核实的到期结束组合。提前平仓和持仓中的组合仅在下方展示。'}</div>`;
   const height = 280, left = width < 600 ? 60 : 80, right = 24, top = 24, bottom = 44;
-  const values = [0, ...points.map(point => Number(point.cumulative))];
+  const values = [0, ...points.map(({point}) => Number(point.cumulative))];
   const min = values.reduce((a,b)=>Math.min(a,b),0), max = values.reduce((a,b)=>Math.max(a,b),0), pad = Math.max((max - min) * .15, 1);
-  const firstTime = Date.parse(points[0].time), lastTime = Date.parse(points.at(-1).time);
-  const x = point => firstTime === lastTime ? (left + width - right) / 2 : left + (Date.parse(point.time) - firstTime) / (lastTime - firstTime) * (width - left - right);
+  const firstTime = points[0].time, lastTime = points.at(-1).time;
+  const x = time => firstTime === lastTime ? (left + width - right) / 2 : left + (time - firstTime) / (lastTime - firstTime) * (width - left - right);
   const y = value => top + (max + pad - value) / (max - min + pad * 2) * (height - top - bottom);
   const n = value => Number(value.toFixed(2));
+  for (const sample of points) {
+    sample.x = x(sample.time);
+    sample.y = y(sample.point.cumulative);
+  }
   let path = '', gaps = 0;
-  points.forEach((point, i) => {
+  points.forEach((sample, i) => {
     const previous = points[i-1];
-    if (!previous || Date.parse(point.time) - Date.parse(previous.time) > (series.sample_seconds || 60) * 3000) {
-      path += ` M${n(x(point))},${n(y(point.cumulative))}`;
+    if (!previous || sample.time - previous.time > (series.sample_seconds || 60) * 3000) {
+      path += ` M${n(sample.x)},${n(sample.y)}`;
       if (previous) gaps++;
     } else {
       // Bounded cubic interpolation passes through actual samples without inventing extrema.
-      const third = (x(point) - x(previous)) / 3;
-      path += ` C${n(x(previous)+third)},${n(y(previous.cumulative))} ${n(x(point)-third)},${n(y(point.cumulative))} ${n(x(point))},${n(y(point.cumulative))}`;
+      const third = (sample.x - previous.x) / 3;
+      path += ` C${n(previous.x+third)},${n(previous.y)} ${n(sample.x-third)},${n(sample.y)} ${n(sample.x)},${n(sample.y)}`;
     }
   });
   const labelTimes = [...new Set([firstTime, firstTime + (lastTime - firstTime) / 2, lastTime])];
-  const labels = labelTimes.map((time,i) => `<text x="${n(x({time:new Date(time).toISOString()}))}" y="${height - 12}" text-anchor="${labelTimes.length === 1 ? 'middle' : i === 0 ? 'start' : i === labelTimes.length - 1 ? 'end' : 'middle'}">${new Date(time).toISOString().slice(firstTime === lastTime || lastTime-firstTime<86400000 ? 11 : 5, firstTime === lastTime || lastTime-firstTime<86400000 ? 16 : 10)}</text>`).join('');
+  const labels = labelTimes.map((time,i) => {
+    const date = new Date(time);
+    return `<text x="${n(x(date.getTime()))}" y="${height - 12}" text-anchor="${labelTimes.length === 1 ? 'middle' : i === 0 ? 'start' : i === labelTimes.length - 1 ? 'end' : 'middle'}">${date.toISOString().slice(firstTime === lastTime || lastTime-firstTime<86400000 ? 11 : 5, firstTime === lastTime || lastTime-firstTime<86400000 ? 16 : 10)}</text>`;
+  }).join('');
   const grid = [min, (min + max) / 2, max].filter((v, i, all) => all.indexOf(v) === i).map(value =>
     `<line class="pp-grid" x1="${left}" x2="${width-right}" y1="${n(y(value))}" y2="${n(y(value))}"/><text x="${left-10}" y="${n(y(value)+4)}" text-anchor="end">${num(value, Math.abs(value) < 10 ? 2 : 0)}</text>`).join('');
-  const dots = points.map((point, i) => (i % Math.max(1, Math.ceil(points.length / 80)) === 0 || i === points.length - 1 || point.terminal) ? `<circle class="performance-point" cx="${n(x(point))}" cy="${n(y(point.cumulative))}" r="${point.terminal ? 4 : 2}"><title>${esc(point.group_id || '')} · ${esc(point.time)} · ${point.terminal ? '结束净收益' : '真实采样'} ${money(point.pnl)} · 曲线值 ${money(point.cumulative)} ${esc(series.currency)}</title></circle>` : '').join('');
-  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${series.holding ? '单次组合持仓盈亏采样曲线' : '仅到期结束组合综合收益采样曲线'}，横轴为实际时间。${points.length} 个记录点，缺失区间断开显示。">${grid}<line class="pp-zero" x1="${left}" x2="${width-right}" y1="${n(y(0))}" y2="${n(y(0))}"/><path class="pp-line" d="${path}"/>${dots}${labels}</svg><p class="performance-sample-note">${points.filter(p=>!p.terminal).length} 个真实采样点 · UTC${gaps ? ` · ${gaps} 段采样缺口已断开` : ''}${points.every(p=>p.terminal) ? ' · 历史无持仓采样，仅显示结束净收益点' : ''}</p>`;
+  const dots = points.map(({point, x, y}, i) => (i % Math.max(1, Math.ceil(points.length / 80)) === 0 || i === points.length - 1 || point.terminal) ? `<circle class="performance-point" cx="${n(x)}" cy="${n(y)}" r="${point.terminal ? 4 : 2}"><title>${esc(point.group_id || '')} · ${esc(point.time)} · ${point.terminal ? '结束净收益' : '真实采样'} ${money(point.pnl)} · 曲线值 ${money(point.cumulative)} ${esc(series.currency)}</title></circle>` : '').join('');
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${series.holding ? '单次组合持仓盈亏采样曲线' : '仅到期结束组合综合收益采样曲线'}，横轴为实际时间。${points.length} 个记录点，缺失区间断开显示。">${grid}<line class="pp-zero" x1="${left}" x2="${width-right}" y1="${n(y(0))}" y2="${n(y(0))}"/><path class="pp-line" d="${path}"/>${dots}${labels}</svg><p class="performance-sample-note">${points.filter(({point})=>!point.terminal).length} 个真实采样点 · UTC${gaps ? ` · ${gaps} 段采样缺口已断开` : ''}${points.every(({point})=>point.terminal) ? ' · 历史无持仓采样，仅显示结束净收益点' : ''}</p>`;
 }
 
 function renderPerformance(payload) {

@@ -215,6 +215,72 @@ test('sampled charts use real time, bounded smooth paths, and break at missing s
   assert.doesNotMatch(old, / C/);
 });
 
+test('performance samples sort by actual time without reordering ties or mutating the input', () => {
+  const {context} = dashboard({embedded:true});
+  const points = Object.freeze([
+    {group_id:'latest',time:'2026-09-01T00:02:00Z',cumulative:3,pnl:3},
+    {group_id:'same-first',time:'2026-09-01T00:01:00Z',cumulative:2,pnl:2},
+    {group_id:'earliest',time:'2026-09-01T00:00:00Z',cumulative:-1,pnl:-1},
+    {group_id:'same-second',time:'2026-09-01T01:01:00+01:00',cumulative:4,pnl:4},
+  ].map(Object.freeze));
+  const before = JSON.stringify(points);
+  const chart = context.performanceChart({currency:'USDC',points},310);
+  const marks = [...chart.matchAll(/<circle[^>]+cx="([^"]+)"[^>]*><title>([^<]+)<\/title><\/circle>/g)];
+  assert.deepEqual(marks.map(mark => mark[2].split(' · ')[0]), ['earliest','same-first','same-second','latest']);
+  assert.deepEqual(marks.map(mark => Number(mark[1])), [60,173,173,286]);
+  assert.ok(marks.every(mark => mark[2].endsWith(' USDC')));
+  assert.equal(JSON.stringify(points), before);
+  assert.doesNotMatch(chart, /NaN|Infinity|采样缺口已断开/);
+});
+
+test('single samples and equal timestamps stay centered and keep terminal evidence', () => {
+  const {context} = dashboard({embedded:true});
+  const first = {group_id:'start',time:'2026-09-01T00:00:00Z',cumulative:-2,pnl:-2};
+  for (const points of [[first], [first,{...first,group_id:'end',cumulative:3,pnl:3,terminal:true}]]) {
+    const chart = context.performanceChart({holding:true,currency:'USDT',points},310);
+    const marks = [...chart.matchAll(/<circle[^>]+cx="([^"]+)"/g)];
+    assert.equal(marks.length, points.length);
+    assert.ok(marks.every(mark => Number(mark[1]) === 173));
+    assert.equal((chart.match(/y="268" text-anchor="middle"/g) || []).length, 1);
+    assert.equal((chart.match(/ C/g) || []).length, points.length - 1);
+    assert.match(chart, /单次组合持仓盈亏采样曲线/);
+    assert.doesNotMatch(chart, /NaN|Infinity|采样缺口已断开/);
+    if (points.length === 2) assert.match(chart, /r="4"><title>end · .*结束净收益 \$3/);
+  }
+});
+
+test('performance gaps start only beyond three sampling intervals and never bridge missing data', () => {
+  const {context} = dashboard({embedded:true});
+  const chart = context.performanceChart({currency:'USDT',sample_seconds:60,points:[
+    {time:'2026-09-01T00:00:00.000Z',cumulative:0,pnl:0},
+    {time:'2026-09-01T00:03:00.000Z',cumulative:4,pnl:4},
+    {time:'2026-09-01T00:06:00.001Z',cumulative:-2,pnl:-2,terminal:true},
+  ]},310);
+  const path = chart.match(/<path class="pp-line" d="([^"]+)"/)[1];
+  assert.equal((path.match(/ M/g) || []).length, 2);
+  assert.equal((path.match(/ C/g) || []).length, 1);
+  assert.match(chart, /1 段采样缺口已断开/);
+  assert.match(chart, /2 个真实采样点/);
+  assert.match(chart, /cx="286"[^>]*r="4"/);
+});
+
+test('large performance histories keep terminal and final markers with a linear timestamp parsing budget', () => {
+  const {context} = dashboard({embedded:true});
+  const start = Date.parse('2026-09-01T00:00:00Z');
+  const points = Array.from({length:1000}, (_, index) => ({group_id:`sample-${index}`,
+    time:new Date(start + index * 60000).toISOString(), cumulative:index % 11 - 5, pnl:index % 11 - 5,
+    terminal:index === 7})).reverse();
+  vm.runInContext('globalThis.dateParseCalls = 0; const originalDateParse = Date.parse; Date.parse = (...args) => { dateParseCalls++; return originalDateParse(...args); };', context);
+  const chart = context.performanceChart({currency:'USDT',sample_seconds:60,points});
+  assert.ok(context.dateParseCalls <= points.length + 3, `timestamp parses must stay linear: ${context.dateParseCalls}`);
+  const titles = [...chart.matchAll(/<circle[^>]*><title>([^<]+)<\/title><\/circle>/g)].map(match => match[1]);
+  assert.equal(titles.length, 79, 'sparse markers still include the terminal point and final sample');
+  assert.ok(titles.some(title => title.startsWith('sample-7 · ') && title.includes('结束净收益')));
+  assert.ok(titles.at(-1).startsWith('sample-999 · '));
+  assert.match(chart, /999 个真实采样点/);
+  assert.doesNotMatch(chart, /NaN|Infinity|采样缺口已断开/);
+});
+
 test('testnet mode requires separate plan confirmation and reports exchange fills as testnet', async () => {
   const {context, element, pending} = dashboard();
   const payload = marketPayload(false);
