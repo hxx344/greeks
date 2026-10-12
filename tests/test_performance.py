@@ -132,6 +132,69 @@ class PerformanceTests(unittest.TestCase):
         self.assertEqual(report["groups"][0]["status"], "pending")
         self.assertEqual(report["series"], [])
 
+    def test_shared_symbol_ownership_is_rechecked_after_a_close_and_position_changes(self):
+        records = [fill("a-open", "Buy", 1, 100, 1, 0), fill("b-open", "Buy", 1, 120, 1, 0, "b")]
+        position = Position(symbol=SYMBOL, side="Buy", size=1, avg_price=100,
+                            mark_price=130, unrealised_pnl=30, source="bybit")
+        report = build_performance({}, records, {}, {}, [position], True)
+        self.assertTrue(all(row["floating_pnl"] is None for row in report["groups"]))
+        records.append(fill("b-close", "Sell", 1, 125, 1, 1, "bc", "b"))
+        current = {row["id"]: row for row in build_performance({}, records, {}, {}, [position], True)["groups"]}
+        self.assertEqual(current["a"]["floating_pnl"], 30)
+        self.assertEqual(current["b"]["net_pnl"], 3)
+        self.assertIsNone(current["b"]["floating_pnl"])
+        # Duplicate live observations never provide unique ownership evidence.
+        duplicate = build_performance({}, records, {}, {}, [position, position], True)
+        self.assertTrue(all(row["floating_pnl"] is None for row in duplicate["groups"]))
+        changed = position.model_copy(update={"mark_price": 140})
+        refreshed = {row["id"]: row for row in build_performance({}, records, {}, {}, [changed], True)["groups"]}
+        self.assertEqual(refreshed["a"]["floating_pnl"], 40)
+
+    def test_journal_pending_flags_and_corrections_stay_with_the_linked_group(self):
+        groups = {"a": {"type": "open"}, "b": {"type": "open"}, "ac": {"type": "close", "opening_group": "a"}}
+        records = [fill("a-open", "Buy", 1, 100, 1, 0), fill("b-open", "Sell", 1, 120, 1, 0, "b")]
+        links = {"a-journal": "a", "b-journal": "b", "close-journal": "ac"}
+        journal = {
+            "a-journal": dict(symbol=SYMBOL, side="Buy", filledQty=1, reduce_only=False, terminal=True),
+            "b-journal": dict(symbol=SYMBOL, side="Sell", filledQty=1, reduce_only=False, terminal=False),
+            "close-journal": dict(symbol=SYMBOL, side="Sell", filledQty=0, reduce_only=True, terminal=False),
+            "unrelated": {},  # Unlinked account orders are never interpreted as strategy fills.
+        }
+        report = {row["id"]: row for row in build_performance(groups, records, links, journal)["groups"]}
+        self.assertEqual(report["a"]["issues"], ["平仓成交仍待确认"])
+        self.assertEqual(report["b"]["issues"], ["开仓成交仍待确认"])
+        journal["b-journal"]["terminal"] = journal["close-journal"]["terminal"] = True
+        self.assertTrue(all(row["status"] == "open" for row in build_performance(groups, records, links, journal)["groups"]))
+        journal["b-journal"]["filledQty"] = 2
+        corrected = {row["id"]: row for row in build_performance(groups, records, links, journal)["groups"]}
+        self.assertEqual(corrected["a"]["issues"], [])
+        self.assertEqual(corrected["b"]["issues"], ["开仓成交历史尚未补齐"])
+
+    def test_fifo_decimal_fees_and_missing_close_owners_survive_reordered_history(self):
+        records = [fill("open1", "Sell", 2, 100, 2, 0), fill("open2", "Sell", 1, 120, 1, 1),
+                   fill("close1", "Buy", 2.5, 90, .5, 2, "c", "a"),
+                   fill("unknown", "Buy", 1, 90, 1, 2, "c2", "missing"),
+                   fill("manual", "Buy", 1, 90, 1, 2, "c3").model_copy(update={"reduce_only": True})]
+        report = build_performance({}, list(reversed(records)) + [records[0]], {}, {})
+        self.assertEqual(report["unassigned_closes"], 2)
+        self.assertEqual(len(report["groups"]), 1)
+        self.assertEqual(report["groups"][0]["net_pnl"], 32)
+        self.assertEqual(report["groups"][0]["remaining_qty"], .5)
+        self.assertEqual(report["groups"][0]["status"], "open")
+        records.append(fill("close2", "Buy", .5, 130, -.1, 3, "c4", "a"))
+        closed = build_performance({}, records, {}, {})["groups"][0]
+        self.assertEqual(closed["net_pnl"], 26.6)
+        self.assertEqual(closed["remaining_qty"], 0)
+
+    def test_unmatched_early_reduction_still_excludes_verified_expiry(self):
+        groups = {"a": self.expiry_group(), "close": {"type": "close", "opening_group": "a"}}
+        records = [fill("open", "Sell", 1, 100, 1, 0),
+                   fill("oversized", "Buy", 2, 50, 0, 1, "close")]
+        report = build_performance(groups, records, {}, {})
+        self.assertEqual(report["groups"][0]["status"], "closed")
+        self.assertEqual(report["groups"][0]["closure_kind"], "early")
+        self.assertEqual(report["series"], [])
+
 
 class PerformancePersistenceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

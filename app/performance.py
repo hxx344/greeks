@@ -51,6 +51,21 @@ def option_expiry(symbol):
 
 def build_performance(groups, executions, links, journal, positions=(), positions_available=False, samples=None, sample_seconds=60):
     """Only uniquely attributable, completely reconciled round trips enter the curve."""
+    # These indexes live for one report only; corrected history and current
+    # position availability are reconsidered on every call.
+    expiries_by_symbol = {}
+
+    def expiry_for(symbol):
+        if symbol not in expiries_by_symbol:
+            expiries_by_symbol[symbol] = option_expiry(symbol)
+        return expiries_by_symbol[symbol]
+
+    journal_by_group, pending_closes = {}, set()
+    for link, entry in journal.items():
+        group_id = links.get(link)
+        journal_by_group.setdefault(group_id, []).append(entry)
+        if group_id in groups and not entry.get("terminal"):
+            pending_closes.add(groups[group_id].get("opening_group"))
     buckets = {}
     for key, group in groups.items():
         if group.get("type") == "open":
@@ -99,16 +114,14 @@ def build_performance(groups, executions, links, journal, positions=(), position
             # belongs to this strategy rather than another account position.
             unassigned += 1
             continue
-        candidates = [b for key, b in buckets.items() if (not opening or key == opening) and any(
-            lot["remaining"] > EPS and lot["execution"].symbol == execution.symbol and lot["execution"].side != execution.side
-            for lot in b["lots"])]
-        if len(candidates) != 1:
+        bucket = buckets.get(opening)
+        lots = [lot for lot in bucket["lots"] if lot["execution"].symbol == execution.symbol
+                and lot["execution"].side != execution.side and lot["remaining"] > EPS] if bucket is not None else []
+        if not lots:
             if opening in buckets:
                 buckets[opening]["issues"].append("平仓成交缺少对应开仓记录")
             unassigned += 1
             continue
-        bucket = candidates[0]
-        lots = [lot for lot in bucket["lots"] if lot["execution"].symbol == execution.symbol and lot["execution"].side != execution.side and lot["remaining"] > EPS]
         if sum((lot["remaining"] for lot in lots), ZERO) + EPS < qty or (execution.closed_size is not None and abs(number(execution.closed_size) - qty) > EPS):
             bucket["issues"].append("平仓数量与开仓记录不符")
             continue
@@ -128,7 +141,21 @@ def build_performance(groups, executions, links, journal, positions=(), position
         bucket["closes"].append(execution)
         bucket["closed"] = execution.exec_time
 
-    rows, evidence_owners = [], {}
+    early_groups = set()
+    for item in ordered:
+        opening = item.opening_group or groups.get(links.get(item.order_link_id) or item.execution_group, {}).get("opening_group")
+        if opening in buckets and (expiry := expiry_for(item.symbol)) and item.exec_time < expiry:
+            early_groups.add(opening)
+    rows, evidence_owners, remaining_owners, positions_by_leg = [], {}, {}, {}
+    for key, bucket in buckets.items():
+        for lot in bucket["lots"]:
+            if lot["remaining"] > EPS:
+                leg = (lot["execution"].symbol, lot["execution"].side)
+                remaining_owners.setdefault(leg, set()).add(key)
+    if positions_available:
+        for position in positions:
+            if position.source == "bybit":
+                positions_by_leg.setdefault((position.symbol, position.side), []).append(position)
     for key, group in groups.items():
         for evidence in group.get("closure_evidence", {}).values():
             for row in evidence:
@@ -141,8 +168,8 @@ def build_performance(groups, executions, links, journal, positions=(), position
             leg = (lot["execution"].symbol, lot["execution"].side)
             actual[leg] = actual.get(leg, ZERO) + lot["qty"]
         expected = {}
-        for link, entry in journal.items():
-            if links.get(link) == key and not entry["reduce_only"]:
+        for entry in journal_by_group.get(key, ()):
+            if not entry["reduce_only"]:
                 leg = (entry["symbol"], entry["side"])
                 expected[leg] = expected.get(leg, ZERO) + number(entry.get("filledQty", 0))
                 if not entry.get("terminal"):
@@ -154,12 +181,9 @@ def build_performance(groups, executions, links, journal, positions=(), position
                 bucket["issues"].append("开仓成交历史尚未补齐")
         closed = bool(lots) and all(lot["remaining"] <= EPS for lot in lots)
         source, delivery_fee = "executions", ZERO
-        early_close = any(option_expiry(item.symbol) and item.exec_time < option_expiry(item.symbol) for item in bucket["closes"])
+        early_close = any(expiry_for(item.symbol) and item.exec_time < expiry_for(item.symbol) for item in bucket["closes"])
         # Even an unmatched partial fill is evidence of an early reduction.
-        early_close = early_close or any(
-            (item.opening_group or groups.get(links.get(item.order_link_id) or item.execution_group, {}).get("opening_group")) == key
-            and option_expiry(item.symbol) and item.exec_time < option_expiry(item.symbol)
-            for item in ordered)
+        early_close = early_close or key in early_groups
         verified_expiry = False
         # Exchange closure evidence replaces, never adds to, fill-based P&L.
         evidence = meta.get("closure_evidence", {})
@@ -185,7 +209,7 @@ def build_performance(groups, executions, links, journal, positions=(), position
                         closed_at = datetime.fromtimestamp(int(row["closeTime"]) / 1000, timezone.utc)
                         if closed_at < opened_at or (meta.get("created_at") and opened_at < stamp(meta["created_at"])):
                             raise ValueError("Invalid closure times")
-                        expiry = option_expiry(symbol)
+                        expiry = expiry_for(symbol)
                         evidence_early = evidence_early or bool(expiry and closed_at < expiry) or number(row["totalCloseFee"]) != 0
                         expiry_verified = expiry_verified and expiry is not None and closed_at >= expiry
                         total += number(row["qty"])
@@ -215,7 +239,7 @@ def build_performance(groups, executions, links, journal, positions=(), position
             bucket["issues"].append("等待实际开仓成交记录")
         if len(bucket["currencies"]) != 1:
             bucket["issues"].append("结算币种待核对")
-        if any(links.get(link) in groups and groups[links[link]].get("opening_group") == key and not entry.get("terminal") for link, entry in journal.items()):
+        if key in pending_closes:
             bucket["issues"].append("平仓成交仍待确认")
         issues = list(dict.fromkeys(bucket["issues"]))
         floating = None
@@ -228,8 +252,8 @@ def build_performance(groups, executions, links, journal, positions=(), position
             for (symbol, side), qty in residuals.items():
                 if qty <= EPS:
                     continue
-                matches = [p for p in positions if p.source == "bybit" and p.symbol == symbol and p.side == side and abs(number(p.size) - qty) <= EPS]
-                owners = [b for b in buckets.values() if any(l["remaining"] > EPS and l["execution"].symbol == symbol and l["execution"].side == side for l in b["lots"])]
+                matches = [p for p in positions_by_leg.get((symbol, side), ()) if abs(number(p.size) - qty) <= EPS]
+                owners = remaining_owners.get((symbol, side), ())
                 if len(matches) != 1 or len(owners) != 1:
                     break
                 # Use this combination's cost, not an unrelated account-wide average.
@@ -237,7 +261,7 @@ def build_performance(groups, executions, links, journal, positions=(), position
             else:
                 floating = amount(total_float)
         currency = next(iter(bucket["currencies"])) if len(bucket["currencies"]) == 1 else "待确认"
-        expiries = {option_expiry(symbol) for symbol, _ in (actual or targets)}
+        expiries = {expiry_for(symbol) for symbol, _ in (actual or targets)}
         expiry = next(iter(expiries)) if len(expiries) == 1 else None
         eligible = closed and not issues and verified_expiry and expiry is not None
         closure_kind = "early" if early_close else "expiry" if eligible else "unknown" if closed else "holding"
